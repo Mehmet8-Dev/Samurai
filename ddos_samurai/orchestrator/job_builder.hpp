@@ -54,6 +54,26 @@ struct JobOptions {
   std::uint32_t auth_mode = 0;        // 0=Anon, 1=Bearer JWT, 2=Cookie
   std::uint32_t evasion_tactic = 0;   // 0=Normal, 1=Path Traversal, 2=URL Encoded, 3=Header Spoof
   std::string auth_payload;           // Dynamic JSON body for login
+
+  // Telecom GTP-U & 5G QFI parameters
+  std::uint32_t teid_start = 1;
+  std::uint32_t teid_count = 1;
+  std::uint32_t ue_src_ip_start = 0;
+  std::uint32_t ue_src_ip_count = 1;
+  std::uint32_t inner_dst_ip = 0;
+  std::uint16_t inner_src_port = 0;
+  std::uint16_t inner_dst_port = 80;
+  std::uint16_t svlan_tci = 0;
+  std::uint16_t cvlan_tci = 0;
+  std::uint8_t  qfi = 9;
+  std::uint8_t  pdu_type = 1;
+  std::uint8_t  inner_proto = 17;
+  std::uint8_t  vlan_depth = 0;
+  std::uint8_t  with_seq = 1;
+  std::uint8_t  with_qfi_ext = 1;
+  std::uint8_t  echo_mode = 0;
+  bool gpu_bar1_p2p = false;
+  bool gpu_persistent = false;
 };
 
 // Copies a std::string into a fixed-size char buffer, always NUL-terminating and
@@ -110,6 +130,36 @@ inline samurai::wire::JobEnvelopeV2 BuildJobEnvelopeV2(const JobOptions& opt) {
   env.auth_mode = opt.auth_mode;
   env.evasion_tactic = opt.evasion_tactic;
   CopyFixed(env.auth_payload, sizeof(env.auth_payload), opt.auth_payload);
+  return env;
+}
+
+inline bool IsTelcoGtpuProtocol(const std::string& proto) {
+  return proto == "gtpu" || proto == "gtp-u" || proto == "GTPU" || proto == "GTP-U" || proto == "5g-gtpu";
+}
+
+inline samurai::wire::TelcoGpuJobEnvelopeV1 BuildTelcoGpuJobEnvelope(const JobOptions& opt) {
+  samurai::wire::TelcoGpuJobEnvelopeV1 env{};
+  env.base = BuildJobEnvelope(opt);
+  env.teid_start = opt.teid_start;
+  env.teid_count = opt.teid_count;
+  env.ue_src_ip_start = opt.ue_src_ip_start;
+  env.ue_src_ip_count = opt.ue_src_ip_count;
+  env.inner_dst_ip = opt.inner_dst_ip;
+  env.inner_src_port = opt.inner_src_port;
+  env.inner_dst_port = opt.inner_dst_port;
+  env.svlan_tci = opt.svlan_tci;
+  env.cvlan_tci = opt.cvlan_tci;
+  env.qfi = opt.qfi;
+  env.pdu_type = opt.pdu_type;
+  env.inner_proto = opt.inner_proto;
+  env.vlan_depth = opt.vlan_depth;
+  env.with_seq = opt.with_seq;
+  env.with_qfi_ext = opt.with_qfi_ext;
+  env.echo_mode = opt.echo_mode;
+  std::uint8_t fl = samurai::wire::kTelcoGpuJobFlagNone;
+  if (opt.gpu_bar1_p2p) fl |= samurai::wire::kTelcoGpuJobFlagBar1P2p;
+  if (opt.gpu_persistent) fl |= samurai::wire::kTelcoGpuJobFlagPersistent;
+  env.flags = fl;
   return env;
 }
 

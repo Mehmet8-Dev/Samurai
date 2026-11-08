@@ -91,6 +91,48 @@ struct JobEnvelopeV2 {
   char auth_payload[128];                   // L7: dynamic json auth payload
 };
 
+// Telco GPU job envelope: embeds JobEnvelopeV1 for base rate/timing/spoof config,
+// and appends 3GPP TS 29.281 GTP-U and 5G TS 38.415 QFI dataplane parameters.
+enum TelcoGpuJobFlags : std::uint8_t {
+  kTelcoGpuJobFlagNone       = 0u,
+  kTelcoGpuJobFlagBar1P2p    = 1u << 0,
+  kTelcoGpuJobFlagPersistent = 1u << 1,
+};
+
+enum TelcoGpuTunnelUpsertFlags : std::uint32_t {
+  kTelcoTunnelUpsertFlagNone              = 0u,
+  kTelcoTunnelUpsertFlagClearBeforeUpsert = 1u << 0,
+};
+
+struct TelcoGpuJobEnvelopeV1 {
+  JobEnvelopeV1 base; // 480B
+
+  std::uint32_t teid_start;
+  std::uint32_t teid_count;
+  std::uint32_t ue_src_ip_start;
+  std::uint32_t ue_src_ip_count;
+  std::uint32_t inner_dst_ip;
+  std::uint16_t inner_src_port;
+  std::uint16_t inner_dst_port;
+  std::uint16_t svlan_tci;
+  std::uint16_t cvlan_tci;
+  std::uint8_t  qfi;             // 0..63
+  std::uint8_t  pdu_type;        // 1=UL, 0=DL
+  std::uint8_t  inner_proto;     // 17=UDP, 6=TCP, 1=ICMP
+  std::uint8_t  vlan_depth;      // 0=none, 1=802.1Q, 2=802.1ad
+  std::uint8_t  with_seq;        // 1 or 0
+  std::uint8_t  with_qfi_ext;    // 1 or 0
+  std::uint8_t  echo_mode;       // 1 or 0
+  std::uint8_t  flags;           // Bitmask of TelcoGpuJobFlags
+  std::uint8_t  pad[12];
+};
+
+struct TelcoGpuTunnelUpsertV1 {
+  std::uint32_t count;
+  std::uint32_t flags; // 1 = clear_before_upsert
+  std::uint8_t  pad[8];
+};
+
 struct MetricSnapshotV1 {
   std::uint64_t timestamp_ns;
   std::uint64_t packets_sent;
@@ -171,6 +213,7 @@ enum class MessageType : std::uint8_t {
   METRIC_SNAPSHOT = 20,
   FLOW_UPDATE = 21,
   FLOW_STREAM_UPSERT = 22,
+  TELCO_TUNNEL_UPSERT = 23,
 
   ERROR = 30,
 
@@ -284,6 +327,9 @@ static_assert(sizeof(FlowStreamUpsertV1) == 84, "FlowStreamUpsertV1 size mismatc
 static_assert(sizeof(TelcoJobPayload) == 104, "TelcoJobPayload size mismatch");
 static_assert(sizeof(TelcoChaosPayload) == 16, "TelcoChaosPayload size mismatch");
 static_assert(sizeof(TelcoStatsPayload) == 64, "TelcoStatsPayload size mismatch");
+static_assert(sizeof(TelcoGpuJobEnvelopeV1) == 528, "TelcoGpuJobEnvelopeV1 size mismatch");
+static_assert(offsetof(TelcoGpuJobEnvelopeV1, base) == 0, "TelcoGpuJobEnvelopeV1 must embed V1 at offset 0");
+static_assert(sizeof(TelcoGpuTunnelUpsertV1) == 16, "TelcoGpuTunnelUpsertV1 size mismatch");
 
 inline constexpr bool IsVersionSupported(std::uint8_t version) {
   return version == kVersionV1 || version == kVersionV2;

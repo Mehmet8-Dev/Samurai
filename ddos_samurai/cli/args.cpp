@@ -216,6 +216,40 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
       out.sip_rate = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
     } else if (a == "--enable-srtp") {
       out.enable_srtp = true;
+    } else if (a == "--teid-start") {
+      if (!NeedsValue(i, argc, "--teid-start")) return ParseStatus::kError;
+      out.job.teid_start = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--teid-count") {
+      if (!NeedsValue(i, argc, "--teid-count")) return ParseStatus::kError;
+      out.job.teid_count = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--qfi") {
+      if (!NeedsValue(i, argc, "--qfi")) return ParseStatus::kError;
+      out.job.qfi = static_cast<std::uint8_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--ue-subnet") {
+      if (!NeedsValue(i, argc, "--ue-subnet")) return ParseStatus::kError;
+      out.job.spoof_mode = argv[++i];
+    } else if (a == "--gtpu-vlan") {
+      if (!NeedsValue(i, argc, "--gtpu-vlan")) return ParseStatus::kError;
+      std::string vlan_str = argv[++i];
+      auto colon = vlan_str.find(':');
+      if (colon != std::string::npos) {
+        out.job.svlan_tci = static_cast<std::uint16_t>(std::strtoul(vlan_str.substr(0, colon).c_str(), nullptr, 10));
+        out.job.cvlan_tci = static_cast<std::uint16_t>(std::strtoul(vlan_str.substr(colon + 1).c_str(), nullptr, 10));
+        out.job.vlan_depth = 2;
+      } else {
+        out.job.svlan_tci = static_cast<std::uint16_t>(std::strtoul(vlan_str.c_str(), nullptr, 10));
+        out.job.vlan_depth = 1;
+      }
+    } else if (a == "--gtpu-inner-proto") {
+      if (!NeedsValue(i, argc, "--gtpu-inner-proto")) return ParseStatus::kError;
+      std::string p = argv[++i];
+      if (p == "tcp") out.job.inner_proto = 6;
+      else if (p == "icmp") out.job.inner_proto = 1;
+      else out.job.inner_proto = 17;
+    } else if (a == "--gpu-bar1-p2p") {
+      out.job.gpu_bar1_p2p = true;
+    } else if (a == "--gpu-persistent") {
+      out.job.gpu_persistent = true;
     } else {
       std::fprintf(stderr, "samurai: unknown argument: %s\n", a.c_str());
       return ParseStatus::kError;

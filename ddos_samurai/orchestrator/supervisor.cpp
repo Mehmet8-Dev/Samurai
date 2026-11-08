@@ -175,11 +175,18 @@ int RunJob(const SupervisorConfig& cfg, const JobOptions& job, RunStats& out_sta
   // Per-call locals: must not be static — each RunJob needs a fresh envelope.
   samurai::wire::JobEnvelopeV2 env_v2{};
   samurai::wire::JobEnvelopeV1 env_v1{};
+  samurai::wire::TelcoGpuJobEnvelopeV1 env_telco{};
   if (cfg.worker.kind == samurai::wire::WorkerKind::L7) {
     env_v2 = BuildJobEnvelopeV2(job);
     envelope_version = samurai::wire::kVersionV2;
     envelope_ptr = reinterpret_cast<const std::uint8_t*>(&env_v2);
     envelope_size = sizeof(env_v2);
+  } else if (cfg.worker.kind == samurai::wire::WorkerKind::GPU &&
+             IsTelcoGtpuProtocol(job.protocol)) {
+    env_telco = BuildTelcoGpuJobEnvelope(job);
+    envelope_version = samurai::wire::kVersionV1;
+    envelope_ptr = reinterpret_cast<const std::uint8_t*>(&env_telco);
+    envelope_size = sizeof(env_telco);
   } else {
     env_v1 = BuildJobEnvelope(job);
     envelope_ptr = reinterpret_cast<const std::uint8_t*>(&env_v1);

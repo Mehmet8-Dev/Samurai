@@ -1,6 +1,7 @@
 #include "wire_protocol.h"
 #include "worker_common.hpp"
 #include "zmq_worker_base.hpp"
+#include "ddos_samurai/samurai_tsc.h"
 #include "ddos_samurai/telecom/core/fastpath_classifier.hpp"
 #include "ddos_samurai/telecom/core/session_manager.hpp"
 #include "ddos_samurai/telecom/core/hierarchical_timing_wheel.hpp"
@@ -9,6 +10,8 @@
 #include "ddos_samurai/telecom/protocols/stateful/dhcp/dhcp_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/bfd/bfd_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/mobile/gtpu_engine.hpp"
+#include "ddos_samurai/telecom/protocols/stateful/mobile/pfcp_engine.hpp"
+#include "ddos_samurai/telecom/cups/dpu_arm_cups_bridge.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/sctp/sctp_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/diameter/diameter_engine.hpp"
 #include "ddos_samurai/telecom/protocols/stateful/sip_rtp/sip_rtp_engine.hpp"
@@ -530,7 +533,7 @@ public:
 
     void ProcessRx(SessionManager& /*session_mgr*/, const uint8_t* frame, size_t len,
                    const PacketMetadata& /*meta*/, TelcoFrameType /*frame_type*/) override {
-        uint64_t now_tsc = __builtin_ia32_rdtsc();
+        uint64_t now_tsc = samurai_rdtsc();
         engine_.ProcessRxFrame(frame, len, now_tsc);
     }
 
@@ -605,7 +608,7 @@ public:
 
     void ProcessRx(SessionManager& /*session_mgr*/, const uint8_t* frame, size_t len,
                    const PacketMetadata& /*meta*/, TelcoFrameType /*frame_type*/) override {
-        uint64_t now_tsc = __builtin_ia32_rdtsc();
+        uint64_t now_tsc = samurai_rdtsc();
         engine_.ProcessRxFrame(frame, len, now_tsc);
     }
 
@@ -681,7 +684,7 @@ public:
 
     void ProcessRx(SessionManager& /*session_mgr*/, const uint8_t* frame, size_t len,
                    const PacketMetadata& /*meta*/, TelcoFrameType /*frame_type*/) override {
-        uint64_t now_tsc = __builtin_ia32_rdtsc();
+        uint64_t now_tsc = samurai_rdtsc();
         engine_.ProcessRxFrame(frame, len, now_tsc);
     }
 
@@ -791,6 +794,53 @@ private:
     SipRtpDriver& sip_;
 };
 
+// 9. DPU ARM CUPS Bridge Driver
+class CupsDriver final : public ITelcoProtocolDriver {
+public:
+    explicit CupsDriver(samurai::telecom::cups::DpuArmCupsSessionController& controller)
+        : controller_(controller) {}
+
+    void InitializeSubscribers(SessionManager& /*session_mgr*/, uint32_t sub_start, uint32_t sub_count,
+                              uint16_t base_vlan_s, uint16_t base_vlan_c) override {
+        for (uint32_t i = 0; i < sub_count; ++i) {
+            uint32_t sub_idx = sub_start + i;
+            samurai::telecom::cups::CupsTunnelParams p{};
+            p.uplink_teid = sub_idx + 1u;
+            p.downlink_teid = sub_idx + 1000u;
+            p.ue_src_ip = 0x0A3C0001u + sub_idx;
+            p.inner_dst_ip = 0x08080808u;
+            p.inner_src_port = static_cast<uint16_t>(1024u + (sub_idx % 60000u));
+            p.inner_dst_port = 80;
+            p.svlan_tci = base_vlan_s;
+            p.cvlan_tci = base_vlan_c;
+            p.vlan_depth = (base_vlan_s && base_vlan_c) ? 2 : (base_vlan_s || base_vlan_c ? 1 : 0);
+            p.qfi = 9;
+            p.pdu_type = 1;
+            p.inner_proto = 17;
+            p.with_seq = true;
+            p.with_qfi_ext = true;
+            controller_.EstablishSubscriberSession(sub_idx, static_cast<uint64_t>(sub_idx + 1u), p, nullptr);
+        }
+    }
+
+    void GenerateTraffic(SessionManager& /*session_mgr*/, uint32_t /*sub_cursor*/, uint32_t /*count*/,
+                         std::vector<std::vector<uint8_t>>& /*out_packets*/) override {
+        // Wire generation is offloaded to GPU user plane via zero-copy BAR1 / ZMQ
+    }
+
+    void ProcessRx(SessionManager& /*session_mgr*/, const uint8_t* frame, size_t len,
+                   const PacketMetadata& /*meta*/, TelcoFrameType /*frame_type*/) override {
+        controller_.ProcessInboundPfcpMessage(frame, len, nullptr);
+    }
+
+    void OnTimerTick(uint64_t current_tsc) override {
+        controller_.UpdateHeartbeat(current_tsc);
+    }
+
+private:
+    samurai::telecom::cups::DpuArmCupsSessionController& controller_;
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -813,6 +863,14 @@ int main(int argc, char** argv) {
     uint16_t base_vlan_s = 100;
     uint16_t base_vlan_c = 10;
     int db_port = kDefaultDbPort;
+    std::string cups_shm_path;
+    if (const char* env_cups = std::getenv("SAMURAI_CUPS_CONTRACT_PATH"); env_cups && env_cups[0]) {
+        cups_shm_path = env_cups;
+    }
+    std::string cups_gpu_endpoint;
+    if (const char* env_gep = std::getenv("SAMURAI_CUPS_GPU_ENDPOINT"); env_gep && env_gep[0]) {
+        cups_gpu_endpoint = env_gep;
+    }
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -848,6 +906,10 @@ int main(int argc, char** argv) {
             base_vlan_c = static_cast<uint16_t>(std::stoul(argv[++i]));
         } else if (arg == "--db-port" && i + 1 < argc) {
             db_port = std::stoi(argv[++i]);
+        } else if (arg == "--cups-shm-path" && i + 1 < argc) {
+            cups_shm_path = argv[++i];
+        } else if (arg == "--cups-gpu-endpoint" && i + 1 < argc) {
+            cups_gpu_endpoint = argv[++i];
         }
     }
 
@@ -920,6 +982,7 @@ int main(int argc, char** argv) {
     DhcpEngine dhcp_engine(session_mgr, &timing_wheel);
     BfdEngine bfd_engine(session_mgr, &timing_wheel);
     GtpuEngine gtpu_engine(session_mgr, &timing_wheel);
+    PfcpEngine pfcp_engine(session_mgr, &timing_wheel);
     SctpEngine sctp_engine(session_mgr, &timing_wheel);
     DiameterEngine diameter_engine(session_mgr, &timing_wheel);
     SipRtpEngine sip_rtp_engine(session_mgr, &timing_wheel);
@@ -934,15 +997,38 @@ int main(int argc, char** argv) {
     dhcp_engine.Init(proto_cfg);
     bfd_engine.Init(proto_cfg);
     gtpu_engine.Init(proto_cfg);
+    pfcp_engine.Init(proto_cfg);
     sctp_engine.Init(proto_cfg);
     diameter_engine.Init(proto_cfg);
     sip_rtp_engine.Init(proto_cfg);
+
+    // Initialize DPU ARM CUPS bridge & shared memory
+    samurai::telecom::cups::DpuArmCupsSessionController cups_controller(session_mgr, pfcp_engine, max_capacity);
+    if (!cups_shm_path.empty()) {
+        if (cups_controller.InitializeSharedRegion(cups_shm_path, true)) {
+            std::cout << "[TELCO_WORKER] Successfully initialized DPU CUPS shared memory: "
+                      << cups_shm_path << " (" << max_capacity << " slots)" << std::endl;
+        } else {
+            std::cerr << "[TELCO_WORKER] Warning: Failed to initialize CUPS shared memory at: "
+                      << cups_shm_path << std::endl;
+        }
+    }
+
+    void* cups_gpu_sock = nullptr;
+    if (!cups_gpu_endpoint.empty()) {
+        cups_gpu_sock = zmq_socket(zmq_ctx, ZMQ_PUSH);
+        if (cups_gpu_sock) {
+            zmq_connect(cups_gpu_sock, cups_gpu_endpoint.c_str());
+            std::cout << "[TELCO_WORKER] Connected CUPS GPU ZMQ push socket: " << cups_gpu_endpoint << std::endl;
+        }
+    }
 
     // Instantiate Protocol Lifecycle Drivers
     PppoeDriver pppoe_driver(pppoe_engine);
     DhcpDriver dhcp_driver(dhcp_engine);
     BfdDriver bfd_driver(bfd_engine);
     GtpuDriver gtpu_driver(gtpu_engine);
+    CupsDriver cups_driver(cups_controller);
     SctpDriver sctp_driver(sctp_engine);
     DiameterDriver diameter_driver(diameter_engine);
     SipRtpDriver sip_rtp_driver(sip_rtp_engine, enable_srtp);
@@ -956,6 +1042,8 @@ int main(int argc, char** argv) {
         active_driver = &bfd_driver;
     } else if (protocol_str == "gtpu") {
         active_driver = &gtpu_driver;
+    } else if (protocol_str == "pfcp" || protocol_str == "cups") {
+        active_driver = &cups_driver;
     } else if (protocol_str == "sctp" || protocol_str == "sctp-flood") {
         active_driver = &sctp_driver;
     } else if (protocol_str == "diameter" || protocol_str == "diameter-ccr") {
@@ -969,7 +1057,18 @@ int main(int argc, char** argv) {
     // Initialize subscriber range through the lifecycle driver
     active_driver->InitializeSubscribers(session_mgr, sub_start, sub_count, base_vlan_s, base_vlan_c);
 
-    uint64_t last_metric_tsc = __builtin_ia32_rdtsc();
+    if (cups_gpu_sock && cups_controller.GetActiveSessions() > 0) {
+        std::vector<uint8_t> upsert_payload = cups_controller.BuildZmqUpsertPayload(
+            sub_start, sub_count, samurai::wire::kTelcoTunnelUpsertFlagClearBeforeUpsert);
+        if (!upsert_payload.empty()) {
+            SendFrame(cups_gpu_sock, static_cast<uint8_t>(MessageType::TELCO_TUNNEL_UPSERT),
+                      0, WorkerKind::TELCO, "cups_upsert", upsert_payload);
+            std::cout << "[TELCO_WORKER] Pushed initial CUPS tunnel table ("
+                      << cups_controller.GetActiveSessions() << " sessions) to GPU worker" << std::endl;
+        }
+    }
+
+    uint64_t last_metric_tsc = samurai_rdtsc();
     uint64_t tsc_per_sec = tsc_hz;
     uint64_t tx_packets_total = 0;
     uint64_t rx_packets_total = 0;
@@ -1035,7 +1134,7 @@ int main(int argc, char** argv) {
             zmq_msg_close(&msg);
         }
 
-        uint64_t now_tsc = __builtin_ia32_rdtsc();
+        uint64_t now_tsc = samurai_rdtsc();
 
         // 1. Advance timing wheel and timer ticks for active protocol driver
         active_driver->OnTimerTick(now_tsc);
@@ -1152,6 +1251,9 @@ int main(int argc, char** argv) {
     std::cout << "[TELCO_WORKER] Shutting down cleanly." << std::endl;
     if (packet_transport) {
         packet_transport->Close();
+    }
+    if (cups_gpu_sock) {
+        zmq_close(cups_gpu_sock);
     }
     zmq_close(jobs_sock);
     zmq_close(events_sock);

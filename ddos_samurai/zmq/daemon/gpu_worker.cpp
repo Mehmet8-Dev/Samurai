@@ -23,6 +23,7 @@ extern "C" {
 
 #include "pacing_engine.h"
 #include "wire_protocol.h"
+#include "gpu_packet_cuda/zero_copy_dataplane_contract.cuh"
 #include "zmq_worker_base.hpp"
 #include "worker_common.hpp"
 
@@ -53,6 +54,16 @@ using fn_free_t = void (*)(void*);
 using fn_last_error_t = const char* (*)();
 using fn_p2p_bar1_available_t = int (*)();
 using fn_p2p_get_arena_info_t = int (*)(std::uint64_t*, void**, void**, std::size_t*);
+using fn_generate_gtpu_packets_t = int (*)(const char*, int, void**, std::size_t*, int*);
+using fn_telco_upsert_tunnels_v1_t = int (*)(const void*, std::uint32_t);
+using fn_telco_clear_tunnels_v1_t = int (*)();
+using fn_telco_verify_rx_batch_v1_t = int (*)(const void*, std::uint32_t, std::uint32_t, void*);
+using fn_telco_read_rx_stats_v1_t = int (*)(void*);
+using fn_p2p_tx_bar1_batch_v1_t = int (*)(const std::uint32_t*, const std::uint16_t*, std::uint32_t, std::uint32_t*);
+using fn_p2p_set_active_ring_v1_t = int (*)(std::uint32_t);
+using fn_p2p_get_active_ring_v1_t = int (*)(std::uint32_t*);
+using fn_telco_attach_cups_shm_v1_t = int (*)(const char*, std::uint32_t);
+using fn_telco_detach_cups_shm_v1_t = int (*)();
 
 struct GpuNativeApi {
   void* handle{nullptr};
@@ -69,6 +80,16 @@ struct GpuNativeApi {
   fn_last_error_t last_error{nullptr};
   fn_p2p_bar1_available_t p2p_bar1_available{nullptr};
   fn_p2p_get_arena_info_t p2p_get_arena_info{nullptr};
+  fn_generate_gtpu_packets_t generate_gtpu_packets{nullptr};
+  fn_telco_upsert_tunnels_v1_t telco_upsert_tunnels_v1{nullptr};
+  fn_telco_clear_tunnels_v1_t telco_clear_tunnels_v1{nullptr};
+  fn_telco_verify_rx_batch_v1_t telco_verify_rx_batch_v1{nullptr};
+  fn_telco_read_rx_stats_v1_t telco_read_rx_stats_v1{nullptr};
+  fn_p2p_tx_bar1_batch_v1_t p2p_tx_bar1_batch{nullptr};
+  fn_p2p_set_active_ring_v1_t p2p_set_active_ring_v1{nullptr};
+  fn_p2p_get_active_ring_v1_t p2p_get_active_ring_v1{nullptr};
+  fn_telco_attach_cups_shm_v1_t telco_attach_cups_shm_v1{nullptr};
+  fn_telco_detach_cups_shm_v1_t telco_detach_cups_shm_v1{nullptr};
   std::string lib_path;
 };
 
@@ -145,6 +166,26 @@ bool LoadGpuNative(GpuNativeApi& api, std::string& err) {
       dlsym(api.handle, "samurai_gpu_packet_p2p_bar1_available"));
   api.p2p_get_arena_info = reinterpret_cast<fn_p2p_get_arena_info_t>(
       dlsym(api.handle, "samurai_gpu_packet_p2p_get_arena_info"));
+  api.generate_gtpu_packets = reinterpret_cast<fn_generate_gtpu_packets_t>(
+      dlsym(api.handle, "samurai_gpu_packet_generate_gtpu_packets"));
+  api.telco_upsert_tunnels_v1 = reinterpret_cast<fn_telco_upsert_tunnels_v1_t>(
+      dlsym(api.handle, "samurai_gpu_packet_telco_upsert_tunnels_v1"));
+  api.telco_clear_tunnels_v1 = reinterpret_cast<fn_telco_clear_tunnels_v1_t>(
+      dlsym(api.handle, "samurai_gpu_packet_telco_clear_tunnels_v1"));
+  api.telco_verify_rx_batch_v1 = reinterpret_cast<fn_telco_verify_rx_batch_v1_t>(
+      dlsym(api.handle, "samurai_gpu_packet_telco_verify_rx_batch_v1"));
+  api.telco_read_rx_stats_v1 = reinterpret_cast<fn_telco_read_rx_stats_v1_t>(
+      dlsym(api.handle, "samurai_gpu_packet_telco_read_rx_stats_v1"));
+  api.p2p_tx_bar1_batch = reinterpret_cast<fn_p2p_tx_bar1_batch_v1_t>(
+      dlsym(api.handle, "samurai_gpu_packet_p2p_tx_bar1_batch_v1"));
+  api.p2p_set_active_ring_v1 = reinterpret_cast<fn_p2p_set_active_ring_v1_t>(
+      dlsym(api.handle, "samurai_gpu_packet_p2p_set_active_ring_v1"));
+  api.p2p_get_active_ring_v1 = reinterpret_cast<fn_p2p_get_active_ring_v1_t>(
+      dlsym(api.handle, "samurai_gpu_packet_p2p_get_active_ring_v1"));
+  api.telco_attach_cups_shm_v1 = reinterpret_cast<fn_telco_attach_cups_shm_v1_t>(
+      dlsym(api.handle, "samurai_gpu_packet_telco_attach_cups_shm_v1"));
+  api.telco_detach_cups_shm_v1 = reinterpret_cast<fn_telco_detach_cups_shm_v1_t>(
+      dlsym(api.handle, "samurai_gpu_packet_telco_detach_cups_shm_v1"));
   if (!api.generate_packets || !api.generate_icmp_packets || !api.free_fn || !api.last_error) {
     err = "gpu_native_symbol_missing";
     dlclose(api.handle);
@@ -529,6 +570,52 @@ int SendAck(void* push, std::uint64_t cid, const std::string& job_id) {
   return SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK), cid, samurai::wire::WorkerKind::GPU, job_id);
 }
 
+inline std::string FormatIpv4(std::uint32_t ip) {
+  return std::to_string((ip >> 24) & 0xFF) + "." +
+         std::to_string((ip >> 16) & 0xFF) + "." +
+         std::to_string((ip >> 8) & 0xFF) + "." +
+         std::to_string(ip & 0xFF);
+}
+
+bool HandleTelcoTunnelUpsertPayload(
+    const GpuNativeApi& api,
+    const std::uint8_t* payload_ptr,
+    std::size_t payload_len,
+    std::string& err_out) {
+  if (payload_len < sizeof(samurai::wire::TelcoGpuTunnelUpsertV1)) {
+    err_out = "telco_tunnel_upsert_payload_too_small";
+    return false;
+  }
+  samurai::wire::TelcoGpuTunnelUpsertV1 upsert_hdr{};
+  std::memcpy(&upsert_hdr, payload_ptr, sizeof(upsert_hdr));
+  const std::uint64_t expected_entries = static_cast<std::uint64_t>(upsert_hdr.count);
+  const std::uint64_t entry_size =
+      static_cast<std::uint64_t>(sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1));
+  const std::uint64_t expected_entries_bytes = expected_entries * entry_size;
+  const std::uint64_t actual_entries_bytes =
+      static_cast<std::uint64_t>(payload_len - sizeof(upsert_hdr));
+
+  if (actual_entries_bytes != expected_entries_bytes) {
+    err_out = "telco_tunnel_upsert_entries_size_mismatch";
+    return false;
+  }
+
+  if ((upsert_hdr.flags & samurai::wire::kTelcoTunnelUpsertFlagClearBeforeUpsert) != 0) {
+    if (api.telco_clear_tunnels_v1) {
+      api.telco_clear_tunnels_v1();
+    }
+  }
+
+  if (upsert_hdr.count > 0 && api.telco_upsert_tunnels_v1) {
+    const void* entries_ptr = payload_ptr + sizeof(upsert_hdr);
+    if (api.telco_upsert_tunnels_v1(entries_ptr, upsert_hdr.count) != 0) {
+      err_out = "telco_upsert_tunnels_failed";
+      return false;
+    }
+  }
+  return true;
+}
+
 struct NativeResult {
   std::size_t bytes_total{0};
   int packet_size{0};
@@ -544,7 +631,8 @@ bool RunGpuNativeBatch(
     int batch_count,
     long long ipg_ns,
     NativeResult& out,
-    std::string& err) {
+    std::string& err,
+    const samurai::wire::TelcoGpuJobEnvelopeV1* telco_env = nullptr) {
   std::uint8_t* ptr = nullptr;
   std::size_t out_size = 0;
   int out_packet_size = 0;
@@ -561,9 +649,48 @@ bool RunGpuNativeBatch(
   // L2 TX_RING requires Ethernet header (has_ethernet=1); L3 raw socket uses IPv4 payload (has_ethernet=0).
   const int has_ethernet = (!iface.empty() || !tx_enabled) ? 1 : 0;
 
+  const bool is_gtpu = (protocol == "gtpu" || protocol == "GTPU" || protocol == "gtp-u" || protocol == "5g-gtpu" ||
+                       (telco_env != nullptr && (protocol.empty() || protocol == "gtpu" || protocol == "GTPU" || protocol == "gtp-u" || protocol == "5g-gtpu")));
   const bool is_icmp = (protocol == "icmp" || protocol == "ICMP");
   int rc = 0;
-  if (is_icmp) {
+  if (is_gtpu && api.generate_gtpu_packets) {
+    const bool bar1_p2p_mode =
+        (telco_env && (telco_env->flags & samurai::wire::kTelcoGpuJobFlagBar1P2p) != 0) ||
+        EnvFlag("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", false) ||
+        EnvString("SAMURAI_GPU_TX_BACKEND", "") == "geforce_p2p";
+    const std::string ue_ip_str = (telco_env && telco_env->ue_src_ip_start != 0) ? FormatIpv4(telco_env->ue_src_ip_start) : "10.60.0.1";
+    const std::string inner_dst_str = (telco_env && telco_env->inner_dst_ip != 0) ? FormatIpv4(telco_env->inner_dst_ip) : "8.8.8.8";
+    const int inner_payload_len = env.packet_size > 64 ? static_cast<int>(env.packet_size) - 64 : 32;
+    std::ostringstream json_cfg;
+    json_cfg << "{"
+             << "\"target_ip\":\"" << target_ip_norm << "\","
+             << "\"src_ip\":\"192.168.1.100\","
+             << "\"teid_start\":" << (telco_env ? telco_env->teid_start : 1u) << ","
+             << "\"teid_count\":" << (telco_env ? telco_env->teid_count : 1u) << ","
+             << "\"ue_ip_start\":\"" << ue_ip_str << "\","
+             << "\"ue_ip_count\":" << (telco_env && telco_env->ue_src_ip_count > 0 ? telco_env->ue_src_ip_count : 1u) << ","
+             << "\"inner_dst_ip\":\"" << inner_dst_str << "\","
+             << "\"inner_src_port\":" << (telco_env ? static_cast<int>(telco_env->inner_src_port) : 0) << ","
+             << "\"inner_dst_port\":" << (telco_env && telco_env->inner_dst_port != 0 ? static_cast<int>(telco_env->inner_dst_port) : 80) << ","
+             << "\"qfi\":" << (telco_env ? static_cast<int>(telco_env->qfi) : 9) << ","
+             << "\"pdu_type\":" << (telco_env ? static_cast<int>(telco_env->pdu_type) : 1) << ","
+             << "\"with_qfi\":" << (telco_env ? (telco_env->with_qfi_ext ? "true" : "false") : "true") << ","
+             << "\"with_seq\":" << (telco_env ? (telco_env->with_seq ? "true" : "false") : "true") << ","
+             << "\"echo_mode\":" << (telco_env ? (telco_env->echo_mode ? "true" : "false") : "false") << ","
+             << "\"payload_len\":" << inner_payload_len << ","
+             << "\"inner_proto\":\"" << (telco_env && telco_env->inner_proto == 6 ? "tcp" : (telco_env && telco_env->inner_proto == 1 ? "icmp" : "udp")) << "\","
+             << "\"svlan\":" << (telco_env ? telco_env->svlan_tci : 0) << ","
+             << "\"cvlan\":" << (telco_env ? telco_env->cvlan_tci : 0) << ","
+             << "\"vlan_depth\":" << (telco_env ? static_cast<int>(telco_env->vlan_depth) : 0) << ","
+             << "\"bar1_p2p\":" << (bar1_p2p_mode ? "true" : "false")
+             << "}";
+    rc = api.generate_gtpu_packets(
+        json_cfg.str().c_str(),
+        batch_count,
+        reinterpret_cast<void**>(&ptr),
+        &out_size,
+        &out_packet_size);
+  } else if (is_icmp) {
     rc = api.generate_icmp_packets(
         static_cast<std::int64_t>(batch_count),
         target_ip_norm.c_str(),
@@ -617,11 +744,26 @@ bool RunGpuNativeBatch(
   out.packet_size = out_packet_size;
 
   const bool bar1_p2p_mode =
+      (telco_env && (telco_env->flags & samurai::wire::kTelcoGpuJobFlagBar1P2p) != 0) ||
       EnvFlag("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", false) ||
       EnvString("SAMURAI_GPU_TX_BACKEND", "") == "geforce_p2p";
   if (bar1_p2p_mode) {
     if (tx_enabled) {
-      err = "bar1_p2p_afpacket_fallback_disabled_use_dpdk_p2p_transport";
+      if (api.p2p_tx_bar1_batch) {
+        std::uint32_t submitted = 0u;
+        const int p2p_rc = api.p2p_tx_bar1_batch(nullptr, nullptr, static_cast<std::uint32_t>(batch_count), &submitted);
+        if (p2p_rc != 0) {
+          err = NativeLastError(api);
+          if (err.empty()) err = "bar1_p2p_gpu_doorbell_tx_failed";
+          return false;
+        }
+        out.packets_sent = static_cast<int>(submitted);
+        out.packets_errors = static_cast<int>(batch_count - submitted);
+        out.transmitted_on_wire = true;
+        out.tx_note = "gpu_native_capi+geforce_p2p_bar1:doorbell";
+        return true;
+      }
+      err = "bar1_p2p_tx_bar1_batch_symbol_missing";
       return false;
     }
     out.packets_sent = 0;
@@ -649,10 +791,32 @@ bool RunGpuNativeBatch(
       out.transmitted_on_wire = true;
       out.tx_note = "gpu_native_capi+afpacket:tx_ring";
     } else {
+      std::vector<std::uint8_t> l3_buffer;
+      const std::uint8_t* tx_ptr = ptr;
+      std::size_t tx_size = out_size;
+      int tx_packet_size = out_packet_size;
+
+      if (is_gtpu) {
+        const std::size_t vlan_depth = telco_env ? static_cast<std::size_t>(telco_env->vlan_depth) : 0u;
+        const std::size_t l2_hdr_len = 14u + vlan_depth * 4u;
+        if (static_cast<std::size_t>(out_packet_size) > l2_hdr_len) {
+          const std::size_t l3_pkt_sz = static_cast<std::size_t>(out_packet_size) - l2_hdr_len;
+          l3_buffer.resize(static_cast<std::size_t>(batch_count) * l3_pkt_sz);
+          for (int i = 0; i < batch_count; ++i) {
+            const std::uint8_t* src_pkt = ptr + static_cast<std::size_t>(i) * static_cast<std::size_t>(out_packet_size) + l2_hdr_len;
+            std::uint8_t* dst_pkt = l3_buffer.data() + static_cast<std::size_t>(i) * l3_pkt_sz;
+            std::memcpy(dst_pkt, src_pkt, l3_pkt_sz);
+          }
+          tx_ptr = l3_buffer.data();
+          tx_size = l3_buffer.size();
+          tx_packet_size = static_cast<int>(l3_pkt_sz);
+        }
+      }
+
       afpkt_tx_metrics_t m{};
       const int tx_rc = afpkt_send_l3_ex(
           target_ip_norm.c_str(), static_cast<int>(env.target_port),
-          ptr, out_size, out_packet_size, batch_count, ipg_ns,
+          tx_ptr, tx_size, tx_packet_size, batch_count, ipg_ns,
           nullptr, &m, tx_err, sizeof(tx_err));
       if (tx_rc != 0) {
         err = tx_err[0] ? std::string(tx_err) : "gpu_afpacket_l3_tx_failed";
@@ -663,6 +827,11 @@ bool RunGpuNativeBatch(
       out.transmitted_on_wire = true;
       out.tx_note = "gpu_native_capi+afpacket:l3";
     }
+  } else {
+    out.packets_sent = batch_count;
+    out.packets_errors = 0;
+    out.transmitted_on_wire = false;
+    out.tx_note = "gpu_native_capi:dry_run";
   }
 
   return true;
@@ -676,6 +845,8 @@ int main(int argc, char** argv) {
   bool bind_jobs = true;
   bool bind_events = false;
   int cli_batch_size = 8192;
+  std::string cups_shm_path = EnvString("SAMURAI_CUPS_CONTRACT_PATH", "");
+  std::uint32_t active_ring_handle = static_cast<std::uint32_t>(EnvI64("SAMURAI_P2P_ACTIVE_RING", 0));
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -691,6 +862,10 @@ int main(int argc, char** argv) {
       cli_batch_size = std::max(1, std::stoi(argv[++i]));
     } else if (arg == "--gpu-bar1-p2p") {
       setenv("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT", "1", 1);
+    } else if (arg == "--cups-shm-path" && i + 1 < argc) {
+      cups_shm_path = argv[++i];
+    } else if (arg == "--p2p-ring-handle" && i + 1 < argc) {
+      active_ring_handle = static_cast<std::uint32_t>(std::stoul(argv[++i]));
     }
   }
 
@@ -726,6 +901,24 @@ int main(int argc, char** argv) {
   }
 
   GpuNativeApi api{};
+  if (!cups_shm_path.empty()) {
+    std::string native_err;
+    if (LoadGpuNative(api, native_err) && api.telco_attach_cups_shm_v1) {
+      const int attach_rc = api.telco_attach_cups_shm_v1(cups_shm_path.c_str(), 0);
+      if (attach_rc == 0) {
+        std::cout << "[gpu_worker] Attached to DPU CUPS shared memory: " << cups_shm_path << "\n";
+      } else {
+        std::cerr << "[gpu_worker] Warning: Failed to attach CUPS shared memory at " << cups_shm_path
+                  << ": " << NativeLastError(api) << "\n";
+      }
+    }
+  }
+  if (active_ring_handle != 0) {
+    std::string native_err;
+    if (LoadGpuNative(api, native_err) && api.p2p_set_active_ring_v1) {
+      api.p2p_set_active_ring_v1(active_ring_handle);
+    }
+  }
   FlowLifecycleConfig flow_lifecycle_cfg = LoadFlowLifecycleConfig();
   std::unordered_map<std::uint32_t, std::int64_t> flow_streams;
   bool running = true;
@@ -959,9 +1152,66 @@ int main(int argc, char** argv) {
       continue;
     }
 
+    if (msg_type == samurai::wire::MessageType::TELCO_TUNNEL_UPSERT) {
+      std::string native_err;
+      if (!LoadGpuNative(api, native_err)) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError(native_err));
+        zmq_msg_close(&msg);
+        continue;
+      }
+      std::string upsert_err;
+      if (!HandleTelcoTunnelUpsertPayload(api, payload_ptr, payload_len, upsert_err)) {
+        (void)SendFrame(
+            push,
+            static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+            header.correlation_id,
+            samurai::wire::WorkerKind::GPU,
+            job_id,
+            JsonError(upsert_err));
+        zmq_msg_close(&msg);
+        continue;
+      }
+      (void)SendAck(push, header.correlation_id, job_id);
+      zmq_msg_close(&msg);
+      continue;
+    }
+
     if (msg_type == samurai::wire::MessageType::START_JOB) {
-      if (payload_len != sizeof(samurai::wire::JobEnvelopeV1) ||
-          header.payload_len != sizeof(samurai::wire::JobEnvelopeV1)) {
+      samurai::wire::JobEnvelopeV1 env{};
+      samurai::wire::TelcoGpuJobEnvelopeV1 telco_env{};
+      bool has_telco_env = false;
+
+      if (payload_len == sizeof(samurai::wire::TelcoGpuJobEnvelopeV1)) {
+        std::memcpy(&telco_env, payload_ptr, sizeof(telco_env));
+        env = telco_env.base;
+        has_telco_env = true;
+      } else if (payload_len == sizeof(samurai::wire::TelcoJobPayload)) {
+        samurai::wire::TelcoJobPayload tjp{};
+        std::memcpy(&tjp, payload_ptr, sizeof(tjp));
+        std::snprintf(env.protocol, sizeof(env.protocol), "gtpu");
+        env.target_port = 2152;
+        env.packet_count = tjp.subscriber_count > 0 ? tjp.subscriber_count * 10 : 1000;
+        env.packet_size = 128;
+        env.target_rps = static_cast<double>(tjp.rate_cps);
+        telco_env.base = env;
+        telco_env.teid_start = tjp.subscriber_start_idx;
+        telco_env.teid_count = tjp.subscriber_count > 0 ? tjp.subscriber_count : 1;
+        telco_env.svlan_tci = tjp.base_vlan_s;
+        telco_env.cvlan_tci = tjp.base_vlan_c;
+        telco_env.vlan_depth = (tjp.base_vlan_s && tjp.base_vlan_c) ? 2 : (tjp.base_vlan_s || tjp.base_vlan_c ? 1 : 0);
+        telco_env.ue_src_ip_start = tjp.base_client_ip;
+        telco_env.ue_src_ip_count = telco_env.teid_count;
+        telco_env.inner_dst_ip = tjp.gateway_ip;
+        has_telco_env = true;
+      } else if (payload_len == sizeof(samurai::wire::JobEnvelopeV1)) {
+        std::memcpy(&env, payload_ptr, sizeof(env));
+      } else {
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
@@ -972,8 +1222,6 @@ int main(int argc, char** argv) {
         zmq_msg_close(&msg);
         continue;
       }
-      samurai::wire::JobEnvelopeV1 env{};
-      std::memcpy(&env, payload_ptr, sizeof(env));
       (void)SendAck(push, header.correlation_id, job_id);
       zmq_msg_close(&msg);
 
@@ -1012,7 +1260,7 @@ int main(int argc, char** argv) {
           const int current = std::min(batch_size, remaining);
           NativeResult gen{};
           std::string gen_err;
-          if (!RunGpuNativeBatch(api, env, current, ipg_ns, gen, gen_err)) {
+          if (!RunGpuNativeBatch(api, env, current, ipg_ns, gen, gen_err, has_telco_env ? &telco_env : nullptr)) {
             (void)SendFrame(
                 push,
                 static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
@@ -1024,6 +1272,51 @@ int main(int argc, char** argv) {
             break;
           }
           run_note = gen.tx_note;
+
+          // Live non-blocking control messages (STOP_JOB, SHUTDOWN, TELCO_TUNNEL_UPSERT)
+          bool job_stopped = false;
+          zmq_msg_t cmsg;
+          zmq_msg_init(&cmsg);
+          while (zmq_msg_recv(&cmsg, pull, ZMQ_DONTWAIT) > 0) {
+            const std::size_t c_sz = static_cast<std::size_t>(zmq_msg_size(&cmsg));
+            if (c_sz >= sizeof(samurai::wire::SamuraiWireHeaderV1)) {
+              const auto* c_raw = static_cast<const std::uint8_t*>(zmq_msg_data(&cmsg));
+              samurai::wire::SamuraiWireHeaderV1 c_hdr{};
+              std::memcpy(&c_hdr, c_raw, sizeof(c_hdr));
+              const auto c_type = static_cast<samurai::wire::MessageType>(c_hdr.msg_type);
+              const std::string c_job_id = samurai::daemon::ReadJobId(c_hdr);
+              if (c_type == samurai::wire::MessageType::STOP_JOB) {
+                job_stopped = true;
+                (void)SendAck(push, c_hdr.correlation_id, c_job_id);
+              } else if (c_type == samurai::wire::MessageType::SHUTDOWN) {
+                job_stopped = true;
+                running = false;
+                (void)SendAck(push, c_hdr.correlation_id, c_job_id);
+              } else if (c_type == samurai::wire::MessageType::TELCO_TUNNEL_UPSERT) {
+                const std::size_t c_payload_len = c_sz - sizeof(c_hdr);
+                const std::uint8_t* c_payload_ptr = c_raw + sizeof(c_hdr);
+                std::string upsert_err;
+                if (HandleTelcoTunnelUpsertPayload(api, c_payload_ptr, c_payload_len, upsert_err)) {
+                  (void)SendAck(push, c_hdr.correlation_id, c_job_id);
+                } else {
+                  (void)SendFrame(
+                      push,
+                      static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                      c_hdr.correlation_id,
+                      samurai::wire::WorkerKind::GPU,
+                      c_job_id,
+                      JsonError(upsert_err));
+                }
+              }
+            }
+            zmq_msg_close(&cmsg);
+            if (job_stopped) break;
+            zmq_msg_init(&cmsg);
+          }
+          zmq_msg_close(&cmsg);
+          if (job_stopped) {
+            break;
+          }
 
           const std::uint64_t packet_size_u = static_cast<std::uint64_t>(std::max(1, gen.packet_size));
           if (gen.transmitted_on_wire) {
@@ -1139,6 +1432,9 @@ int main(int argc, char** argv) {
         JsonError("unsupported_msg_type"));
   }
 
+  if (api.telco_detach_cups_shm_v1) {
+    api.telco_detach_cups_shm_v1();
+  }
   if (api.handle) {
     dlclose(api.handle);
   }
