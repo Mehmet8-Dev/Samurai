@@ -4,7 +4,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 720" role="img" aria-labelledby="telco-cups-title telco-cups-desc">
   <title id="telco-cups-title">Samurai DPU ARM &amp; GPU Telecom CUPS Architecture</title>
   <desc id="telco-cups-desc">Architectural diagram illustrating hardware-enforced 3GPP CUPS split: DPU ARMv8-A control plane managing N4 PFCP and subscriber contexts, seqlock shared memory and ZMQ IPC bridge, and NVIDIA GPU CUDA fastpath executing zero-copy GTP-U, 5G QFI, and BAR1 P2P ring transmission.</desc>
-  <style>
+  <style><![CDATA[
     text { font-family: "NVIDIA Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
     .bg { fill: #FFFFFF; stroke: #E0E0E0; stroke-width: 1; }
     .t { fill: #111827; }
@@ -63,7 +63,7 @@
       .badge-gpu { fill: #581C87; stroke: #C084FC; }
       .badge-hw { fill: #78350F; stroke: #FBBF24; }
     }
-  </style>
+  ]]></style>
 
   <defs>
     <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
