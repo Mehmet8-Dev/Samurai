@@ -43,6 +43,7 @@ This directory serves as the centralized technical index for the Samurai network
 - [46 - GPU-Initiated NIC MMIO Doorbell & Baremetal PMD](./46-gpu-initiated-doorbell-and-baremetal-pmd.md)
 - [47 - Zero-CPU Persistent Kernel Dataplane Architecture](./47-zero-cpu-persistent-dataplane-architecture.md)
 - [48 - Commodity Workarounds & Enterprise Hardware Migration Plan](./48-commodity-workarounds-and-enterprise-migration-plan.md)
+- [49 - DPU ARM & GPU Telecom CUPS Dataplane Architecture](./49-telecom-gpu-dpu-cups-dataplane-architecture.md)
 
 ### Benchmarks & Verified Acceptance Reports:
 - [43 - L4 Stateful TCP 1M Active Flows Benchmark Report](./benchmarks/43-tcpdp-1m-flows-benchmark-report.md)
