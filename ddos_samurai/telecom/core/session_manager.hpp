@@ -121,6 +121,14 @@ private:
         static constexpr uint32_t WRITER_BIT = 0x80000000u;
         std::atomic<uint32_t> state{0};
 
+        static inline void SpinPause() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield" ::: "memory");
+#endif
+        }
+
         inline void LockRead() noexcept {
             while (true) {
                 uint32_t s = state.load(std::memory_order_relaxed);
@@ -131,9 +139,7 @@ private:
                         return;
                     }
                 } else {
-#if defined(__x86_64__) || defined(__i386__)
-                    __builtin_ia32_pause();
-#endif
+                    SpinPause();
                 }
             }
         }
@@ -152,14 +158,10 @@ private:
                         break;
                     }
                 }
-#if defined(__x86_64__) || defined(__i386__)
-                __builtin_ia32_pause();
-#endif
+                SpinPause();
             }
             while ((state.load(std::memory_order_acquire) & ~WRITER_BIT) != 0) {
-#if defined(__x86_64__) || defined(__i386__)
-                __builtin_ia32_pause();
-#endif
+                SpinPause();
             }
         }
 

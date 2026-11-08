@@ -6,6 +6,10 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <x86intrin.h>
+#elif defined(__aarch64__)
+#if defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
 #endif
 
 namespace ddos_samurai::telecom {
@@ -51,6 +55,14 @@ static inline uint32_t Hash5Tuple(const Flow5Tuple& key) noexcept {
                   (static_cast<uint64_t>(key.dst_port) << 32) | key.proto;
     uint32_t h = __builtin_ia32_crc32di(0xFFFFFFFFu, k1);
     return __builtin_ia32_crc32di(h, k2);
+}
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+static inline uint32_t Hash5Tuple(const Flow5Tuple& key) noexcept {
+    uint64_t k1 = (static_cast<uint64_t>(key.src_ip) << 32) | key.dst_ip;
+    uint64_t k2 = (static_cast<uint64_t>(key.src_port) << 48) |
+                  (static_cast<uint64_t>(key.dst_port) << 32) | key.proto;
+    uint32_t h = __crc32cd(0xFFFFFFFFu, k1);
+    return __crc32cd(h, k2);
 }
 #else
 static inline uint32_t Hash5Tuple(const Flow5Tuple& key) noexcept {

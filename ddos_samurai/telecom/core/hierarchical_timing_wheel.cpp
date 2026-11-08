@@ -20,8 +20,12 @@ bool HierarchicalTimingWheel::IsInvariantTscSupported() noexcept {
             return (edx & (1U << 8)) != 0; // Invariant TSC flag (bit 8)
         }
     }
-#endif
     return false;
+#elif defined(__aarch64__)
+    return true; // Generic Timer (cntvct_el0) is architecturally invariant on ARMv8
+#else
+    return false;
+#endif
 }
 
 uint64_t HierarchicalTimingWheel::CalibrateTscHz() noexcept {
@@ -38,6 +42,12 @@ uint64_t HierarchicalTimingWheel::CalibrateTscHz() noexcept {
             }
         }
     }
+#elif defined(__aarch64__)
+    uint64_t arm_frq = 0;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(arm_frq));
+    if (arm_frq >= 1000000ULL && arm_frq <= 10000000000ULL) {
+        return arm_frq;
+    }
 #endif
 
     // 2. CLOCK_MONOTONIC kalibrasyonu (5 ms pencere)
@@ -45,6 +55,9 @@ uint64_t HierarchicalTimingWheel::CalibrateTscHz() noexcept {
     if (clock_gettime(CLOCK_MONOTONIC, &ts_start) == 0) {
 #if defined(__x86_64__) || defined(__i386__)
         uint64_t c_start = __builtin_ia32_rdtsc();
+#elif defined(__aarch64__)
+        uint64_t c_start = 0;
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(c_start));
 #else
         uint64_t c_start = 0;
 #endif
@@ -53,6 +66,9 @@ uint64_t HierarchicalTimingWheel::CalibrateTscHz() noexcept {
         clock_gettime(CLOCK_MONOTONIC, &ts_end);
 #if defined(__x86_64__) || defined(__i386__)
         uint64_t c_end = __builtin_ia32_rdtsc();
+#elif defined(__aarch64__)
+        uint64_t c_end = 0;
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(c_end));
 #else
         uint64_t c_end = 0;
 #endif

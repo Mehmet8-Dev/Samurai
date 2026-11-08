@@ -32,6 +32,28 @@ static inline int samurai_tsc_invariant_supported(void)
     return (edx & (1U << 8)) ? 1 : 0;
 }
 
+#elif defined(__aarch64__)
+
+static inline uint64_t samurai_rdtsc(void)
+{
+    uint64_t v = 0;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+
+static inline uint64_t samurai_arm_cntfrq(void)
+{
+    uint64_t freq = 0;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    return freq;
+}
+
+static inline int samurai_tsc_invariant_supported(void)
+{
+    // Generic Timer (cntvct_el0) on ARMv8 is architecturally invariant.
+    return 1;
+}
+
 #else
 
 static inline uint64_t samurai_rdtsc(void)
