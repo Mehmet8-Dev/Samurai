@@ -147,14 +147,18 @@ struct alignas(128) GeforceP2pGpuDeviceTxq {
   uint32_t flags;                      // kDoorbellFlagInitPmdRegs | kDoorbellFlagAutoReapOnWrap
   // Mutable GPU-PMD runtime state (updated atomically on device)
   uint32_t reserve_cursor;             // Monotonic packet/descriptor sequence number
-  uint32_t commit_tail;                // Latest tail index written to descriptor ring
+  uint32_t commit_tail;                // Latest contiguous tail index published to descriptor ring
   uint32_t last_pushed_tail;           // Last tail index kicked to NIC MMIO Doorbell
+  uint32_t published_cursor;           // Contiguous published sequence cursor (all seq < published_cursor ready)
+  uint32_t last_pushed_seq;            // Last monotonic published_cursor kicked to NIC MMIO Doorbell
   uint32_t pad0;
+  uint32_t* dev_slot_published_seq;    // Optional external per-slot published tag array (for rings > 4096)
   unsigned long long descriptors_written;
   unsigned long long doorbell_kicks;
   unsigned long long backpressure_drops;
   unsigned long long reaped_completions;
   unsigned long long tx_bytes;
+  uint32_t inline_slot_published_seq[4096]; // Zero-init safe inline per-slot published sequence tags
 };
 
 // Realtek r8169 constants & PMD MMIO registers
@@ -214,10 +218,13 @@ __host__ __device__ __forceinline__ uint32_t ixgbe_reg_txdctl(uint32_t queue_id)
 
 // Intel i40e constants
 constexpr uint64_t kI40eTxDescDtypeData = 0x0ULL;
+constexpr uint64_t kI40eTxDescDtypeDone = 0xFULL;
+constexpr uint64_t kI40eTxDescDtypeMask = 0xFULL;
 constexpr uint64_t kI40eTxDescCmdShift  = 4ULL;
 constexpr uint64_t kI40eTxDescCmdEop    = (0x0001ULL << kI40eTxDescCmdShift);
 constexpr uint64_t kI40eTxDescCmdRs     = (0x0002ULL << kI40eTxDescCmdShift);
 constexpr uint64_t kI40eTxDescCmdIcrc   = (0x0004ULL << kI40eTxDescCmdShift);
+constexpr uint32_t kMaxInlinePublishedSlots = 4096u;
 
 __host__ __device__ __forceinline__ uint32_t i40e_reg_qtx_tail(uint32_t queue_id) {
   return 0x00100000u + (queue_id * 0x1000u);
@@ -381,16 +388,95 @@ __device__ __forceinline__ bool device_reap_nic_tx_descriptor(
     case NicHardwareDriverType::kIntelI40e: {
       auto* ring = static_cast<volatile I40eTxDesc*>(dev_tx_desc_ring);
       volatile I40eTxDesc& desc = ring[desc_idx];
-      return (desc.buffer_addr != 0u);
+      if (desc.buffer_addr != 0ULL || desc.cmd_type_offset_bsz != 0ULL) {
+        const bool dd_done = (desc.cmd_type_offset_bsz & kI40eTxDescDtypeMask) == kI40eTxDescDtypeDone;
+        if (dd_done || auto_reap) {
+          desc.cmd_type_offset_bsz = 0ULL;
+          desc.buffer_addr = 0ULL;
+          __threadfence_system();
+          return true;
+        }
+      }
+      return false;
     }
 
     case NicHardwareDriverType::kMellanoxMlx5: {
       auto* ring = static_cast<volatile Mlx5TxWqe*>(dev_tx_desc_ring);
       volatile Mlx5TxWqe& wqe = ring[desc_idx];
-      return (wqe.data.addr != 0u);
+      if (wqe.data.addr != 0ULL) {
+        if (wqe.ctrl.signature == 0xFFu || auto_reap) {
+          wqe.data.addr = 0ULL;
+          wqe.ctrl.opmod_idx_opcode = 0u;
+          wqe.ctrl.signature = 0u;
+          __threadfence_system();
+          return true;
+        }
+      }
+      return false;
     }
   }
   return false;
+}
+
+/**
+ * @brief Non-destructive check whether hardware TX descriptor slot `desc_idx` is free or reapable.
+ * Used before advancing `reserve_cursor` so backpressure never creates holes or overruns `TDT`.
+ */
+__device__ __forceinline__ bool device_is_nic_tx_slot_available(
+    const void* dev_tx_desc_ring,
+    uint32_t desc_idx,
+    NicHardwareDriverType nic_type,
+    uint32_t flags) {
+  if (!dev_tx_desc_ring) {
+    return false;
+  }
+  const bool auto_reap = (flags & kDoorbellFlagAutoReapOnWrap) != 0u;
+  switch (nic_type) {
+    case NicHardwareDriverType::kRealtekR8169: {
+      const auto* ring = static_cast<const volatile Rtl8169TxDesc*>(dev_tx_desc_ring);
+      return ((ring[desc_idx].opts1 & kRtlDescOwn) == 0u) || auto_reap;
+    }
+    case NicHardwareDriverType::kIntelE1000e: {
+      const auto* ring = static_cast<const volatile E1000eTxDesc*>(dev_tx_desc_ring);
+      const volatile E1000eTxDesc& d = ring[desc_idx];
+      return (d.lower.data == 0u) || ((d.upper.data & kE1000TxdStatDd) != 0u) || auto_reap;
+    }
+    case NicHardwareDriverType::kIntelIxgbe: {
+      const auto* ring = static_cast<const volatile IxgbeAdvTxDesc*>(dev_tx_desc_ring);
+      const volatile IxgbeAdvTxDesc& d = ring[desc_idx];
+      return (d.read.cmd_type_len == 0u) || ((d.wb.status & kIxgbeTxdStatDd) != 0u) || auto_reap;
+    }
+    case NicHardwareDriverType::kIntelI40e: {
+      const auto* ring = static_cast<const volatile I40eTxDesc*>(dev_tx_desc_ring);
+      const volatile I40eTxDesc& d = ring[desc_idx];
+      return (d.buffer_addr == 0ULL && d.cmd_type_offset_bsz == 0ULL) ||
+             ((d.cmd_type_offset_bsz & kI40eTxDescDtypeMask) == kI40eTxDescDtypeDone) ||
+             auto_reap;
+    }
+    case NicHardwareDriverType::kMellanoxMlx5: {
+      const auto* ring = static_cast<const volatile Mlx5TxWqe*>(dev_tx_desc_ring);
+      const volatile Mlx5TxWqe& wqe = ring[desc_idx];
+      return (wqe.data.addr == 0ULL) || (wqe.ctrl.signature == 0xFFu) || auto_reap;
+    }
+  }
+  return false;
+}
+
+__device__ __forceinline__ uint32_t device_p2p_published_seq_tag(uint32_t seq) {
+  const uint32_t tag = seq + 1u;
+  return (tag == 0u) ? 1u : tag;
+}
+
+__device__ __forceinline__ uint32_t* device_p2p_published_slot_ptr(
+    GeforceP2pGpuDeviceTxq* txq,
+    uint32_t desc_idx) {
+  if (txq->dev_slot_published_seq != nullptr) {
+    return &txq->dev_slot_published_seq[desc_idx];
+  }
+  if (desc_idx < 4096u) {
+    return &txq->inline_slot_published_seq[desc_idx];
+  }
+  return nullptr;
 }
 
 /**
@@ -439,6 +525,8 @@ __device__ __forceinline__ bool device_write_nic_tx_descriptor(
       }
       desc.buffer_addr = bar1_slot_iova;
       desc.upper.data  = 0u;
+      // Ensure 64-bit BAR1 address is visible before publishing command/length to NIC DMA
+      __threadfence_system();
       const uint32_t cmd = static_cast<uint32_t>(kE1000TxdCmdEop | kE1000TxdCmdIfcs | kE1000TxdCmdRs);
       desc.lower.data  = static_cast<uint32_t>(pkt_len) | (cmd << 24);
       return true;
@@ -452,6 +540,7 @@ __device__ __forceinline__ bool device_write_nic_tx_descriptor(
       }
       desc.read.buffer_addr   = bar1_slot_iova;
       desc.read.olinfo_status = static_cast<uint32_t>(pkt_len) << kIxgbeAdvTxdPaylenShift;
+      __threadfence_system();
       desc.read.cmd_type_len  = kIxgbeAdvTxdDtypData |
                                 kIxgbeAdvTxdDcmdDext |
                                 kIxgbeAdvTxdDcmdEop  |
@@ -464,12 +553,17 @@ __device__ __forceinline__ bool device_write_nic_tx_descriptor(
     case NicHardwareDriverType::kIntelI40e: {
       auto* ring = static_cast<volatile I40eTxDesc*>(dev_tx_desc_ring);
       volatile I40eTxDesc& desc = ring[desc_idx];
+      if ((desc.buffer_addr != 0ULL || desc.cmd_type_offset_bsz != 0ULL) &&
+          ((desc.cmd_type_offset_bsz & kI40eTxDescDtypeMask) != kI40eTxDescDtypeDone)) {
+        return false;  // Previous packet not yet completed by Intel i40e DMA engine
+      }
       const uint64_t cmd = kI40eTxDescDtypeData |
                            kI40eTxDescCmdEop    |
                            kI40eTxDescCmdRs     |
                            kI40eTxDescCmdIcrc;
       const uint64_t bsz = (static_cast<uint64_t>(pkt_len) & 0x3FFFULL) << 34;
       desc.buffer_addr = bar1_slot_iova;
+      __threadfence_system();
       desc.cmd_type_offset_bsz = cmd | bsz;
       return true;
     }
@@ -477,10 +571,11 @@ __device__ __forceinline__ bool device_write_nic_tx_descriptor(
     case NicHardwareDriverType::kMellanoxMlx5: {
       auto* ring = static_cast<volatile Mlx5TxWqe*>(dev_tx_desc_ring);
       volatile Mlx5TxWqe& wqe = ring[desc_idx];
+      if (wqe.data.addr != 0ULL && wqe.ctrl.signature != 0xFFu) {
+        return false;  // Previous WQE not yet completed
+      }
       const uint32_t opmod_idx_opcode = kMlx5OpcodeSend | ((producer_seq & 0xFFFFu) << 8);
       const uint32_t qpn_ds = (mlx5_qpn << 8) | 4u;
-      wqe.ctrl.opmod_idx_opcode = bswap32_dev(opmod_idx_opcode);
-      wqe.ctrl.qpn_ds           = bswap32_dev(qpn_ds);
       wqe.ctrl.signature        = 0u;
       wqe.ctrl.fm_ce_se         = 0u;
       wqe.ctrl.imm              = 0u;
@@ -489,6 +584,9 @@ __device__ __forceinline__ bool device_write_nic_tx_descriptor(
       wqe.data.byte_count       = bswap32_dev(static_cast<uint32_t>(pkt_len));
       wqe.data.lkey             = bswap32_dev(mlx5_lkey);
       wqe.data.addr             = bswap64_dev(bar1_slot_iova);
+      __threadfence_system();
+      wqe.ctrl.qpn_ds           = bswap32_dev(qpn_ds);
+      wqe.ctrl.opmod_idx_opcode = bswap32_dev(opmod_idx_opcode);
       return true;
     }
   }
@@ -546,6 +644,18 @@ __device__ __forceinline__ void device_ring_nic_doorbell(
   __threadfence_system();
 }
 
+__device__ __forceinline__ bool device_is_valid_nic_driver_type(NicHardwareDriverType nic_type) {
+  switch (nic_type) {
+    case NicHardwareDriverType::kRealtekR8169:
+    case NicHardwareDriverType::kIntelE1000e:
+    case NicHardwareDriverType::kIntelIxgbe:
+    case NicHardwareDriverType::kIntelI40e:
+    case NicHardwareDriverType::kMellanoxMlx5:
+      return true;
+  }
+  return false;
+}
+
 /**
  * @brief Persistent Kernel Direct Enqueue Hook for Consumer GeForce BAR1 GPU-PMD.
  * Called per-lane inside `persistent_dataplane_kernel` without any CPU bridge thread.
@@ -555,13 +665,38 @@ __device__ __forceinline__ bool device_p2p_txq_try_enqueue(
     const uint8_t* packet_ptr,
     uint32_t packet_len) {
   if (!txq || txq->magic != kGeforceP2pDeviceTxqMagic || !txq->dev_tx_desc_ring ||
-      !packet_ptr || packet_len == 0u || txq->tx_ring_size == 0u) {
+      !packet_ptr || packet_len == 0u || txq->tx_ring_size < 2u) {
     return false;
   }
 
-  const uint32_t seq = atomicAdd(&txq->reserve_cursor, 1u);
-  const uint32_t desc_idx = seq & txq->tx_ring_mask;
   const auto nic_type = static_cast<NicHardwareDriverType>(txq->nic_driver_type);
+  if (!device_is_valid_nic_driver_type(nic_type)) {
+    atomicAdd(&txq->backpressure_drops, 1ULL);
+    return false;
+  }
+
+  const uint32_t max_usable = txq->tx_ring_size - 1u;
+  uint32_t seq = 0u;
+  uint32_t desc_idx = 0u;
+
+  while (true) {
+    const uint32_t cur = atomicAdd(&txq->reserve_cursor, 0u);
+    const uint32_t pub_floor = atomicAdd(&txq->published_cursor, 0u);
+    if ((cur - pub_floor) >= max_usable) {
+      atomicAdd(&txq->backpressure_drops, 1ULL);
+      return false;
+    }
+    const uint32_t cand_idx = cur & txq->tx_ring_mask;
+    if (!device_is_nic_tx_slot_available(txq->dev_tx_desc_ring, cand_idx, nic_type, txq->flags)) {
+      atomicAdd(&txq->backpressure_drops, 1ULL);
+      return false;
+    }
+    if (atomicCAS(&txq->reserve_cursor, cur, cur + 1u) == cur) {
+      seq = cur;
+      desc_idx = cand_idx;
+      break;
+    }
+  }
 
   if (device_reap_nic_tx_descriptor(
           txq->dev_tx_desc_ring, desc_idx, txq->tx_ring_size, nic_type, txq->flags)) {
@@ -600,41 +735,78 @@ __device__ __forceinline__ bool device_p2p_txq_try_enqueue(
     return false;
   }
 
+  __threadfence_system();
+  if (uint32_t* pub_slot = device_p2p_published_slot_ptr(txq, desc_idx)) {
+    atomicExch(pub_slot, device_p2p_published_seq_tag(seq));
+  }
+
   atomicAdd(&txq->descriptors_written, 1ULL);
   atomicAdd(&txq->tx_bytes, static_cast<unsigned long long>(clamped_len));
-  atomicExch(&txq->commit_tail, (seq + 1u) & txq->tx_ring_mask);
   return true;
 }
 
 /**
  * @brief Persistent Kernel Direct Commit & Doorbell Push Hook for Consumer GeForce BAR1 GPU-PMD.
- * Called once per warp batch by warp lane 0 inside `persistent_dataplane_kernel`.
+ * Advances `published_cursor` strictly across contiguous completed descriptor writes so out-of-order
+ * warps never kick NIC `TDT` past an unwritten descriptor. Returns true both when this warp rings
+ * the doorbell and when doorbell ringing was safely coalesced or deferred to an earlier in-flight warp.
  */
 __device__ __forceinline__ bool device_p2p_txq_try_commit_push(GeforceP2pGpuDeviceTxq* txq) {
-  if (!txq || txq->magic != kGeforceP2pDeviceTxqMagic || !txq->dev_nic_mmio_base) {
+  if (!txq || txq->magic != kGeforceP2pDeviceTxqMagic || !txq->dev_nic_mmio_base ||
+      txq->tx_ring_size < 2u) {
     return false;
   }
-  const uint32_t prod_seq = atomicAdd(&txq->reserve_cursor, 0u);
-  const uint32_t new_tail = prod_seq & txq->tx_ring_mask;
-  const auto nic_type = static_cast<NicHardwareDriverType>(txq->nic_driver_type);
 
-  device_ring_nic_doorbell(
-      txq->dev_nic_mmio_base,
-      nic_type,
-      txq->queue_id,
-      new_tail,
-      prod_seq,
-      txq->mlx5_qpn,
-      txq->doorbell_reg_offset);
+  uint32_t pub = atomicAdd(&txq->published_cursor, 0u);
+  while (true) {
+    const uint32_t idx = pub & txq->tx_ring_mask;
+    uint32_t* pub_slot = device_p2p_published_slot_ptr(txq, idx);
+    if (!pub_slot) {
+      pub = atomicAdd(&txq->reserve_cursor, 0u);
+      break;
+    }
+    const uint32_t have_tag = atomicAdd(pub_slot, 0u);
+    if (have_tag != device_p2p_published_seq_tag(pub)) {
+      break;
+    }
+    const uint32_t prev = atomicCAS(&txq->published_cursor, pub, pub + 1u);
+    if (prev == pub) {
+      pub += 1u;
+    } else {
+      pub = prev;
+    }
+  }
 
-  atomicExch(&txq->last_pushed_tail, new_tail);
-  atomicAdd(&txq->doorbell_kicks, 1ULL);
+  const uint32_t new_tail = pub & txq->tx_ring_mask;
+  atomicExch(&txq->commit_tail, new_tail);
+
+  uint32_t prev_pushed = atomicAdd(&txq->last_pushed_seq, 0u);
+  while (static_cast<int32_t>(pub - prev_pushed) > 0) {
+    const uint32_t seen = atomicCAS(&txq->last_pushed_seq, prev_pushed, pub);
+    if (seen == prev_pushed) {
+      const auto nic_type = static_cast<NicHardwareDriverType>(txq->nic_driver_type);
+      device_ring_nic_doorbell(
+          txq->dev_nic_mmio_base,
+          nic_type,
+          txq->queue_id,
+          new_tail,
+          pub,
+          txq->mlx5_qpn,
+          txq->doorbell_reg_offset);
+      atomicExch(&txq->last_pushed_tail, new_tail);
+      atomicAdd(&txq->doorbell_kicks, 1ULL);
+      return true;
+    }
+    prev_pushed = seen;
+  }
   return true;
 }
 
 /**
  * @brief CUDA kernel that reaps completed descriptors, populates NIC hardware TX descriptors
- *        for a batch of BAR1 slots, and rings the NIC MMIO Doorbell directly from the GPU.
+ *        for an arbitrary-length batch of BAR1 slots, and rings the NIC MMIO Doorbell once.
+ *        Uses two-phase availability check per chunk so descriptors past a busy ring entry are
+ *        never prematurely written, and enforces `usable_ring_cap = desc_ring_size - 1` (`TDT != TDH`).
  */
 __global__ void geforce_p2p_gpu_doorbell_tx_burst_kernel(
     uint64_t bar1_iova_base,
@@ -657,53 +829,115 @@ __global__ void geforce_p2p_gpu_doorbell_tx_burst_kernel(
     uint32_t* out_backpressure_drops,
     uint32_t* out_doorbell_kicks,
     uint32_t* out_reaped_completions) {
+  __shared__ uint32_t s_slot_avail[256];
   __shared__ uint32_t s_slot_ok[256];
   __shared__ uint32_t s_slot_reaped[256];
+  __shared__ uint32_t s_chunk_valid_n;
+  __shared__ uint32_t s_contiguous_ok;
+  __shared__ uint32_t s_total_reaped;
+  __shared__ uint32_t s_stop;
 
   const uint32_t tid = threadIdx.x;
-  const uint32_t batch_n = (count <= 256u) ? count : 256u;
   const auto nic_type = static_cast<NicHardwareDriverType>(nic_driver_type_raw);
-  const uint32_t ring_mask = desc_ring_size - 1u;
-
-  if (tid < batch_n) {
-    const uint32_t bar1_slot = slot_indices[tid];
-    const uint16_t pkt_len = pkt_lengths[tid];
-    const uint64_t slot_iova = bar1_iova_base + static_cast<uint64_t>(bar1_slot) * slot_stride;
-    const uint32_t desc_idx = (start_tx_head + tid) & ring_mask;
-    const uint32_t prod_seq = start_producer_seq + tid;
-
-    const bool reaped = device_reap_nic_tx_descriptor(
-        dev_tx_desc_ring, desc_idx, desc_ring_size, nic_type, doorbell_flags);
-    s_slot_reaped[tid] = reaped ? 1u : 0u;
-
-    const bool ok = device_write_nic_tx_descriptor(
-        dev_tx_desc_ring,
-        desc_idx,
-        desc_ring_size,
-        slot_iova,
-        pkt_len,
-        nic_type,
-        prod_seq,
-        mlx5_qpn,
-        mlx5_lkey);
-    s_slot_ok[tid] = ok ? 1u : 0u;
-  } else if (tid < 256u) {
-    s_slot_ok[tid] = 0u;
-    s_slot_reaped[tid] = 0u;
-  }
-
-  __syncthreads();
+  const uint32_t usable_ring_cap = (desc_ring_size > 1u) ? (desc_ring_size - 1u) : 0u;
+  const uint32_t ring_mask = (desc_ring_size > 0u) ? (desc_ring_size - 1u) : 0u;
+  const bool valid_cfg = (dev_tx_desc_ring != nullptr) &&
+                         (slot_indices != nullptr) &&
+                         (pkt_lengths != nullptr) &&
+                         (usable_ring_cap > 0u) &&
+                         device_is_valid_nic_driver_type(nic_type);
 
   if (tid == 0u) {
-    uint32_t contiguous_ok = 0u;
-    uint32_t total_reaped = 0u;
-    for (uint32_t i = 0u; i < batch_n; ++i) {
-      if (s_slot_ok[i] == 0u) {
-        break;
-      }
-      contiguous_ok += 1u;
-      total_reaped += s_slot_reaped[i];
+    s_chunk_valid_n = 0u;
+    s_contiguous_ok = 0u;
+    s_total_reaped = 0u;
+    s_stop = valid_cfg ? 0u : 1u;
+  }
+  __syncthreads();
+
+  for (uint32_t base = 0u; s_stop == 0u && base < count && base < usable_ring_cap; base += 256u) {
+    const uint32_t rem = count - base;
+    const uint32_t max_rem = usable_ring_cap - base;
+    const uint32_t eff_rem = (rem < max_rem) ? rem : max_rem;
+    const uint32_t chunk_n = (eff_rem <= 256u) ? eff_rem : 256u;
+
+    // Phase 1: Non-destructive contiguous slot availability check
+    if (tid < chunk_n) {
+      const uint32_t idx = base + tid;
+      const uint16_t pkt_len = pkt_lengths[idx];
+      const uint32_t desc_idx = (start_tx_head + idx) & ring_mask;
+      const bool avail = (pkt_len > 0u) &&
+          device_is_nic_tx_slot_available(dev_tx_desc_ring, desc_idx, nic_type, doorbell_flags);
+      s_slot_avail[tid] = avail ? 1u : 0u;
+    } else if (tid < 256u) {
+      s_slot_avail[tid] = 0u;
     }
+    __syncthreads();
+
+    if (tid == 0u) {
+      uint32_t valid_n = 0u;
+      for (uint32_t i = 0u; i < chunk_n; ++i) {
+        if (s_slot_avail[i] == 0u) {
+          s_stop = 1u;
+          break;
+        }
+        valid_n += 1u;
+      }
+      s_chunk_valid_n = valid_n;
+    }
+    __syncthreads();
+
+    // Phase 2: Write descriptors strictly within the verified contiguous prefix [0, s_chunk_valid_n)
+    const uint32_t valid_n = s_chunk_valid_n;
+    if (tid < valid_n) {
+      const uint32_t idx = base + tid;
+      const uint32_t bar1_slot = slot_indices[idx];
+      const uint16_t pkt_len = pkt_lengths[idx];
+      const uint64_t slot_iova = bar1_iova_base + static_cast<uint64_t>(bar1_slot) * slot_stride;
+      const uint32_t desc_idx = (start_tx_head + idx) & ring_mask;
+      const uint32_t prod_seq = start_producer_seq + idx;
+
+      const bool reaped = device_reap_nic_tx_descriptor(
+          dev_tx_desc_ring, desc_idx, desc_ring_size, nic_type, doorbell_flags);
+      s_slot_reaped[tid] = reaped ? 1u : 0u;
+
+      const bool ok = device_write_nic_tx_descriptor(
+          dev_tx_desc_ring,
+          desc_idx,
+          desc_ring_size,
+          slot_iova,
+          pkt_len,
+          nic_type,
+          prod_seq,
+          mlx5_qpn,
+          mlx5_lkey);
+      s_slot_ok[tid] = ok ? 1u : 0u;
+    } else if (tid < 256u) {
+      s_slot_ok[tid] = 0u;
+      s_slot_reaped[tid] = 0u;
+    }
+
+    __syncthreads();
+
+    if (tid == 0u) {
+      for (uint32_t i = 0u; i < valid_n; ++i) {
+        if (s_slot_ok[i] == 0u) {
+          s_stop = 1u;
+          break;
+        }
+        s_contiguous_ok += 1u;
+        s_total_reaped += s_slot_reaped[i];
+      }
+    }
+    __syncthreads();
+    if (s_stop != 0u) {
+      break;
+    }
+  }
+
+  if (tid == 0u) {
+    const uint32_t contiguous_ok = s_contiguous_ok;
+    const uint32_t total_reaped = s_total_reaped;
     const uint32_t drops = count - contiguous_ok;
     if (out_submitted_count) {
       *out_submitted_count = contiguous_ok;

@@ -10,6 +10,7 @@
 #include "gpu_packet_cuda/tx_backend_geforce_p2p.cuh"
 #include "gpu_packet_cuda/gpu_initiated_doorbell.cuh"
 #include "gpu_packet_cuda/geforce_p2p_runtime.cuh"
+#include "gpu_packet_cuda/kernels_telecom.cuh"
 #include "gpu_packet_cuda/preamble.cuh"
 #include "gpu_packet_cuda/kernels_l4.cuh"
 #include "gpu_packet_cuda/kernels_template_pool.cuh"

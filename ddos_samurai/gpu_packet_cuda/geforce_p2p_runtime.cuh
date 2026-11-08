@@ -1031,6 +1031,18 @@ struct GeforceP2pRingInstance {
   uint64_t synced_dev_txq_reaped = 0u;
   uint64_t synced_dev_txq_bytes = 0u;
 
+  // Zero-copy BAR1 ring batch generation state
+  cudaStream_t gen_stream = nullptr;
+  uint32_t* h_gen_slot_ids = nullptr;
+  uint32_t* d_gen_slot_ids = nullptr;
+  uint16_t* h_gen_lengths = nullptr;
+  uint16_t* d_gen_lengths = nullptr;
+  uint32_t gen_scratch_cap = 0u;
+  uint32_t gen_packet_seq = 0u;
+  uint32_t pending_start_slot = 0u;
+  uint32_t pending_slot_count = 0u;
+  bool has_pending_committed_batch = false;
+
   void cleanup_gpu_doorbell() {
     if (d_db_slot_ids) { (void)cudaFree(d_db_slot_ids); d_db_slot_ids = nullptr; }
     if (d_db_lengths) { (void)cudaFree(d_db_lengths); d_db_lengths = nullptr; }
@@ -1038,6 +1050,10 @@ struct GeforceP2pRingInstance {
     db_scratch_cap = 0u;
     if (doorbell_stream) { (void)cudaStreamDestroy(doorbell_stream); doorbell_stream = nullptr; }
     if (host_device_txq) {
+      if (host_device_txq->dev_slot_published_seq) {
+        (void)cudaFree(host_device_txq->dev_slot_published_seq);
+        host_device_txq->dev_slot_published_seq = nullptr;
+      }
       (void)cudaFreeHost(host_device_txq);
       host_device_txq = nullptr;
       dev_device_txq = nullptr;
@@ -1073,11 +1089,30 @@ struct GeforceP2pRingInstance {
 
   ~GeforceP2pRingInstance() {
     cleanup_gpu_doorbell();
+    if (h_gen_slot_ids) (void)cudaFreeHost(h_gen_slot_ids);
+    if (h_gen_lengths) (void)cudaFreeHost(h_gen_lengths);
+    if (gen_stream) (void)cudaStreamDestroy(gen_stream);
     if (d_rx_slot_ids) (void)cudaFree(d_rx_slot_ids);
     if (d_rx_lengths) (void)cudaFree(d_rx_lengths);
     if (d_rx_counts) (void)cudaFree(d_rx_counts);
     if (verify_stream) (void)cudaStreamDestroy(verify_stream);
   }
+};
+
+struct Bar1RingBatchContext {
+  int handle = -1;
+  uint8_t* ring_dev_base = nullptr;
+  uint8_t* ring_host_base = nullptr;
+  uint32_t slot_stride = 0u;
+  uint32_t ring_slot_count = 0u;
+  uint32_t start_slot = 0u;
+  uint32_t packet_seq_base = 0u;
+  cudaStream_t gen_stream = nullptr;
+  uint32_t* h_slot_ids = nullptr;
+  uint32_t* d_slot_ids = nullptr;
+  uint16_t* h_lengths = nullptr;
+  uint16_t* d_lengths = nullptr;
+  int cuda_device_index = 0;
 };
 
 // DPDK C-ABI adapter callbacks for GeforceP2pNicTransportOpsV1
@@ -1258,6 +1293,7 @@ class GeforceP2pRegistry {
     const int handle = next_handle_++;
     inst->stats.queue_id = handle;
     rings_[handle] = std::move(inst);
+    active_ring_handle_ = handle;
     *out_handle = handle;
     write_error(err, err_len, "");
     return 0;
@@ -1271,8 +1307,351 @@ class GeforceP2pRegistry {
       return -1;
     }
     rings_.erase(it);
+    if (active_ring_handle_ == handle) {
+      active_ring_handle_ = rings_.empty() ? -1 : rings_.begin()->first;
+    }
     write_error(err, err_len, "");
     return 0;
+  }
+
+  int set_active_ring_handle(int handle, char* err, size_t err_len) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (rings_.find(handle) == rings_.end()) {
+      write_error(err, err_len, "geforce_p2p: set_active_ring_handle given invalid ring handle");
+      return -1;
+    }
+    active_ring_handle_ = handle;
+    write_error(err, err_len, "");
+    return 0;
+  }
+
+  int get_active_ring_handle() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (active_ring_handle_ > 0 && rings_.find(active_ring_handle_) != rings_.end()) {
+      return active_ring_handle_;
+    }
+    if (!rings_.empty()) {
+      active_ring_handle_ = rings_.begin()->first;
+      return active_ring_handle_;
+    }
+    return -1;
+  }
+
+  int get_or_create_active_ring(
+      uint32_t min_slots,
+      uint32_t min_stride,
+      int* out_handle,
+      char* err,
+      size_t err_len) {
+    if (!out_handle) {
+      write_error(err, err_len, "out_handle is null");
+      return -1;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (active_ring_handle_ > 0) {
+        auto it = rings_.find(active_ring_handle_);
+        if (it != rings_.end() && it->second->slots.size() >= min_slots &&
+            it->second->cfg.slot_stride >= min_stride) {
+          *out_handle = active_ring_handle_;
+          write_error(err, err_len, "");
+          return 0;
+        }
+      }
+      for (const auto& kv : rings_) {
+        if (kv.second && kv.second->slots.size() >= min_slots &&
+            kv.second->cfg.slot_stride >= min_stride) {
+          active_ring_handle_ = kv.first;
+          *out_handle = kv.first;
+          write_error(err, err_len, "");
+          return 0;
+        }
+      }
+    }
+
+    uint32_t target_slots = std::max<uint32_t>(1024u, min_slots * 2u);
+    uint32_t pow2_slots = 64u;
+    while (pow2_slots < target_slots && pow2_slots < (1u << 20)) {
+      pow2_slots <<= 1u;
+    }
+    GeforceP2pConfigV1 auto_cfg{};
+    auto_cfg.ring_slot_count = pow2_slots;
+    auto_cfg.slot_stride = std::max<uint32_t>(2048u, (min_stride + 63u) & ~63u);
+    auto_cfg.dpdk_port_handle = -1;
+    if (const char* env_port = std::getenv("SAMURAI_GEFORCE_P2P_DPDK_PORT"); env_port && *env_port) {
+      auto_cfg.dpdk_port_handle = std::atoi(env_port);
+    }
+    if (const char* env_bdf = std::getenv("SAMURAI_GEFORCE_P2P_GPU_BDF"); env_bdf && *env_bdf) {
+      std::snprintf(auto_cfg.pci_gpu_bdf, sizeof(auto_cfg.pci_gpu_bdf), "%s", env_bdf);
+    }
+    if (const char* env_nic = std::getenv("SAMURAI_GEFORCE_P2P_NIC_BDF"); env_nic && *env_nic) {
+      std::snprintf(auto_cfg.pci_nic_bdf, sizeof(auto_cfg.pci_nic_bdf), "%s", env_nic);
+    }
+    return create_ring(&auto_cfg, out_handle, err, err_len);
+  }
+
+  int begin_bar1_batch_generation(
+      int handle,
+      uint32_t count,
+      Bar1RingBatchContext* out_ctx,
+      char* err,
+      size_t err_len) {
+    if (!out_ctx || count == 0u) {
+      write_error(err, err_len, "invalid begin_bar1_batch_generation arguments");
+      return -1;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = rings_.find(handle);
+    if (it == rings_.end()) {
+      write_error(err, err_len, "geforce_p2p invalid ring handle");
+      return -1;
+    }
+    auto& ring = *it->second;
+    if (!ring.arena.initialized || !ring.arena.cuda_dev_ptr || !ring.arena.host_bar1_ptr) {
+      write_error(err, err_len, "geforce_p2p BAR1 arena pointers not initialized");
+      return -1;
+    }
+    const uint32_t n_slots = static_cast<uint32_t>(ring.slots.size());
+    if (count > n_slots) {
+      write_error(err, err_len, "geforce_p2p: batch count exceeds BAR1 ring_slot_count");
+      return -1;
+    }
+
+    // Reclaim any unsubmitted slots from an abandoned prior batch before claiming new slots
+    if (ring.has_pending_committed_batch) {
+      for (uint32_t i = 0u; i < ring.pending_slot_count; ++i) {
+        const uint32_t idx = (ring.pending_start_slot + i) % n_slots;
+        if (ring.slots[idx].state == zero_copy::DescriptorOwnershipState::kReadyForNic ||
+            ring.slots[idx].state == zero_copy::DescriptorOwnershipState::kGpuWriting) {
+          ring.slots[idx].state = zero_copy::DescriptorOwnershipState::kFree;
+        }
+      }
+      ring.claim_cursor = ring.pending_start_slot;
+      ring.has_pending_committed_batch = false;
+      ring.pending_slot_count = 0u;
+    }
+
+    const uint32_t start = ring.claim_cursor;
+    for (uint32_t i = 0u; i < count; ++i) {
+      const uint32_t idx = (start + i) % n_slots;
+      auto& slot = ring.slots[idx];
+      if (slot.state == zero_copy::DescriptorOwnershipState::kComplete) {
+        slot.state = zero_copy::DescriptorOwnershipState::kFree;
+      }
+      if (!zero_copy::is_valid_descriptor_transition(
+              slot.state, zero_copy::DescriptorOwnershipState::kGpuWriting)) {
+        for (uint32_t j = 0u; j < i; ++j) {
+          ring.slots[(start + j) % n_slots].state = zero_copy::DescriptorOwnershipState::kFree;
+        }
+        ring.stats.tx_drops += (count - i);
+        write_error(err, err_len, "geforce_p2p BAR1 ring slot busy");
+        return -1;
+      }
+      slot.state = zero_copy::DescriptorOwnershipState::kGpuWriting;
+    }
+
+    (void)cudaSetDevice(ring.arena.cuda_device_index);
+    if (!ring.gen_stream) {
+      if (cudaStreamCreateWithFlags(&ring.gen_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        for (uint32_t i = 0u; i < count; ++i) {
+          ring.slots[(start + i) % n_slots].state = zero_copy::DescriptorOwnershipState::kFree;
+        }
+        write_error(err, err_len, "geforce_p2p: cudaStreamCreateWithFlags failed for gen_stream");
+        return -1;
+      }
+    }
+    if (ring.gen_scratch_cap < count) {
+      if (ring.h_gen_slot_ids) { (void)cudaFreeHost(ring.h_gen_slot_ids); ring.h_gen_slot_ids = nullptr; ring.d_gen_slot_ids = nullptr; }
+      if (ring.h_gen_lengths) { (void)cudaFreeHost(ring.h_gen_lengths); ring.h_gen_lengths = nullptr; ring.d_gen_lengths = nullptr; }
+      const uint32_t new_cap = std::max<uint32_t>(count, 1024u);
+      if (cudaHostAlloc(reinterpret_cast<void**>(&ring.h_gen_slot_ids), new_cap * sizeof(uint32_t), cudaHostAllocMapped) != cudaSuccess ||
+          cudaHostGetDevicePointer(&ring.d_gen_slot_ids, ring.h_gen_slot_ids, 0) != cudaSuccess ||
+          cudaHostAlloc(reinterpret_cast<void**>(&ring.h_gen_lengths), new_cap * sizeof(uint16_t), cudaHostAllocMapped) != cudaSuccess ||
+          cudaHostGetDevicePointer(&ring.d_gen_lengths, ring.h_gen_lengths, 0) != cudaSuccess) {
+        if (ring.h_gen_slot_ids) { (void)cudaFreeHost(ring.h_gen_slot_ids); ring.h_gen_slot_ids = nullptr; ring.d_gen_slot_ids = nullptr; }
+        if (ring.h_gen_lengths) { (void)cudaFreeHost(ring.h_gen_lengths); ring.h_gen_lengths = nullptr; ring.d_gen_lengths = nullptr; }
+        ring.gen_scratch_cap = 0u;
+        for (uint32_t i = 0u; i < count; ++i) {
+          ring.slots[(start + i) % n_slots].state = zero_copy::DescriptorOwnershipState::kFree;
+        }
+        write_error(err, err_len, "geforce_p2p: cudaHostAllocMapped failed for BAR1 generation metadata");
+        return -1;
+      }
+      ring.gen_scratch_cap = new_cap;
+    }
+
+    ring.claim_cursor = (start + count) % n_slots;
+    const uint32_t seq_base = ring.gen_packet_seq;
+    ring.gen_packet_seq += count;
+
+    out_ctx->handle = handle;
+    out_ctx->ring_dev_base = ring.arena.cuda_dev_ptr;
+    out_ctx->ring_host_base = ring.arena.host_bar1_ptr;
+    out_ctx->slot_stride = ring.cfg.slot_stride;
+    out_ctx->ring_slot_count = n_slots;
+    out_ctx->start_slot = start;
+    out_ctx->packet_seq_base = seq_base;
+    out_ctx->gen_stream = ring.gen_stream;
+    out_ctx->h_slot_ids = ring.h_gen_slot_ids;
+    out_ctx->d_slot_ids = ring.d_gen_slot_ids;
+    out_ctx->h_lengths = ring.h_gen_lengths;
+    out_ctx->d_lengths = ring.d_gen_lengths;
+    out_ctx->cuda_device_index = ring.arena.cuda_device_index;
+    write_error(err, err_len, "");
+    return 0;
+  }
+
+  int complete_bar1_batch_generation(
+      int handle,
+      uint32_t start_slot,
+      uint32_t count,
+      bool kernel_ok,
+      uint16_t* out_max_pkt_len,
+      size_t* out_total_wire_bytes,
+      char* err,
+      size_t err_len) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = rings_.find(handle);
+    if (it == rings_.end()) {
+      write_error(err, err_len, "geforce_p2p invalid ring handle");
+      return -1;
+    }
+    auto& ring = *it->second;
+    const uint32_t n_slots = static_cast<uint32_t>(ring.slots.size());
+    if (!kernel_ok || !ring.h_gen_lengths || count == 0u || count > ring.gen_scratch_cap) {
+      for (uint32_t i = 0u; i < count && n_slots > 0u; ++i) {
+        ring.slots[(start_slot + i) % n_slots].state = zero_copy::DescriptorOwnershipState::kFree;
+      }
+      ring.claim_cursor = start_slot % std::max<uint32_t>(n_slots, 1u);
+      write_error(err, err_len, "geforce_p2p: BAR1 packet generation kernel failed");
+      return -1;
+    }
+
+    uint16_t max_len = 0u;
+    size_t sum_bytes = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+      const uint16_t len = ring.h_gen_lengths[i];
+      if (len == 0u) {
+        for (uint32_t j = 0u; j < count; ++j) {
+          ring.slots[(start_slot + j) % n_slots].state = zero_copy::DescriptorOwnershipState::kFree;
+        }
+        ring.claim_cursor = start_slot;
+        ring.stats.tx_errors += 1u;
+        write_error(err, err_len, "geforce_p2p: zero-length packet generated in BAR1 ring slot");
+        return -1;
+      }
+      const uint32_t idx = (start_slot + i) % n_slots;
+      ring.slots[idx].packet_len = len;
+      ring.slots[idx].state = zero_copy::DescriptorOwnershipState::kReadyForNic;
+      if (len > max_len) max_len = len;
+      sum_bytes += len;
+    }
+
+    if (ring.slots[ring.tx_cursor].state != zero_copy::DescriptorOwnershipState::kReadyForNic) {
+      ring.tx_cursor = start_slot;
+    }
+    ring.pending_start_slot = start_slot;
+    ring.pending_slot_count = count;
+    ring.has_pending_committed_batch = true;
+    std::atomic_thread_fence(std::memory_order_release);
+
+    if (out_max_pkt_len) *out_max_pkt_len = max_len;
+    if (out_total_wire_bytes) *out_total_wire_bytes = sum_bytes;
+    write_error(err, err_len, "");
+    return 0;
+  }
+
+  bool owns_bar1_pointer(const void* ptr, int* out_handle = nullptr) {
+    if (!ptr) return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto* byte_ptr = static_cast<const uint8_t*>(ptr);
+    for (const auto& kv : rings_) {
+      if (!kv.second || !kv.second->arena.initialized) continue;
+      const auto& a = kv.second->arena;
+      if (a.host_bar1_ptr && byte_ptr >= a.host_bar1_ptr &&
+          byte_ptr < (a.host_bar1_ptr + a.arena_bytes)) {
+        if (out_handle) *out_handle = kv.first;
+        return true;
+      }
+      if (a.cuda_dev_ptr && byte_ptr >= a.cuda_dev_ptr &&
+          byte_ptr < (a.cuda_dev_ptr + a.arena_bytes)) {
+        if (out_handle) *out_handle = kv.first;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool release_unsubmitted_batch_for_pointer(const void* ptr) {
+    if (!ptr) return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto* byte_ptr = static_cast<const uint8_t*>(ptr);
+    for (auto& kv : rings_) {
+      if (!kv.second || !kv.second->arena.initialized) continue;
+      auto& ring = *kv.second;
+      const auto& a = ring.arena;
+      const bool match_host = a.host_bar1_ptr && byte_ptr >= a.host_bar1_ptr &&
+                              byte_ptr < (a.host_bar1_ptr + a.arena_bytes);
+      const bool match_dev = a.cuda_dev_ptr && byte_ptr >= a.cuda_dev_ptr &&
+                             byte_ptr < (a.cuda_dev_ptr + a.arena_bytes);
+      if (!match_host && !match_dev) continue;
+
+      const uint32_t n_slots = static_cast<uint32_t>(ring.slots.size());
+      if (ring.has_pending_committed_batch && n_slots > 0u) {
+        for (uint32_t i = 0u; i < ring.pending_slot_count; ++i) {
+          const uint32_t idx = (ring.pending_start_slot + i) % n_slots;
+          if (ring.slots[idx].state == zero_copy::DescriptorOwnershipState::kReadyForNic ||
+              ring.slots[idx].state == zero_copy::DescriptorOwnershipState::kGpuWriting) {
+            ring.slots[idx].state = zero_copy::DescriptorOwnershipState::kFree;
+          }
+        }
+        ring.claim_cursor = ring.pending_start_slot;
+        ring.has_pending_committed_batch = false;
+        ring.pending_slot_count = 0u;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  int tx_bar1_ring_batch(
+      int preferred_handle,
+      const uint32_t* slot_ids,
+      const uint16_t* lengths,
+      uint32_t count,
+      uint32_t* out_submitted,
+      char* err,
+      size_t err_len) {
+    if (!out_submitted) {
+      write_error(err, err_len, "out_submitted is null");
+      return -1;
+    }
+    *out_submitted = 0u;
+    if (count == 0u) {
+      write_error(err, err_len, "");
+      return 0;
+    }
+    const int handle = (preferred_handle > 0) ? preferred_handle : get_active_ring_handle();
+    if (handle <= 0) {
+      write_error(err, err_len, "geforce_p2p: no active BAR1 ring instance created");
+      return -1;
+    }
+    bool use_pending_ring_burst = false;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = rings_.find(handle);
+      if (it == rings_.end()) {
+        write_error(err, err_len, "geforce_p2p invalid ring handle");
+        return -1;
+      }
+      if (it->second->has_pending_committed_batch || !slot_ids || !lengths) {
+        use_pending_ring_burst = true;
+      }
+    }
+    if (use_pending_ring_burst) {
+      return nic_tx_burst(handle, count, out_submitted, err, err_len);
+    }
+    return submit_slot_batch(handle, slot_ids, lengths, count, out_submitted, err, err_len);
   }
 
   int bind_nic_transport(int handle, const GeforceP2pNicTransportOpsV1* ops, char* err, size_t err_len) {
@@ -1455,6 +1834,14 @@ class GeforceP2pRegistry {
         ring.slots[ready_indices[i]].state = zero_copy::DescriptorOwnershipState::kReadyForNic;
       }
       ring.tx_cursor = (ring.tx_cursor + db_sent) % n_slots;
+      if (ring.has_pending_committed_batch) {
+        const uint32_t consumed = std::min<uint32_t>(db_sent, ring.pending_slot_count);
+        ring.pending_start_slot = (ring.pending_start_slot + consumed) % n_slots;
+        ring.pending_slot_count -= consumed;
+        if (ring.pending_slot_count == 0u) {
+          ring.has_pending_committed_batch = false;
+        }
+      }
       *out_transmitted = db_sent;
       return 0;
     }
@@ -1501,6 +1888,14 @@ class GeforceP2pRegistry {
     }
 
     ring.tx_cursor = (ring.tx_cursor + transmitted) % n_slots;
+    if (ring.has_pending_committed_batch) {
+      const uint32_t consumed = std::min<uint32_t>(transmitted, ring.pending_slot_count);
+      ring.pending_start_slot = (ring.pending_start_slot + consumed) % n_slots;
+      ring.pending_slot_count -= consumed;
+      if (ring.pending_slot_count == 0u) {
+        ring.has_pending_committed_batch = false;
+      }
+    }
     *out_transmitted = transmitted;
     write_error(err, err_len, "");
     return 0;
@@ -2263,6 +2658,16 @@ class GeforceP2pRegistry {
     ring.host_device_txq->doorbell_reg_offset = db_cfg->doorbell_reg_offset;
     ring.host_device_txq->slot_stride = ring.cfg.slot_stride;
     ring.host_device_txq->flags = db_cfg->flags;
+    if (ring_sz > doorbell::kMaxInlinePublishedSlots) {
+      uint32_t* ext_pub = nullptr;
+      if (cudaMalloc(reinterpret_cast<void**>(&ext_pub), ring_sz * sizeof(uint32_t)) != cudaSuccess || !ext_pub) {
+        write_error(err, err_len, "geforce_p2p: cudaMalloc failed for dev_slot_published_seq");
+        ring.cleanup_gpu_doorbell();
+        return -1;
+      }
+      (void)cudaMemset(ext_pub, 0, ring_sz * sizeof(uint32_t));
+      ring.host_device_txq->dev_slot_published_seq = ext_pub;
+    }
 
     if (cudaStreamCreateWithFlags(&ring.doorbell_stream, cudaStreamNonBlocking) != cudaSuccess) {
       write_error(err, err_len, "geforce_p2p: cudaStreamCreateWithFlags failed for doorbell_stream");
@@ -2326,35 +2731,37 @@ class GeforceP2pRegistry {
     }
 
     (void)cudaSetDevice(ring.arena.cuda_device_index);
-    const uint32_t max_chunk = 256u;
-    if (ring.db_scratch_cap < max_chunk) {
+    const uint32_t desc_ring_sz = (ring.doorbell_cfg.tx_ring_size >= 16u) ? ring.doorbell_cfg.tx_ring_size : 256u;
+    const uint32_t usable_desc_cap = (desc_ring_sz > 1u) ? (desc_ring_sz - 1u) : 1u;
+    const uint32_t max_chunk = std::min<uint32_t>(std::max<uint32_t>(count, 1u), usable_desc_cap);
+    const uint32_t alloc_chunk = std::max<uint32_t>(max_chunk, 256u);
+    if (ring.db_scratch_cap < alloc_chunk) {
       if (ring.d_db_slot_ids) (void)cudaFree(ring.d_db_slot_ids);
       if (ring.d_db_lengths) (void)cudaFree(ring.d_db_lengths);
       if (ring.d_db_counters) (void)cudaFree(ring.d_db_counters);
-      if (cudaMalloc(reinterpret_cast<void**>(&ring.d_db_slot_ids), max_chunk * sizeof(uint32_t)) != cudaSuccess ||
-          cudaMalloc(reinterpret_cast<void**>(&ring.d_db_lengths), max_chunk * sizeof(uint16_t)) != cudaSuccess ||
+      if (cudaMalloc(reinterpret_cast<void**>(&ring.d_db_slot_ids), alloc_chunk * sizeof(uint32_t)) != cudaSuccess ||
+          cudaMalloc(reinterpret_cast<void**>(&ring.d_db_lengths), alloc_chunk * sizeof(uint16_t)) != cudaSuccess ||
           cudaMalloc(reinterpret_cast<void**>(&ring.d_db_counters), 4u * sizeof(uint32_t)) != cudaSuccess) {
         write_error(err, err_len, "geforce_p2p: cudaMalloc failed for GPU doorbell scratch buffers");
         return -1;
       }
-      ring.db_scratch_cap = max_chunk;
+      ring.db_scratch_cap = alloc_chunk;
     }
 
     const uint32_t n_slots = static_cast<uint32_t>(ring.slots.size());
-    const uint32_t desc_ring_sz = ring.doorbell_cfg.tx_ring_size;
+    std::vector<uint32_t> norm_slots(max_chunk, 0u);
     uint32_t total_submitted = 0u;
     uint32_t offset = 0u;
 
     while (offset < count) {
       const uint32_t chunk = std::min<uint32_t>(count - offset, max_chunk);
-      uint32_t norm_slots[256];
       for (uint32_t i = 0u; i < chunk; ++i) {
         norm_slots[i] = slot_ids[offset + i] % n_slots;
       }
 
       (void)cudaMemsetAsync(ring.d_db_counters, 0, 4u * sizeof(uint32_t), ring.doorbell_stream);
       (void)cudaMemcpyAsync(
-          ring.d_db_slot_ids, norm_slots, chunk * sizeof(uint32_t), cudaMemcpyHostToDevice, ring.doorbell_stream);
+          ring.d_db_slot_ids, norm_slots.data(), chunk * sizeof(uint32_t), cudaMemcpyHostToDevice, ring.doorbell_stream);
       (void)cudaMemcpyAsync(
           ring.d_db_lengths,
           lengths + offset,
@@ -2448,11 +2855,16 @@ class GeforceP2pRegistry {
 
   std::mutex mu_;
   int next_handle_ = 1;
+  int active_ring_handle_ = -1;
   std::unordered_map<int, std::unique_ptr<GeforceP2pRingInstance>> rings_;
   GeforceP2pDoorbellConfigV1 default_doorbell_cfg_{};
   bool has_default_doorbell_cfg_ = false;
   uint64_t default_bar1_iova_override_ = 0u;
 };
+
+inline int api_set_active_ring_handle(int handle, char* err, size_t err_len) {
+  return GeforceP2pRegistry::instance().set_active_ring_handle(handle, err, err_len);
+}
 
 inline int api_create_tx_ring(const GeforceP2pConfigV1* cfg, int* out_handle, char* err, size_t err_len) {
   return GeforceP2pRegistry::instance().create_ring(cfg, out_handle, err, err_len);

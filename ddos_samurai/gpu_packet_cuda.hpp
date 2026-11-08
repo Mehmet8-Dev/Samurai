@@ -554,6 +554,36 @@ int samurai_gpu_packet_p2p_get_arena_info(
     void** out_dev_ptr,
     size_t* out_size);
 
+// Telecom GTP-U 4G/5G Hardware Data Plane C ABI.
+int samurai_gpu_packet_generate_gtpu_packets(
+    const char* config_json,
+    int count,
+    void** out_packets_ptr,
+    size_t* out_total_bytes,
+    int* out_packet_size);
+int samurai_gpu_packet_telco_upsert_tunnels_v1(
+    const void* entries,
+    uint32_t count);
+int samurai_gpu_packet_telco_clear_tunnels_v1(void);
+int samurai_gpu_packet_telco_verify_rx_batch_v1(
+    const void* rx_base_ptr,
+    uint32_t slot_stride,
+    uint32_t count,
+    void* out_stats);
+int samurai_gpu_packet_telco_read_rx_stats_v1(
+    void* out_stats);
+int samurai_gpu_packet_p2p_tx_bar1_batch_v1(
+    const uint32_t* slot_indices,
+    const uint16_t* pkt_lengths,
+    uint32_t count,
+    uint32_t* out_submitted_count);
+int samurai_gpu_packet_p2p_set_active_ring_v1(int ring_handle);
+int samurai_gpu_packet_p2p_get_active_ring_v1(void);
+int samurai_gpu_packet_telco_attach_cups_shm_v1(
+    const char* shm_path,
+    uint32_t max_tunnels);
+int samurai_gpu_packet_telco_detach_cups_shm_v1(void);
+
 // Isolated defense/classifier C ABI.
 int samurai_gpu_packet_defense_init(
     const char* runtime,

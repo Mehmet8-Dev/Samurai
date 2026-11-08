@@ -18,9 +18,11 @@
 #include "kernels_template_pool.cuh"
 #include "kernels_fragment_amp.cuh"
 #include "kernels_icmp_utils.cuh"
+#include "kernels_telecom.cuh"
 #undef SAMURAI_GPU_PACKET_CUDA_FRAGMENT_CHAIN
 #else
 #include "tx_backend_doca_gpunetio.cuh"
+#include "kernels_telecom.cuh"
 #endif
 #ifndef SAMURAI_WITH_DOCA_GPUNETIO_DEVICE
 #define SAMURAI_WITH_DOCA_GPUNETIO_DEVICE 0
@@ -1273,6 +1275,7 @@ enum class PersistentStreamKind : int32_t {
   kIcmp = 1,
   kPcapReplay = 2,
   kRamp = 3,
+  kTelecom = 4,
 };
 
 constexpr int kPersistentUmemFrameSize = 2048;
@@ -1482,6 +1485,24 @@ struct PersistentDeviceStreamState {
   uint16_t template_base_tcp_flags = 0;
   uint8_t template_valid = 0;
   uint8_t template_packet[kPersistentMaxPacketBytes]{};
+  // Telecom GTP-U Extension State
+  uint32_t telco_teid_start = 0;
+  uint32_t telco_teid_count = 1;
+  uint32_t telco_ue_ip_start = 0;
+  uint32_t telco_ue_ip_count = 1;
+  uint32_t telco_inner_dst_ip = 0;
+  uint16_t telco_inner_src_port = 0;
+  uint16_t telco_inner_dst_port = 80;
+  uint16_t telco_svlan_tci = 0;
+  uint16_t telco_cvlan_tci = 0;
+  uint8_t  telco_qfi = 9;
+  uint8_t  telco_pdu_type = 1;
+  uint8_t  telco_inner_proto = 17;
+  uint8_t  telco_vlan_depth = 0;
+  uint8_t  telco_with_seq = 1;
+  uint8_t  telco_with_qfi_ext = 1;
+  uint8_t  telco_echo_mode = 0;
+  uint8_t  telco_pad = 0;
 };
 
 struct PersistentStreamHotState {
@@ -1552,6 +1573,23 @@ struct PersistentStreamState {
   std::array<uint8_t, 6> dst_mac{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
   uint64_t tx_base_timestamp_ns = 0u;
   uint32_t tx_ipg_ns = 0u;
+  // Telecom GTP-U Extension State
+  uint32_t telco_teid_start = 1;
+  uint32_t telco_teid_count = 1;
+  uint32_t telco_ue_ip_start = 0;
+  uint32_t telco_ue_ip_count = 1;
+  uint32_t telco_inner_dst_ip = 0;
+  uint16_t telco_inner_src_port = 0;
+  uint16_t telco_inner_dst_port = 80;
+  uint16_t telco_svlan_tci = 0;
+  uint16_t telco_cvlan_tci = 0;
+  uint8_t  telco_qfi = 9;
+  uint8_t  telco_pdu_type = 1;
+  uint8_t  telco_inner_proto = 17;
+  uint8_t  telco_vlan_depth = 0;
+  uint8_t  telco_with_seq = 1;
+  uint8_t  telco_with_qfi_ext = 1;
+  uint8_t  telco_echo_mode = 0;
   int active = 1;
 };
 
@@ -2966,6 +3004,9 @@ inline PersistentStreamKind stream_kind_from_string(const std::string& stream_ty
   if (t == "ramp") {
     return PersistentStreamKind::kRamp;
   }
+  if (t == "gtpu" || t == "gtp-u" || t == "telecom" || t == "telco") {
+    return PersistentStreamKind::kTelecom;
+  }
   if (protocol == 1) {
     return PersistentStreamKind::kIcmp;
   }
@@ -3892,6 +3933,11 @@ __device__ __forceinline__ void persistent_copy_bytes_vectorized(
   }
 }
 
+__device__ ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1* g_dev_telco_tunnels = nullptr;
+__device__ uint32_t g_dev_telco_tunnel_count = 0u;
+__device__ const ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1* g_dev_telco_cups_hdr = nullptr;
+__device__ ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuRxStatsV1* g_dev_telco_rx_stats = nullptr;
+
 __device__ inline void persistent_write_packet(
     PersistentRingSlot* slot,
     uint8_t* payload,
@@ -3912,6 +3958,51 @@ __device__ inline void persistent_write_packet(
     } else {
       slot->tx_timestamp_ns = tx_base_timestamp_ns;
     }
+  }
+
+  // Direct Telecom / GTP-U 4G/5G hardware packet generation
+  if (sv->stream_kind == static_cast<int32_t>(PersistentStreamKind::kTelecom)) {
+    ddos_samurai::gpu_packet_cuda::telecom::TelcoGtpuStreamConfig cfg{};
+    cfg.teid_start = sv->telco_teid_start;
+    cfg.teid_count = sv->telco_teid_count;
+    cfg.ue_ip_start = sv->telco_ue_ip_start ? sv->telco_ue_ip_start : sv->src_ip;
+    cfg.ue_ip_count = sv->telco_ue_ip_count;
+    cfg.inner_dst_ip = sv->telco_inner_dst_ip ? sv->telco_inner_dst_ip : sv->target_ip;
+    cfg.outer_src_ip = sv->src_ip;
+    cfg.outer_dst_ip = sv->target_ip;
+    cfg.inner_src_port = sv->telco_inner_src_port ? sv->telco_inner_src_port : sv->source_port;
+    cfg.inner_dst_port = sv->telco_inner_dst_port
+        ? sv->telco_inner_dst_port
+        : ((sv->target_port != 0u && sv->target_port != ddos_samurai::gpu_packet_cuda::telecom::kGtpuUdpPort)
+               ? sv->target_port
+               : 80u);
+    cfg.svlan_tci = sv->telco_svlan_tci;
+    cfg.cvlan_tci = sv->telco_cvlan_tci;
+    cfg.qfi = sv->telco_qfi;
+    cfg.pdu_type = sv->telco_pdu_type;
+    cfg.inner_proto = sv->telco_inner_proto;
+    cfg.vlan_depth = sv->telco_vlan_depth;
+    cfg.with_seq = sv->telco_with_seq;
+    cfg.with_qfi_ext = sv->telco_with_qfi_ext;
+    cfg.echo_mode = sv->telco_echo_mode;
+    for (int i = 0; i < 6; ++i) {
+      cfg.outer_src_mac[i] = sv->src_mac[i];
+      cfg.outer_dst_mac[i] = sv->dst_mac[i];
+    }
+    cfg.inner_payload_size = sv->payload_len > 0 ? sv->payload_len : 32;
+
+    const uint32_t eff_tunnel_count =
+        ddos_samurai::gpu_packet_cuda::telecom::device_resolve_telco_tunnel_span(
+            g_dev_telco_tunnel_count, g_dev_telco_cups_hdr);
+    uint32_t written = ddos_samurai::gpu_packet_cuda::telecom::device_write_gtpu_packet(
+        payload,
+        max_packet_bytes,
+        seq,
+        &cfg,
+        g_dev_telco_tunnels,
+        eff_tunnel_count);
+    slot->len = written;
+    return;
   }
   const int protocol = static_cast<int>(sv->protocol);
   const int has_eth = (sv->has_ethernet != 0) ? 1 : 0;
@@ -7700,14 +7791,19 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   st.protocol = protocol_from_string(json_get_string(profile, "protocol", "tcp"), 6);
   st.stream_type = lower_copy(json_get_string(profile, "stream_type", (st.protocol == 1 ? "icmp" : "l4")));
   st.stream_kind = static_cast<int>(stream_kind_from_string(st.stream_type, st.protocol));
+  if (st.stream_kind == static_cast<int>(PersistentStreamKind::kTelecom)) {
+    st.protocol = 17;
+  }
   st.target_ip_int = json_get_ip(profile, "target_ip", 0u);
   st.src_ip_int = json_get_ip(
       profile,
       "real_src_ip",
       ddos_samurai::gpu_packet_cuda::ip_to_int("192.168.1.100"));
+  const int default_target_port =
+      (st.stream_kind == static_cast<int>(PersistentStreamKind::kTelecom)) ? 2152 : 0;
   st.target_port = (st.protocol == 1)
       ? static_cast<uint16_t>(0)
-      : static_cast<uint16_t>(clamp_i(json_get_int(profile, "target_port", 0), 0, 65535));
+      : static_cast<uint16_t>(clamp_i(json_get_int(profile, "target_port", default_target_port), 0, 65535));
   st.queue_affinity = json_get_int(profile, "queue_affinity", -1);
   st.source_port = static_cast<uint16_t>(clamp_i(json_get_int(profile, "source_port", 0), 0, 65535));
   st.source_port_mode = static_cast<uint8_t>(
@@ -7823,6 +7919,49 @@ extern "C" int samurai_gpu_packet_start_stream(const char* profile_json, int64_t
   d.spoof_mask = spoof_mask;
   st.spoof_base_ip = spoof_base;
   st.spoof_mask = spoof_mask;
+
+  // Telecom GTP-U Profile Parse
+  st.telco_teid_start = static_cast<uint32_t>(json_get_u64(profile, "teid_start", json_get_u64(profile, "teid", 1u)));
+  st.telco_teid_count = static_cast<uint32_t>(std::max(1, json_get_int(profile, "teid_count", 1)));
+  const std::string ue_sub = json_get_string(profile, "ue_subnet", "");
+  if (!ue_sub.empty()) {
+    auto [ue_base, ue_m] = ddos_samurai::gpu_packet_cuda::parse_subnet(ue_sub);
+    st.telco_ue_ip_start = ue_base;
+    st.telco_ue_ip_count = (ue_m == 0u) ? 0xFFFFFFFFu : ((ue_m <= 32u) ? (1u << (32u - ue_m)) : 1u);
+  } else {
+    st.telco_ue_ip_start = json_get_ip(profile, "ue_ip_start", json_get_ip(profile, "ue_ip", st.src_ip_int));
+    st.telco_ue_ip_count = static_cast<uint32_t>(std::max(1, json_get_int(profile, "ue_ip_count", 1)));
+  }
+  st.telco_inner_dst_ip = json_get_ip(profile, "inner_dst_ip", st.target_ip_int);
+  st.telco_inner_src_port = static_cast<uint16_t>(clamp_i(json_get_int(profile, "inner_src_port", 0), 0, 65535));
+  st.telco_inner_dst_port = static_cast<uint16_t>(clamp_i(json_get_int(profile, "inner_dst_port", 80), 0, 65535));
+  st.telco_svlan_tci = static_cast<uint16_t>(clamp_i(json_get_int(profile, "svlan", json_get_int(profile, "svlan_tci", 0)), 0, 65535));
+  st.telco_cvlan_tci = static_cast<uint16_t>(clamp_i(json_get_int(profile, "cvlan", json_get_int(profile, "cvlan_tci", 0)), 0, 65535));
+  st.telco_vlan_depth = static_cast<uint8_t>(clamp_i(json_get_int(profile, "vlan_depth", (st.telco_svlan_tci && st.telco_cvlan_tci ? 2 : (st.telco_cvlan_tci || st.telco_svlan_tci ? 1 : 0))), 0, 2));
+  st.telco_qfi = static_cast<uint8_t>(clamp_i(json_get_int(profile, "qfi", 9), 0, 63));
+  st.telco_pdu_type = static_cast<uint8_t>(clamp_i(json_get_int(profile, "pdu_type", 1), 0, 1));
+  const std::string in_proto = lower_copy(json_get_string(profile, "inner_proto", "udp"));
+  st.telco_inner_proto = (in_proto == "tcp" || in_proto == "6") ? 6 : ((in_proto == "icmp" || in_proto == "1") ? 1 : 17);
+  st.telco_with_seq = static_cast<uint8_t>(json_get_bool(profile, "with_seq", true) ? 1 : 0);
+  st.telco_with_qfi_ext = static_cast<uint8_t>(json_get_bool(profile, "with_qfi", json_get_bool(profile, "with_qfi_ext", true)) ? 1 : 0);
+  st.telco_echo_mode = static_cast<uint8_t>(json_get_bool(profile, "echo_mode", false) ? 1 : 0);
+
+  d.telco_teid_start = st.telco_teid_start;
+  d.telco_teid_count = st.telco_teid_count;
+  d.telco_ue_ip_start = st.telco_ue_ip_start;
+  d.telco_ue_ip_count = st.telco_ue_ip_count;
+  d.telco_inner_dst_ip = st.telco_inner_dst_ip;
+  d.telco_inner_src_port = st.telco_inner_src_port;
+  d.telco_inner_dst_port = st.telco_inner_dst_port;
+  d.telco_svlan_tci = st.telco_svlan_tci;
+  d.telco_cvlan_tci = st.telco_cvlan_tci;
+  d.telco_vlan_depth = st.telco_vlan_depth;
+  d.telco_qfi = st.telco_qfi;
+  d.telco_pdu_type = st.telco_pdu_type;
+  d.telco_inner_proto = st.telco_inner_proto;
+  d.telco_with_seq = st.telco_with_seq;
+  d.telco_with_qfi_ext = st.telco_with_qfi_ext;
+  d.telco_echo_mode = st.telco_echo_mode;
   persistent_build_stream_template(&d);
   if (!persistent_stream_copy_slot_to_device(g_persistent_runtime, free_slot)) {
     std::memset(&d, 0, sizeof(d));
@@ -8030,6 +8169,78 @@ extern "C" int samurai_gpu_packet_update_stream(int64_t stream_id, const char* u
     d.ramp_epoch_counter = 0u;
   }
   st.pcap_file = json_get_string(st.update_json, "pcap_file", st.pcap_file);
+  if (st.stream_kind == static_cast<int>(PersistentStreamKind::kTelecom)) {
+    st.protocol = 17;
+    d.protocol = 17;
+    if (st.target_port == 0) {
+      st.target_port = 2152;
+      d.target_port = 2152;
+    }
+    st.telco_teid_start = static_cast<uint32_t>(
+        json_get_u64(st.update_json, "teid_start", json_get_u64(st.update_json, "teid", st.telco_teid_start)));
+    st.telco_teid_count = static_cast<uint32_t>(
+        std::max(1, json_get_int(st.update_json, "teid_count", static_cast<int>(st.telco_teid_count))));
+    const std::string ue_sub = json_get_string(st.update_json, "ue_subnet", "");
+    if (!ue_sub.empty()) {
+      auto [ue_base, ue_m] = ddos_samurai::gpu_packet_cuda::parse_subnet(ue_sub);
+      st.telco_ue_ip_start = ue_base;
+      st.telco_ue_ip_count = (ue_m == 0u) ? 0xFFFFFFFFu : ((ue_m <= 32u) ? (1u << (32u - ue_m)) : 1u);
+    } else {
+      st.telco_ue_ip_start = json_get_ip(
+          st.update_json, "ue_ip_start", json_get_ip(st.update_json, "ue_ip", st.telco_ue_ip_start));
+      st.telco_ue_ip_count = static_cast<uint32_t>(
+          std::max(1, json_get_int(st.update_json, "ue_ip_count", static_cast<int>(st.telco_ue_ip_count))));
+    }
+    st.telco_inner_dst_ip = json_get_ip(st.update_json, "inner_dst_ip", st.telco_inner_dst_ip);
+    st.telco_inner_src_port = static_cast<uint16_t>(
+        clamp_i(json_get_int(st.update_json, "inner_src_port", st.telco_inner_src_port), 0, 65535));
+    st.telco_inner_dst_port = static_cast<uint16_t>(
+        clamp_i(json_get_int(st.update_json, "inner_dst_port", st.telco_inner_dst_port), 0, 65535));
+    st.telco_svlan_tci = static_cast<uint16_t>(clamp_i(
+        json_get_int(st.update_json, "svlan", json_get_int(st.update_json, "svlan_tci", st.telco_svlan_tci)),
+        0,
+        65535));
+    st.telco_cvlan_tci = static_cast<uint16_t>(clamp_i(
+        json_get_int(st.update_json, "cvlan", json_get_int(st.update_json, "cvlan_tci", st.telco_cvlan_tci)),
+        0,
+        65535));
+    st.telco_vlan_depth = static_cast<uint8_t>(
+        clamp_i(json_get_int(st.update_json, "vlan_depth", st.telco_vlan_depth), 0, 2));
+    st.telco_qfi = static_cast<uint8_t>(clamp_i(json_get_int(st.update_json, "qfi", st.telco_qfi), 0, 63));
+    st.telco_pdu_type = static_cast<uint8_t>(
+        clamp_i(json_get_int(st.update_json, "pdu_type", st.telco_pdu_type), 0, 1));
+    const std::string in_proto = lower_copy(json_get_string(st.update_json, "inner_proto", ""));
+    if (!in_proto.empty()) {
+      st.telco_inner_proto =
+          (in_proto == "tcp" || in_proto == "6") ? 6 : ((in_proto == "icmp" || in_proto == "1") ? 1 : 17);
+    }
+    st.telco_with_seq = static_cast<uint8_t>(
+        json_get_bool(st.update_json, "with_seq", st.telco_with_seq != 0) ? 1 : 0);
+    st.telco_with_qfi_ext = static_cast<uint8_t>(
+        json_get_bool(st.update_json, "with_qfi",
+                      json_get_bool(st.update_json, "with_qfi_ext", st.telco_with_qfi_ext != 0))
+            ? 1
+            : 0);
+    st.telco_echo_mode = static_cast<uint8_t>(
+        json_get_bool(st.update_json, "echo_mode", st.telco_echo_mode != 0) ? 1 : 0);
+
+    d.telco_teid_start = st.telco_teid_start;
+    d.telco_teid_count = st.telco_teid_count;
+    d.telco_ue_ip_start = st.telco_ue_ip_start;
+    d.telco_ue_ip_count = st.telco_ue_ip_count;
+    d.telco_inner_dst_ip = st.telco_inner_dst_ip;
+    d.telco_inner_src_port = st.telco_inner_src_port;
+    d.telco_inner_dst_port = st.telco_inner_dst_port;
+    d.telco_svlan_tci = st.telco_svlan_tci;
+    d.telco_cvlan_tci = st.telco_cvlan_tci;
+    d.telco_vlan_depth = st.telco_vlan_depth;
+    d.telco_qfi = st.telco_qfi;
+    d.telco_pdu_type = st.telco_pdu_type;
+    d.telco_inner_proto = st.telco_inner_proto;
+    d.telco_with_seq = st.telco_with_seq;
+    d.telco_with_qfi_ext = st.telco_with_qfi_ext;
+    d.telco_echo_mode = st.telco_echo_mode;
+  }
   persistent_build_stream_template(&d);
   if (!persistent_stream_copy_slot_to_device(g_persistent_runtime, st.device_slot)) {
     return set_c_api_error("failed to sync stream device state");
@@ -8274,6 +8485,30 @@ extern "C" void samurai_gpu_packet_free(void* ptr) {
   if (!ptr) {
     return;
   }
+  if (ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pRegistry::instance()
+          .release_unsubmitted_batch_for_pointer(ptr)) {
+    return;
+  }
+  if (ddos_samurai::gpu_packet_cuda::p2p::get_global_bar1_batch_pool().release_slice(ptr)) {
+    return;
+  }
+  cudaPointerAttributes attr{};
+  if (cudaPointerGetAttributes(&attr, ptr) == cudaSuccess) {
+#if CUDART_VERSION >= 10000
+    if (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged) {
+      (void)cudaFree(ptr);
+      return;
+    }
+#else
+    if (attr.memoryType == cudaMemoryTypeDevice || attr.memoryType == cudaMemoryTypeManaged) {
+      (void)cudaFree(ptr);
+      return;
+    }
+#endif
+  } else {
+    (void)cudaGetLastError();
+  }
+
   auto* payload = static_cast<uint8_t*>(ptr);
   auto* header = reinterpret_cast<ExportHostBufferHeader*>(payload) - 1;
   if (header->magic != kExportHostBufferMagic) {
@@ -8369,4 +8604,645 @@ extern "C" int samurai_gpu_packet_p2p_get_arena_info(
 
 extern "C" const char* samurai_gpu_packet_last_error() {
   return g_samurai_gpu_packet_last_error.c_str();
+}
+
+// ---------------------------------------------------------------------------
+// Telecom GTP-U 4G/5G Hardware Data Plane C ABI
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct HostTelcoState {
+  std::mutex mu;
+  ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1* d_tunnels = nullptr;
+  std::vector<ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1*> retired_tunnel_buffers;
+  uint32_t tunnel_capacity = 0u;
+  uint32_t tunnel_count = 0u;
+  ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1 sample_tunnel{};
+  bool has_sample_tunnel = false;
+  cudaStream_t ctrl_stream = nullptr;
+  ddos_samurai::gpu_packet_cuda::telecom::TelcoGtpuStreamConfig* d_batch_cfg = nullptr;
+  ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuRxStatsV1* d_rx_stats = nullptr;
+
+  // DPU ARM <-> GPU Zero-Copy CUPS shared region state
+  int cups_shm_fd = -1;
+  void* cups_shm_host = nullptr;
+  size_t cups_shm_bytes = 0u;
+  bool cups_shm_registered = false;
+  const ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1* cups_dev_hdr = nullptr;
+  ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1* cups_dev_tunnels = nullptr;
+  uint32_t cups_capacity = 0u;
+
+  bool ensure_ctrl_stream_locked() {
+    if (ctrl_stream) return true;
+    return cudaStreamCreateWithFlags(&ctrl_stream, cudaStreamNonBlocking) == cudaSuccess;
+  }
+
+  void detach_cups_locked() {
+    const void* null_hdr = nullptr;
+    if (ctrl_stream) {
+      (void)cudaMemcpyToSymbolAsync(g_dev_telco_cups_hdr, &null_hdr, sizeof(void*), 0, cudaMemcpyHostToDevice, ctrl_stream);
+      void* fallback_ptr = static_cast<void*>(d_tunnels);
+      (void)cudaMemcpyToSymbolAsync(g_dev_telco_tunnels, &fallback_ptr, sizeof(void*), 0, cudaMemcpyHostToDevice, ctrl_stream);
+      (void)cudaMemcpyToSymbolAsync(g_dev_telco_tunnel_count, &tunnel_count, sizeof(uint32_t), 0, cudaMemcpyHostToDevice, ctrl_stream);
+      (void)cudaStreamSynchronize(ctrl_stream);
+    } else {
+      (void)cudaMemcpyToSymbol(g_dev_telco_cups_hdr, &null_hdr, sizeof(void*));
+      void* fallback_ptr = static_cast<void*>(d_tunnels);
+      (void)cudaMemcpyToSymbol(g_dev_telco_tunnels, &fallback_ptr, sizeof(void*));
+      (void)cudaMemcpyToSymbol(g_dev_telco_tunnel_count, &tunnel_count, sizeof(uint32_t));
+    }
+    if (cups_shm_registered && cups_shm_host) {
+      (void)cudaHostUnregister(cups_shm_host);
+      cups_shm_registered = false;
+    }
+    if (cups_shm_host && cups_shm_bytes > 0u) {
+      (void)munmap(cups_shm_host, cups_shm_bytes);
+      cups_shm_host = nullptr;
+      cups_shm_bytes = 0u;
+    }
+    if (cups_shm_fd >= 0) {
+      (void)close(cups_shm_fd);
+      cups_shm_fd = -1;
+    }
+    cups_dev_hdr = nullptr;
+    cups_dev_tunnels = nullptr;
+    cups_capacity = 0u;
+  }
+
+  ~HostTelcoState() {
+    detach_cups_locked();
+    for (auto* p : retired_tunnel_buffers) {
+      if (p) (void)cudaFree(p);
+    }
+    if (d_tunnels) (void)cudaFree(d_tunnels);
+    if (d_batch_cfg) (void)cudaFree(d_batch_cfg);
+    if (d_rx_stats) (void)cudaFree(d_rx_stats);
+    if (ctrl_stream) (void)cudaStreamDestroy(ctrl_stream);
+  }
+};
+
+HostTelcoState& get_global_host_telco_state() {
+  static HostTelcoState s;
+  return s;
+}
+
+} // namespace
+
+extern "C" int samurai_gpu_packet_telco_upsert_tunnels_v1(
+    const void* entries,
+    uint32_t count) {
+  if (!entries || count == 0u) {
+    return set_c_api_error("invalid tunnel entries or count 0");
+  }
+  if (count > (1u << 22)) {
+    return set_c_api_error("telco tunnel count exceeds maximum limit");
+  }
+  auto& s = get_global_host_telco_state();
+  std::lock_guard<std::mutex> lock(s.mu);
+  if (!s.ensure_ctrl_stream_locked()) {
+    return set_c_api_error("cudaStreamCreateWithFlags failed for telco control stream");
+  }
+
+  const size_t copy_bytes =
+      static_cast<size_t>(count) * sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1);
+  ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1* target_buf = s.d_tunnels;
+  ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1* old_to_retire = nullptr;
+
+  if (s.tunnel_capacity < count || !target_buf) {
+    void* dev_mem = nullptr;
+    if (cudaMalloc(&dev_mem, copy_bytes) != cudaSuccess || !dev_mem) {
+      return set_c_api_error("cudaMalloc failed for telco tunnels");
+    }
+    old_to_retire = s.d_tunnels;
+    target_buf = static_cast<ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1*>(dev_mem);
+  }
+
+  if (cudaMemcpyAsync(target_buf, entries, copy_bytes, cudaMemcpyHostToDevice, s.ctrl_stream) != cudaSuccess) {
+    if (old_to_retire != nullptr || target_buf != s.d_tunnels) {
+      (void)cudaFree(target_buf);
+    }
+    return set_c_api_error("cudaMemcpyAsync failed for telco tunnels");
+  }
+
+  s.d_tunnels = target_buf;
+  if (s.tunnel_capacity < count) {
+    s.tunnel_capacity = count;
+  }
+  s.tunnel_count = count;
+  std::memcpy(
+      &s.sample_tunnel,
+      entries,
+      sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1));
+  s.has_sample_tunnel = true;
+
+  // Publish new pointer & count BEFORE retiring old buffer so concurrent persistent kernels never UAF
+  if (!s.cups_dev_tunnels) {
+    void* d_ptr = static_cast<void*>(s.d_tunnels);
+    (void)cudaMemcpyToSymbolAsync(
+        g_dev_telco_tunnels, &d_ptr, sizeof(void*), 0, cudaMemcpyHostToDevice, s.ctrl_stream);
+    (void)cudaMemcpyToSymbolAsync(
+        g_dev_telco_tunnel_count, &count, sizeof(uint32_t), 0, cudaMemcpyHostToDevice, s.ctrl_stream);
+  }
+  if (cudaStreamSynchronize(s.ctrl_stream) != cudaSuccess) {
+    return set_c_api_error("cudaStreamSynchronize failed publishing telco tunnels");
+  }
+
+  if (old_to_retire) {
+    s.retired_tunnel_buffers.push_back(old_to_retire);
+    while (s.retired_tunnel_buffers.size() > 4u) {
+      auto* oldest = s.retired_tunnel_buffers.front();
+      s.retired_tunnel_buffers.erase(s.retired_tunnel_buffers.begin());
+      if (oldest) (void)cudaFree(oldest);
+    }
+  }
+
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_telco_clear_tunnels_v1(void) {
+  auto& s = get_global_host_telco_state();
+  std::lock_guard<std::mutex> lock(s.mu);
+  s.tunnel_count = 0u;
+  s.has_sample_tunnel = false;
+  const uint32_t zero = 0u;
+  if (!s.cups_dev_tunnels) {
+    if (s.ensure_ctrl_stream_locked()) {
+      (void)cudaMemcpyToSymbolAsync(
+          g_dev_telco_tunnel_count, &zero, sizeof(uint32_t), 0, cudaMemcpyHostToDevice, s.ctrl_stream);
+      (void)cudaStreamSynchronize(s.ctrl_stream);
+    } else {
+      (void)cudaMemcpyToSymbol(g_dev_telco_tunnel_count, &zero, sizeof(uint32_t));
+    }
+  }
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_telco_attach_cups_shm_v1(
+    const char* shm_path,
+    uint32_t max_tunnels) {
+  if (!shm_path || !*shm_path) {
+    return set_c_api_error("shm_path must not be empty");
+  }
+  auto& s = get_global_host_telco_state();
+  std::lock_guard<std::mutex> lock(s.mu);
+  s.detach_cups_locked();
+  if (!s.ensure_ctrl_stream_locked()) {
+    return set_c_api_error("cudaStreamCreateWithFlags failed for CUPS attach");
+  }
+
+  const int fd = open(shm_path, O_RDWR);
+  if (fd < 0) {
+    return set_c_api_error(std::string("failed to open CUPS shared region: ") + shm_path);
+  }
+  struct stat st_buf{};
+  if (fstat(fd, &st_buf) != 0 ||
+      static_cast<size_t>(st_buf.st_size) <
+          (sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1) +
+           sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1))) {
+    (void)close(fd);
+    return set_c_api_error("CUPS shared region file is too small");
+  }
+  const size_t map_bytes = static_cast<size_t>(st_buf.st_size);
+  void* mapped = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (mapped == MAP_FAILED || !mapped) {
+    (void)close(fd);
+    return set_c_api_error("mmap failed for CUPS shared region");
+  }
+
+  const auto* hdr =
+      static_cast<const ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1*>(mapped);
+  if (hdr->magic != ddos_samurai::gpu_packet_cuda::zero_copy::kDpuCupsSharedMagicV1 ||
+      hdr->version != ddos_samurai::gpu_packet_cuda::zero_copy::kDpuCupsSharedVersionV1 ||
+      hdr->capacity == 0u) {
+    (void)munmap(mapped, map_bytes);
+    (void)close(fd);
+    return set_c_api_error("CUPS shared region header magic/version/capacity invalid");
+  }
+
+  const size_t avail_entries =
+      (map_bytes - sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1)) /
+      sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1);
+  uint32_t eff_cap = std::min<uint32_t>(hdr->capacity, static_cast<uint32_t>(avail_entries));
+  if (max_tunnels > 0u && max_tunnels < eff_cap) {
+    eff_cap = max_tunnels;
+  }
+  if (eff_cap == 0u) {
+    (void)munmap(mapped, map_bytes);
+    (void)close(fd);
+    return set_c_api_error("CUPS shared region effective tunnel capacity is 0");
+  }
+
+  const size_t page_sz = 4096;
+  const size_t reg_bytes = (map_bytes / page_sz) * page_sz;
+  if (reg_bytes == 0) {
+    (void)munmap(mapped, map_bytes);
+    (void)close(fd);
+    return set_c_api_error("CUPS shared region size is smaller than a page");
+  }
+
+  cudaError_t reg_rc =
+      cudaHostRegister(mapped, reg_bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
+  bool registered = (reg_rc == cudaSuccess);
+  if (reg_rc == cudaErrorHostMemoryAlreadyRegistered) {
+    (void)cudaGetLastError();
+  } else if (reg_rc != cudaSuccess) {
+    (void)munmap(mapped, map_bytes);
+    (void)close(fd);
+    return set_c_api_error(std::string("cudaHostRegister failed on CUPS region: ") + cudaGetErrorString(reg_rc));
+  }
+
+  void* dev_base = nullptr;
+  if (cudaHostGetDevicePointer(&dev_base, mapped, 0) != cudaSuccess || !dev_base) {
+    if (registered) (void)cudaHostUnregister(mapped);
+    (void)munmap(mapped, map_bytes);
+    (void)close(fd);
+    return set_c_api_error("cudaHostGetDevicePointer failed on CUPS region");
+  }
+
+  s.cups_shm_fd = fd;
+  s.cups_shm_host = mapped;
+  s.cups_shm_bytes = map_bytes;
+  s.cups_shm_registered = registered;
+  s.cups_dev_hdr =
+      static_cast<const ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1*>(dev_base);
+  s.cups_dev_tunnels = reinterpret_cast<ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1*>(
+      static_cast<uint8_t*>(dev_base) +
+      sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1));
+  s.cups_capacity = eff_cap;
+
+  const void* hdr_sym = static_cast<const void*>(s.cups_dev_hdr);
+  void* tun_sym = static_cast<void*>(s.cups_dev_tunnels);
+  (void)cudaMemcpyToSymbolAsync(
+      g_dev_telco_cups_hdr, &hdr_sym, sizeof(void*), 0, cudaMemcpyHostToDevice, s.ctrl_stream);
+  (void)cudaMemcpyToSymbolAsync(
+      g_dev_telco_tunnels, &tun_sym, sizeof(void*), 0, cudaMemcpyHostToDevice, s.ctrl_stream);
+  (void)cudaMemcpyToSymbolAsync(
+      g_dev_telco_tunnel_count, &eff_cap, sizeof(uint32_t), 0, cudaMemcpyHostToDevice, s.ctrl_stream);
+  (void)cudaStreamSynchronize(s.ctrl_stream);
+
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_telco_detach_cups_shm_v1(void) {
+  auto& s = get_global_host_telco_state();
+  std::lock_guard<std::mutex> lock(s.mu);
+  s.detach_cups_locked();
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_generate_gtpu_packets(
+    const char* config_json,
+    int count,
+    void** out_packets_ptr,
+    size_t* out_total_bytes,
+    int* out_packet_size) {
+  if (count <= 0) {
+    return set_c_api_error("count must be > 0");
+  }
+  if (!out_packets_ptr || !out_total_bytes || !out_packet_size) {
+    return set_c_api_error("invalid output pointers");
+  }
+
+  const std::string json_str = config_json ? std::string(config_json) : std::string("{}");
+  ddos_samurai::gpu_packet_cuda::telecom::TelcoGtpuStreamConfig cfg{};
+  cfg.teid_start = static_cast<uint32_t>(json_get_u64(json_str, "teid_start", json_get_u64(json_str, "teid", 1u)));
+  cfg.teid_count = static_cast<uint32_t>(std::max(1, json_get_int(json_str, "teid_count", 1)));
+  const std::string ue_sub = json_get_string(json_str, "ue_subnet", "");
+  if (!ue_sub.empty()) {
+    auto [ue_base, ue_m] = ddos_samurai::gpu_packet_cuda::parse_subnet(ue_sub);
+    cfg.ue_ip_start = ue_base;
+    cfg.ue_ip_count = (ue_m == 0u) ? 0xFFFFFFFFu : ((ue_m <= 32u) ? (1u << (32u - ue_m)) : 1u);
+  } else {
+    cfg.ue_ip_start = json_get_ip(
+        json_str, "ue_ip_start", json_get_ip(json_str, "ue_ip", ddos_samurai::gpu_packet_cuda::ip_to_int("10.60.0.1")));
+    cfg.ue_ip_count = static_cast<uint32_t>(std::max(1, json_get_int(json_str, "ue_ip_count", 1)));
+  }
+  cfg.inner_dst_ip = json_get_ip(json_str, "inner_dst_ip", ddos_samurai::gpu_packet_cuda::ip_to_int("8.8.8.8"));
+  cfg.outer_src_ip = json_get_ip(
+      json_str, "outer_src_ip", json_get_ip(json_str, "src_ip", ddos_samurai::gpu_packet_cuda::ip_to_int("192.168.1.100")));
+  cfg.outer_dst_ip = json_get_ip(
+      json_str, "outer_dst_ip", json_get_ip(json_str, "target_ip", ddos_samurai::gpu_packet_cuda::ip_to_int("192.168.1.1")));
+  cfg.inner_src_port = static_cast<uint16_t>(clamp_i(json_get_int(json_str, "inner_src_port", 0), 0, 65535));
+  cfg.inner_dst_port = static_cast<uint16_t>(clamp_i(json_get_int(json_str, "inner_dst_port", 80), 0, 65535));
+  cfg.svlan_tci = static_cast<uint16_t>(
+      clamp_i(json_get_int(json_str, "svlan", json_get_int(json_str, "svlan_tci", 0)), 0, 65535));
+  cfg.cvlan_tci = static_cast<uint16_t>(
+      clamp_i(json_get_int(json_str, "cvlan", json_get_int(json_str, "cvlan_tci", 0)), 0, 65535));
+  cfg.vlan_depth = static_cast<uint8_t>(clamp_i(
+      json_get_int(
+          json_str,
+          "vlan_depth",
+          (cfg.svlan_tci && cfg.cvlan_tci ? 2 : (cfg.cvlan_tci || cfg.svlan_tci ? 1 : 0))),
+      0,
+      2));
+  cfg.qfi = static_cast<uint8_t>(clamp_i(json_get_int(json_str, "qfi", 9), 0, 63));
+  cfg.pdu_type = static_cast<uint8_t>(clamp_i(json_get_int(json_str, "pdu_type", 1), 0, 1));
+  const std::string in_proto = lower_copy(json_get_string(json_str, "inner_proto", "udp"));
+  cfg.inner_proto = (in_proto == "tcp" || in_proto == "6") ? 6 : ((in_proto == "icmp" || in_proto == "1") ? 1 : 17);
+  cfg.with_seq = static_cast<uint8_t>(json_get_bool(json_str, "with_seq", true) ? 1 : 0);
+  cfg.with_qfi_ext = static_cast<uint8_t>(
+      json_get_bool(json_str, "with_qfi", json_get_bool(json_str, "with_qfi_ext", true)) ? 1 : 0);
+  cfg.echo_mode = static_cast<uint8_t>(json_get_bool(json_str, "echo_mode", false) ? 1 : 0);
+  cfg.inner_payload_size = static_cast<uint16_t>(clamp_i(json_get_int(json_str, "payload_len", 32), 16, 1400));
+
+  std::array<uint8_t, 6> src_mac{{0x00, 0x0F, 0x53, 0x21, 0x52, 0x02}};
+  std::array<uint8_t, 6> dst_mac{{0x00, 0x0F, 0x53, 0x21, 0x52, 0x01}};
+  (void)parse_mac_string(json_get_string(json_str, "src_mac", ""), src_mac);
+  (void)parse_mac_string(json_get_string(json_str, "dst_mac", ""), dst_mac);
+  for (int i = 0; i < 6; ++i) {
+    cfg.outer_src_mac[i] = src_mac[i];
+    cfg.outer_dst_mac[i] = dst_mac[i];
+  }
+
+  auto estimate_frame_size = [&](uint8_t v_depth, bool seq_f, bool qfi_f, bool echo_f, uint8_t proto_f) -> int {
+    const int v_bytes = std::min<int>(2, v_depth) * 4;
+    const int gtp_ext = ((seq_f || echo_f || (qfi_f && !echo_f)) ? 4 : 0) + ((qfi_f && !echo_f) ? 4 : 0);
+    const int in_l4 = (proto_f == 6u) ? 20 : 8;
+    return 14 + v_bytes + 20 + 8 + (8 + gtp_ext) + (echo_f ? 0 : (20 + in_l4 + cfg.inner_payload_size));
+  };
+
+  int est_packet_size = estimate_frame_size(
+      cfg.vlan_depth, cfg.with_seq != 0, cfg.with_qfi_ext != 0, cfg.echo_mode != 0, cfg.inner_proto);
+
+  // Snapshot active tunnel / CUPS state safely under telco.mu
+  auto& telco = get_global_host_telco_state();
+  ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1* snap_tunnels = nullptr;
+  uint32_t snap_tunnel_count = 0u;
+  const ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1* snap_cups_hdr = nullptr;
+  ddos_samurai::gpu_packet_cuda::telecom::TelcoGtpuStreamConfig* d_cfg = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(telco.mu);
+    if (!telco.d_batch_cfg) {
+      void* cfg_mem = nullptr;
+      if (cudaMalloc(&cfg_mem, sizeof(cfg)) != cudaSuccess || !cfg_mem) {
+        return set_c_api_error("cudaMalloc failed for stream config");
+      }
+      telco.d_batch_cfg =
+          static_cast<ddos_samurai::gpu_packet_cuda::telecom::TelcoGtpuStreamConfig*>(cfg_mem);
+    }
+    d_cfg = telco.d_batch_cfg;
+    (void)cudaMemcpy(d_cfg, &cfg, sizeof(cfg), cudaMemcpyHostToDevice);
+
+    if (telco.cups_dev_tunnels && telco.cups_dev_hdr) {
+      snap_tunnels = telco.cups_dev_tunnels;
+      snap_tunnel_count = telco.cups_capacity;
+      snap_cups_hdr = telco.cups_dev_hdr;
+      if (telco.cups_shm_host) {
+        const auto* hdr =
+            static_cast<const ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1*>(
+                telco.cups_shm_host);
+        const auto* entries =
+            reinterpret_cast<const ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelEntryV1*>(
+                static_cast<const uint8_t*>(telco.cups_shm_host) +
+                sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::DpuCupsSharedRegionHeaderV1));
+        const uint32_t span = std::min<uint32_t>(hdr->active_span, telco.cups_capacity);
+        for (uint32_t ti = 0u; ti < span; ++ti) {
+          const uint8_t fl = entries[ti].flags;
+          if ((fl & static_cast<uint8_t>(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelFlags::kActive)) != 0u) {
+            const int t_sz = estimate_frame_size(
+                entries[ti].vlan_depth,
+                (fl & static_cast<uint8_t>(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelFlags::kWithSeq)) != 0u,
+                (fl & static_cast<uint8_t>(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelFlags::kWithQfiExt)) != 0u,
+                (fl & static_cast<uint8_t>(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelFlags::kEchoMode)) != 0u,
+                entries[ti].inner_proto ? entries[ti].inner_proto : 17u);
+            est_packet_size = std::max(est_packet_size, t_sz);
+          }
+        }
+      }
+    } else if (telco.d_tunnels && telco.tunnel_count > 0u) {
+      snap_tunnels = telco.d_tunnels;
+      snap_tunnel_count = telco.tunnel_count;
+      if (telco.has_sample_tunnel) {
+        const uint8_t fl = telco.sample_tunnel.flags;
+        est_packet_size = std::max(
+            est_packet_size,
+            estimate_frame_size(
+                telco.sample_tunnel.vlan_depth,
+                (fl & static_cast<uint8_t>(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelFlags::kWithSeq)) != 0u,
+                (fl & static_cast<uint8_t>(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelFlags::kWithQfiExt)) != 0u,
+                (fl & static_cast<uint8_t>(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuTunnelFlags::kEchoMode)) != 0u,
+                telco.sample_tunnel.inner_proto ? telco.sample_tunnel.inner_proto : 17u));
+      }
+    }
+  }
+
+  const char* env_bar1 = std::getenv("SAMURAI_GPU_PACKET_BAR1_P2P_OUTPUT");
+  const char* env_tx_backend = std::getenv("SAMURAI_GPU_TX_BACKEND");
+  const bool env_bar1_on = (env_bar1 && *env_bar1 && std::strcmp(env_bar1, "0") != 0);
+  const bool env_p2p_backend = (env_tx_backend && std::strcmp(env_tx_backend, "geforce_p2p") == 0);
+  const int explicit_ring_handle = json_get_int(json_str, "ring_handle", -1);
+  const bool want_bar1_ring =
+      json_get_bool(json_str, "bar1_p2p", env_bar1_on || env_p2p_backend || (explicit_ring_handle > 0));
+  const bool strict_bar1 = (std::getenv("SAMURAI_GEFORCE_P2P_STRICT") != nullptr) ||
+                           json_get_bool(json_str, "bar1_strict", false) ||
+                           (explicit_ring_handle > 0);
+
+  const uint32_t u_count = static_cast<uint32_t>(count);
+  const uint32_t threads = 256u;
+  const uint32_t blocks = (u_count + threads - 1u) / threads;
+
+  // Path 1: True Zero-Copy GeforceP2pRingInstance BAR1 P2P Ring Queue
+  if (want_bar1_ring) {
+    auto& p2p_reg = ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pRegistry::instance();
+    int ring_handle = explicit_ring_handle;
+    char ring_err[256] = {0};
+    if (ring_handle <= 0) {
+      if (p2p_reg.get_or_create_active_ring(
+              u_count,
+              std::max<uint32_t>(2048u, static_cast<uint32_t>(est_packet_size + 64)),
+              &ring_handle,
+              ring_err,
+              sizeof(ring_err)) != 0) {
+        if (strict_bar1) {
+          return set_c_api_error(
+              ring_err[0] ? std::string(ring_err) : "failed to create/acquire GeforceP2pRingInstance");
+        }
+        ring_handle = -1;
+      }
+    }
+
+    if (ring_handle > 0) {
+      ddos_samurai::gpu_packet_cuda::p2p::Bar1RingBatchContext batch_ctx{};
+      if (p2p_reg.begin_bar1_batch_generation(
+              ring_handle, u_count, &batch_ctx, ring_err, sizeof(ring_err)) == 0) {
+        (void)cudaSetDevice(batch_ctx.cuda_device_index);
+        ddos_samurai::gpu_packet_cuda::telecom::telco_gtpu_ring_batch_kernel<<<
+            blocks,
+            threads,
+            0,
+            batch_ctx.gen_stream>>>(
+            batch_ctx.ring_dev_base,
+            batch_ctx.slot_stride,
+            batch_ctx.ring_slot_count,
+            batch_ctx.start_slot,
+            u_count,
+            batch_ctx.packet_seq_base,
+            d_cfg,
+            snap_tunnels,
+            snap_tunnel_count,
+            snap_cups_hdr,
+            batch_ctx.d_slot_ids,
+            batch_ctx.d_lengths);
+        const cudaError_t sync_rc = cudaStreamSynchronize(batch_ctx.gen_stream);
+        uint16_t max_pkt_len = 0u;
+        size_t total_wire_bytes = 0u;
+        if (p2p_reg.complete_bar1_batch_generation(
+                ring_handle,
+                batch_ctx.start_slot,
+                u_count,
+                sync_rc == cudaSuccess,
+                &max_pkt_len,
+                &total_wire_bytes,
+                ring_err,
+                sizeof(ring_err)) == 0) {
+          *out_packets_ptr = static_cast<void*>(
+              batch_ctx.ring_host_base +
+              static_cast<size_t>(batch_ctx.start_slot) * static_cast<size_t>(batch_ctx.slot_stride));
+          *out_total_bytes = total_wire_bytes;
+          *out_packet_size = static_cast<int>(max_pkt_len);
+          g_samurai_gpu_packet_last_error.clear();
+          return 0;
+        }
+        if (strict_bar1) {
+          return set_c_api_error(
+              ring_err[0] ? std::string(ring_err) : "complete_bar1_batch_generation failed");
+        }
+      } else if (strict_bar1) {
+        return set_c_api_error(
+            ring_err[0] ? std::string(ring_err) : "begin_bar1_batch_generation failed");
+      }
+    }
+  }
+
+  // Path 2: Packed Unified Memory export (simultaneously CPU-dereferenceable for AF_PACKET
+  // and CUDA-accessible for cudaMemcpy/cudaFree/samurai_gpu_packet_free)
+  const uint32_t packed_stride = static_cast<uint32_t>(std::max(64, est_packet_size));
+  const size_t total_alloc = static_cast<size_t>(u_count) * static_cast<size_t>(packed_stride);
+  uint8_t* managed_buf = nullptr;
+  if (cudaMallocManaged(reinterpret_cast<void**>(&managed_buf), total_alloc, cudaMemAttachGlobal) != cudaSuccess ||
+      !managed_buf) {
+    return set_c_api_error("cudaMallocManaged failed for GTP-U batch buffer");
+  }
+
+  ddos_samurai::gpu_packet_cuda::telecom::telco_gtpu_batch_kernel<<<blocks, threads>>>(
+      managed_buf,
+      packed_stride,
+      u_count,
+      d_cfg,
+      snap_tunnels,
+      snap_tunnel_count,
+      nullptr,
+      snap_cups_hdr);
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    (void)cudaFree(managed_buf);
+    return set_c_api_error("cudaDeviceSynchronize failed on telco_gtpu_batch_kernel");
+  }
+
+  *out_packets_ptr = managed_buf;
+  *out_total_bytes = total_alloc;
+  *out_packet_size = static_cast<int>(packed_stride);
+
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_telco_verify_rx_batch_v1(
+    const void* rx_base_ptr,
+    uint32_t slot_stride,
+    uint32_t count,
+    void* out_stats) {
+  if (!rx_base_ptr || count == 0u || !out_stats) {
+    return set_c_api_error("invalid arguments to telco_verify_rx_batch");
+  }
+  auto& s = get_global_host_telco_state();
+  std::lock_guard<std::mutex> lock(s.mu);
+
+  if (!s.d_rx_stats) {
+    void* mem = nullptr;
+    if (cudaMalloc(&mem, sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuRxStatsV1)) != cudaSuccess) {
+      return set_c_api_error("cudaMalloc failed for telco rx stats");
+    }
+    s.d_rx_stats = static_cast<ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuRxStatsV1*>(mem);
+    void* d_ptr = static_cast<void*>(s.d_rx_stats);
+    (void)cudaMemcpyToSymbol(g_dev_telco_rx_stats, &d_ptr, sizeof(void*));
+  }
+  (void)cudaMemset(s.d_rx_stats, 0, sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuRxStatsV1));
+
+  const uint32_t threads = 256u;
+  const uint32_t blocks = (count + threads - 1u) / threads;
+
+  ddos_samurai::gpu_packet_cuda::telecom::telco_gtpu_rx_verify_kernel<<<blocks, threads>>>(
+      static_cast<const uint8_t*>(rx_base_ptr),
+      slot_stride,
+      count,
+      s.d_rx_stats);
+  (void)cudaDeviceSynchronize();
+
+  if (cudaMemcpy(out_stats, s.d_rx_stats, sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuRxStatsV1), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return set_c_api_error("cudaMemcpy failed reading telco rx stats");
+  }
+
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_telco_read_rx_stats_v1(
+    void* out_stats) {
+  if (!out_stats) {
+    return set_c_api_error("null out_stats pointer");
+  }
+  auto& s = get_global_host_telco_state();
+  std::lock_guard<std::mutex> lock(s.mu);
+  if (!s.d_rx_stats) {
+    std::memset(out_stats, 0, sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuRxStatsV1));
+    return 0;
+  }
+  if (cudaMemcpy(out_stats, s.d_rx_stats, sizeof(ddos_samurai::gpu_packet_cuda::zero_copy::TelcoGpuRxStatsV1), cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return set_c_api_error("cudaMemcpy failed reading telco rx stats");
+  }
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_p2p_set_active_ring_v1(int ring_handle) {
+  char err[128] = {0};
+  if (ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pRegistry::instance().set_active_ring_handle(
+          ring_handle, err, sizeof(err)) != 0) {
+    return set_c_api_error(err[0] ? std::string(err) : "set_active_ring_handle failed");
+  }
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
+}
+
+extern "C" int samurai_gpu_packet_p2p_get_active_ring_v1(void) {
+  return ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pRegistry::instance().get_active_ring_handle();
+}
+
+extern "C" int samurai_gpu_packet_p2p_tx_bar1_batch_v1(
+    const uint32_t* slot_indices,
+    const uint16_t* pkt_lengths,
+    uint32_t count,
+    uint32_t* out_submitted_count) {
+  if (count == 0u) {
+    if (out_submitted_count) *out_submitted_count = 0u;
+    return 0;
+  }
+
+  char err[256] = {0};
+  uint32_t submitted = 0u;
+  const int rc = ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pRegistry::instance().tx_bar1_ring_batch(
+      -1, slot_indices, pkt_lengths, count, &submitted, err, sizeof(err));
+  if (rc != 0) {
+    return set_c_api_error(err[0] ? std::string(err) : "tx_bar1_ring_batch failed");
+  }
+  if (out_submitted_count) {
+    *out_submitted_count = submitted;
+  }
+  g_samurai_gpu_packet_last_error.clear();
+  return 0;
 }
