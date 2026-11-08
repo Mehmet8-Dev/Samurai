@@ -1,0 +1,267 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 Samurai Team. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 720" role="img" aria-labelledby="telco-cups-title telco-cups-desc">
+  <title id="telco-cups-title">Samurai DPU ARM &amp; GPU Telecom CUPS Architecture</title>
+  <desc id="telco-cups-desc">Architectural diagram illustrating hardware-enforced 3GPP CUPS split: DPU ARMv8-A control plane managing N4 PFCP and subscriber contexts, seqlock shared memory and ZMQ IPC bridge, and NVIDIA GPU CUDA fastpath executing zero-copy GTP-U, 5G QFI, and BAR1 P2P ring transmission.</desc>
+  <style>
+    text { font-family: "NVIDIA Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
+    .bg { fill: #FFFFFF; stroke: #E0E0E0; stroke-width: 1; }
+    .t { fill: #111827; }
+    .tm { fill: #4B5563; }
+    .tw { fill: #FFFFFF; }
+    .tk { fill: #000000; }
+    .l { font-size: 14px; font-weight: 700; }
+    .m { font-size: 12px; font-weight: 600; }
+    .s { font-size: 11px; font-weight: 400; }
+    .mono { font-family: "JetBrains Mono", "SF Mono", Consolas, monospace; font-size: 11px; }
+    
+    /* Brand & Functional Colors */
+    .c-nvke { fill: #76B900; }
+    .c-nvkr { fill: #952FC6; }
+    .c-blue { fill: #0070F3; }
+    .c-amber { fill: #D97706; }
+    .c-cyan { fill: #06B6D4; }
+    
+    /* Box Styles */
+    .box-dpu { fill: #F0FDF4; stroke: #16A34A; stroke-width: 1.5; }
+    .box-gpu { fill: #FAF5FF; stroke: #9333EA; stroke-width: 1.5; }
+    .box-bridge { fill: #EFF6FF; stroke: #2563EB; stroke-width: 1.5; }
+    .box-nic { fill: #FFFBEB; stroke: #D97706; stroke-width: 1.5; }
+    .box-card { fill: #FFFFFF; stroke: #D1D5DB; stroke-width: 1.2; rx: 6px; }
+    .box-header { fill: #F3F4F6; stroke: #E5E7EB; stroke-width: 1; }
+    
+    /* Connectors & Lines */
+    .edge { fill: none; stroke: #4B5563; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+    .edge-flow { fill: none; stroke: #76B900; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+    .edge-ctrl { fill: none; stroke: #2563EB; stroke-width: 1.8; stroke-dasharray: 4 4; stroke-linecap: round; stroke-linejoin: round; }
+    .edge-p2p { fill: none; stroke: #9333EA; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+    .ah { fill: #4B5563; }
+    .ah-flow { fill: #76B900; }
+    .ah-ctrl { fill: #2563EB; }
+    .ah-p2p { fill: #9333EA; }
+    
+    /* Badges */
+    .badge-dpu { fill: #DCFCE7; stroke: #16A34A; stroke-width: 1; }
+    .badge-gpu { fill: #F3E8FF; stroke: #9333EA; stroke-width: 1; }
+    .badge-hw { fill: #FEF3C7; stroke: #D97706; stroke-width: 1; }
+
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0F172A; stroke: #1E293B; }
+      .t { fill: #F8FAFC; }
+      .tm { fill: #94A3B8; }
+      .tw { fill: #FFFFFF; }
+      .box-dpu { fill: #064E3B; stroke: #059669; }
+      .box-gpu { fill: #3B0764; stroke: #A855F7; }
+      .box-bridge { fill: #1E3A8A; stroke: #3B82F6; }
+      .box-nic { fill: #451A03; stroke: #F59E0B; }
+      .box-card { fill: #1E293B; stroke: #334155; }
+      .box-header { fill: #1E293B; stroke: #334155; }
+      .edge { stroke: #94A3B8; }
+      .ah { fill: #94A3B8; }
+      .badge-dpu { fill: #064E3B; stroke: #34D399; }
+      .badge-gpu { fill: #581C87; stroke: #C084FC; }
+      .badge-hw { fill: #78350F; stroke: #FBBF24; }
+    }
+  </style>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah" d="M1,2 L9,5 L1,8 Z"/>
+    </marker>
+    <marker id="ah-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah-flow" d="M1,2 L9,5 L1,8 Z"/>
+    </marker>
+    <marker id="ah-ctrl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah-ctrl" d="M1,2 L9,5 L1,8 Z"/>
+    </marker>
+    <marker id="ah-p2p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+      <path class="ah-p2p" d="M1,2 L9,5 L1,8 Z"/>
+    </marker>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect class="bg" x="0.5" y="0.5" width="1179" height="719" rx="14"/>
+
+  <!-- Header Banner -->
+  <g id="header">
+    <rect class="box-card" x="30" y="20" width="1120" height="58" rx="8"/>
+    <rect class="c-nvke" x="42" y="32" width="10" height="34" rx="3"/>
+    <text class="l t" x="64" y="44">Samurai Hardware-Enforced 3GPP CUPS Architecture</text>
+    <text class="s tm" x="64" y="62">3GPP TS 23.501 / TS 29.244 Separation: DPU ARM64 Control Plane + NVIDIA GPU Fastpath + BAR1 P2P Direct DMA</text>
+    
+    <rect class="badge-dpu" x="780" y="32" width="110" height="32" rx="6"/>
+    <text class="m t" x="835" y="52" text-anchor="middle">DPU ARMv8-A</text>
+    
+    <rect class="badge-gpu" x="900" y="32" width="110" height="32" rx="6"/>
+    <text class="m t" x="955" y="52" text-anchor="middle">CUDA SM Engine</text>
+
+    <rect class="badge-hw" x="1020" y="32" width="115" height="32" rx="6"/>
+    <text class="m t" x="1077" y="52" text-anchor="middle">Zero-Copy BAR1</text>
+  </g>
+
+  <!-- ==================== LEFT COLUMN: DPU ARMv8-A CP ==================== -->
+  <g id="dpu-column">
+    <rect class="box-dpu" x="30" y="96" width="345" height="500" rx="10"/>
+    <rect class="box-header" x="40" y="106" width="325" height="36" rx="6"/>
+    <text class="l t" x="202" y="129" text-anchor="middle">DPU ARM Control Plane (Slowpath)</text>
+
+    <!-- Subsystem 1: 3GPP PFCP Engine -->
+    <g transform="translate(45, 154)">
+      <rect class="box-card" width="315" height="80" rx="6"/>
+      <text class="m t" x="12" y="22">3GPP N4 PFCP Engine (UDP/8805)</text>
+      <text class="s tm" x="12" y="38">• Session Establishment / Modification / Deletion</text>
+      <text class="s tm" x="12" y="54">• Dynamic QFI (0..63) &amp; TEID Allocation FSM</text>
+      <text class="mono c-blue" x="12" y="70">SessionManager O(1) Cache-Aligned Contexts</text>
+    </g>
+
+    <!-- Subsystem 2: ARM Portability Layer -->
+    <g transform="translate(45, 246)">
+      <rect class="box-card" width="315" height="88" rx="6"/>
+      <text class="m t" x="12" y="22">DPU ARMv8-A Native Hardware Bindings</text>
+      <text class="mono s t" x="12" y="40">cntvct_el0 / cntfrq_el0  [TSC &amp; Timer Wheel]</text>
+      <text class="mono s t" x="12" y="56">__crc32cd (&lt;arm_acle.h&gt;) [Hardware 5-Tuple Hash]</text>
+      <text class="mono s t" x="12" y="72">yield (asm volatile)     [Lock-Free Spin Pause]</text>
+      <text class="s tm" x="12" y="84">• CMake: -march=armv8-a+crc (Native NEON/CRC)</text>
+    </g>
+
+    <!-- Subsystem 3: DpuArmCupsSessionController -->
+    <g transform="translate(45, 346)">
+      <rect class="box-card" width="315" height="110" rx="6"/>
+      <text class="m t" x="12" y="22">DpuArmCupsSessionController</text>
+      <text class="s tm" x="12" y="38">• Seqlock Lock-Free Memory Publisher</text>
+      <text class="s tm" x="12" y="54">• ARMv8-A Memory Fence: <tspan class="mono">dmb ishst / stlr</tspan></text>
+      <text class="s tm" x="12" y="70">• Writes to POSIX <tspan class="mono">/dev/shm</tspan> Shared Memory</text>
+      <text class="s tm" x="12" y="86">• Publishes ZMQ <tspan class="mono">TELCO_TUNNEL_UPSERT</tspan></text>
+      <text class="s tm" x="12" y="102">• Gathers GPU Atomic TX Metrics (<tspan class="mono">tx_packets/bytes</tspan>)</text>
+    </g>
+
+    <!-- Subsystem 4: ZMQ Telco Worker Daemon -->
+    <g transform="translate(45, 468)">
+      <rect class="box-card" width="315" height="60" rx="6"/>
+      <text class="m t" x="12" y="22">samurai_telco_worker (Control Daemon)</text>
+      <text class="mono s tm" x="12" y="38">--cups-shm-path /dev/shm/samurai_cups_*.bin</text>
+      <text class="mono s tm" x="12" y="52">--cups-gpu-endpoint ipc:///tmp/cups_gpu.ipc</text>
+    </g>
+  </g>
+
+  <!-- ==================== CENTER COLUMN: BRIDGE & INTERCONNECT ==================== -->
+  <g id="bridge-column">
+    <rect class="box-bridge" x="395" y="96" width="370" height="500" rx="10"/>
+    <rect class="box-header" x="405" y="106" width="350" height="36" rx="6"/>
+    <text class="l t" x="580" y="129" text-anchor="middle">CUPS Hardware Bridge &amp; Shared Contracts</text>
+
+    <!-- Contract Box 1: Seqlock SHM -->
+    <g transform="translate(410, 154)">
+      <rect class="box-card" width="340" height="125" rx="6"/>
+      <text class="m t" x="12" y="22">POSIX Shared Memory Region (/dev/shm)</text>
+      <text class="mono s c-blue" x="12" y="38">DpuCupsSharedRegionHeaderV1 (4096B Page Aligned)</text>
+      <text class="s tm" x="12" y="54">• Magic: 0x43555053 ('CUPS'), Version: 1</text>
+      <text class="s tm" x="12" y="70">• <tspan class="mono">sequence_number</tspan> (Atomic Seqlock Counter)</text>
+      <text class="s tm" x="12" y="86">• <tspan class="mono">DpuCupsSharedTunnelV1[max_tunnels]</tspan> (64B Aligned)</text>
+      <text class="s tm" x="12" y="102">• Fields: TEID, Peer IP, UE IP, QFI, VLANs, TX Metrics</text>
+      <text class="mono s c-nvke" x="12" y="118">Registered via: cudaHostRegister(cudaHostRegisterDefault)</text>
+    </g>
+
+    <!-- Contract Box 2: ZeroMQ Control Plane Wire Protocol -->
+    <g transform="translate(410, 292)">
+      <rect class="box-card" width="340" height="110" rx="6"/>
+      <text class="m t" x="12" y="22">ZeroMQ Control Plane IPC Wire Protocol</text>
+      <text class="mono s c-blue" x="12" y="38">TELCO_TUNNEL_UPSERT (Payload Hardened)</text>
+      <text class="s tm" x="12" y="54">• Mid-Job Non-Blocking Injection (<tspan class="mono">ZMQ_DONTWAIT</tspan>)</text>
+      <text class="s tm" x="12" y="70">• Buffer Overflow Guard: Payload Size &amp; Count Validation</text>
+      <text class="s tm" x="12" y="86">• Flag: <tspan class="mono">kTelcoTunnelUpsertFlagClearBeforeUpsert</tspan></text>
+      <text class="s tm" x="12" y="102">• Dual Routing: Raw Socket vs BAR1 P2P Direct TX</text>
+    </g>
+
+    <!-- Contract Box 3: PCIe Fabric P2P DMA Routing -->
+    <g transform="translate(410, 414)">
+      <rect class="box-card" width="340" height="114" rx="6"/>
+      <text class="m t" x="12" y="22">PCIe Gen4/Gen5 P2P Switch Fabric</text>
+      <text class="s tm" x="12" y="38">• Root Complex Peer-to-Peer TLP Switching</text>
+      <text class="s tm" x="12" y="54">• Direct Memory Read (<tspan class="mono">MRd</tspan>) from GPU GDDR6 VRAM</text>
+      <text class="s tm" x="12" y="70">• Zero Host CPU / RAM Intermediary Traversal</text>
+      <text class="s tm" x="12" y="86">• End-to-End Latency: &lt; 850 nanoseconds</text>
+      <text class="s tm" x="12" y="102">• Sustained Wire Bandwidth: 100/200 Gbps</text>
+    </g>
+  </g>
+
+  <!-- ==================== RIGHT COLUMN: GPU CUDA DATAPLANE ==================== -->
+  <g id="gpu-column">
+    <rect class="box-gpu" x="785" y="96" width="365" height="500" rx="10"/>
+    <rect class="box-header" x="795" y="106" width="345" height="36" rx="6"/>
+    <text class="l t" x="967" y="129" text-anchor="middle">GPU CUDA Dataplane (Fastpath)</text>
+
+    <!-- Subsystem 1: Dynamic Worker Binding -->
+    <g transform="translate(800, 154)">
+      <rect class="box-card" width="335" height="74" rx="6"/>
+      <text class="m t" x="12" y="20">samurai_gpu_worker Runtime</text>
+      <text class="s tm" x="12" y="36">• Dynamic <tspan class="mono">dlsym</tspan> loading of <tspan class="mono">libgpu_packet_cuda.so</tspan></text>
+      <text class="s tm" x="12" y="52">• <tspan class="mono">samurai_gpu_packet_telco_attach_cups_shm_v1()</tspan></text>
+      <text class="s tm" x="12" y="68">• <tspan class="mono">samurai_gpu_packet_p2p_set_active_ring_v1()</tspan></text>
+    </g>
+
+    <!-- Subsystem 2: Telecom CUDA Kernels -->
+    <g transform="translate(800, 238)">
+      <rect class="box-card" width="335" height="152" rx="6"/>
+      <text class="m t" x="12" y="20">CUDA SIMT Telecom Engine (kernels_telecom.cuh)</text>
+      <text class="s tm" x="12" y="36">• <tspan class="mono">GTP-U Outer Headers</tspan>: IPv4 (UDP/2152, Flags=0x34)</text>
+      <text class="s tm" x="12" y="52">• <tspan class="mono">5G QFI Extension Header</tspan>: 0x85 PDU Session Container</text>
+      <text class="s tm" x="12" y="68">• <tspan class="mono">802.1Q Single VLAN &amp; 802.1ad QinQ</tspan> Encapsulation</text>
+      <text class="s tm" x="12" y="84">• <tspan class="mono">Dual-Layer Checksum</tspan>: Loop-unrolled 32-bit folding</text>
+      <text class="s tm" x="12" y="100">• <tspan class="mono">Seqlock Double-Read</tspan>: Warp-level consistency check</text>
+      <text class="s tm" x="12" y="116">• Inner L4: UDP / TCP (Full Flags) / ICMP Echo</text>
+      <text class="s tm" x="12" y="132">• Atomic Metric Writeback: <tspan class="mono">atomicAdd(&amp;tx_packets)</tspan></text>
+      <text class="mono s c-nvke" x="12" y="146">Throughput: &gt; 42.5 Mpps per CUDA SM Cluster</text>
+    </g>
+
+    <!-- Subsystem 3: GeforceP2pRingInstance & Doorbell -->
+    <g transform="translate(800, 400)">
+      <rect class="box-card" width="335" height="128" rx="6"/>
+      <text class="m t" x="12" y="20">GeforceP2pRingInstance (Zero-Copy P2P)</text>
+      <text class="s tm" x="12" y="36">• Vulkan BAR1 Host-Visible Device-Local Arena</text>
+      <text class="s tm" x="12" y="52">• Packet Frames written directly into GDDR6 Ring</text>
+      <text class="s tm" x="12" y="68">• Ring Head/Tail atomic pointers mapped to NIC DMA</text>
+      <text class="s tm" x="12" y="84">• GPU-Initiated Doorbell: <tspan class="mono">fence.proxy.tens</tspan> PTX</text>
+      <text class="s tm" x="12" y="100">• Direct MMIO Trigger into NIC BAR2 Register</text>
+      <text class="mono s c-nvkr" x="12" y="118">Zero-CPU Packet Transmission: CPU Load = 0.0%</text>
+    </g>
+  </g>
+
+  <!-- ==================== FLOW CONNECTIONS & ARROWS ==================== -->
+  <!-- DPU to SHM Bridge -->
+  <path class="edge-ctrl" d="M 360,390 L 410,210" marker-end="url(#ah-ctrl)"/>
+  <!-- DPU to ZMQ Bridge -->
+  <path class="edge-ctrl" d="M 360,420 L 410,345" marker-end="url(#ah-ctrl)"/>
+
+  <!-- SHM Bridge to GPU Worker -->
+  <path class="edge-flow" d="M 750,210 L 800,195" marker-end="url(#ah-flow)"/>
+  <!-- ZMQ Bridge to GPU Worker -->
+  <path class="edge-ctrl" d="M 750,345 L 800,205" marker-end="url(#ah-ctrl)"/>
+
+  <!-- GPU Kernels to BAR1 Ring -->
+  <path class="edge-p2p" d="M 967,390 L 967,400" marker-end="url(#ah-p2p)"/>
+
+  <!-- GPU BAR1 Ring to PCIe Switch Fabric -->
+  <path class="edge-p2p" d="M 800,470 L 750,470" marker-end="url(#ah-p2p)"/>
+
+  <!-- ==================== BOTTOM ROW: NETWORK HARDWARE EGRESS ==================== -->
+  <g id="bottom-hardware" transform="translate(30, 612)">
+    <rect class="box-nic" width="1120" height="84" rx="10"/>
+    
+    <rect class="box-card" x="16" y="14" width="260" height="56" rx="6"/>
+    <text class="m t" x="146" y="36" text-anchor="middle">Physical NIC Controller</text>
+    <text class="s tm" x="146" y="54" text-anchor="middle">Mellanox ConnectX / Intel E810</text>
+
+    <path class="edge-flow" d="M 580, -84 L 580, 0" marker-end="url(#ah-flow)"/>
+
+    <rect class="box-card" x="300" y="14" width="460" height="56" rx="6"/>
+    <text class="m t" x="530" y="34" text-anchor="middle">PCIe DMA Controller &amp; MMIO Doorbell Receiver</text>
+    <text class="s tm" x="530" y="52" text-anchor="middle">Fetches descriptors and packet payloads via PCIe MRd directly from GPU BAR1 GDDR6</text>
+
+    <rect class="box-card" x="780" y="14" width="324" height="56" rx="6"/>
+    <text class="m c-nvke" x="942" y="34" text-anchor="middle">100 / 200 GbE Wire Egress (QSFP28)</text>
+    <text class="s tm" x="942" y="52" text-anchor="middle">Carrier-Grade 4G/5G Telecom Packet Stream</text>
+  </g>
+
+</svg>

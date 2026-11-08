@@ -8,6 +8,8 @@
 
 ---
 
+![Samurai DPU ARM & GPU Telecom CUPS Architecture](assets/diagrams/samurai_telecom_dpu_gpu_cups.svg)
+
 ## 1. Yönetici Özeti ve Mimari Vizyon
 
 Mobil şebekelerde (4G LTE EPC ve 5G NR Standalone) kontrol düzlemi ile veri düzleminin birbirinden ayrılması, **3GPP CUPS (Control and User Plane Separation - 3GPP TS 23.501 / TS 29.244)** standartlarının temel taşıdır. Geleneksel x86 CPU sunucularında, milyonlarca abonenin N4 PFCP durum makinelerini yönetmek ile yüzlerce gigabitlik GTP-U tünel kapsülleme ve paket iletimini aynı işlemci çekirdeklerinde yürütmek; ciddi önbellek kirlenmesine (L1/L2/L3 thrashing), çekirdekler arası kilit çekişmesine (lock contention) ve kabul edilemez paket gecikme dalgalanmalarına (jitter) yol açar.
