@@ -84,7 +84,6 @@ dashboard/dist/
 # Runtime outputs / telemetry / artifacts
 artifacts/reports/
 reports/*
-!reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md
 !reports/benchmarks/
 reports/benchmarks/*
 !reports/benchmarks/task_l3_02/

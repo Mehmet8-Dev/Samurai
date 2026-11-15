@@ -1,7 +1,7 @@
 # Pull Request: Distributed Master/Slave Dynamic Rebalancing Under Worker Chaos (`TASK-TEST-L5-01`)
 
 * **Target Branch:** `main` (Committed directly to `main` without opening separate branches, as requested)
-* **Task / Issue Tracking:** `TASK-TEST-L5-01` ([`test_task.md`](file://test_task.md#L206-L230), [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L122-L145))
+* **Task / Issue Tracking:** `TASK-TEST-L5-01` ([`test_task.md`](../../../test_task.md#L206-L230))
 * **Architectural Layer:** Layer 5 (Distributed Control Plane & High Availability)
 * **Affected Subsystems & Files:**
   * [`samurai/control/master_coordinator.hpp`](file://samurai/control/master_coordinator.hpp)
