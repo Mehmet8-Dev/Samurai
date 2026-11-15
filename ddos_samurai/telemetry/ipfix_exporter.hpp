@@ -42,14 +42,18 @@ class IpfixExporter {
 
   uint32_t exported_packets() const noexcept { return exported_packets_; }
   uint64_t exported_records() const noexcept { return exported_records_; }
+  uint32_t send_errors() const noexcept { return send_errors_; }
   uint32_t sequence_number() const noexcept { return sequence_number_; }
 
  private:
   ExporterConfig cfg_;
   int socket_fd_{-1};
+  uint32_t dest_ip_be_{0};
+  bool dest_ip_valid_{false};
   uint32_t sequence_number_{1};
   uint32_t exported_packets_{0};
   uint64_t exported_records_{0};
+  uint32_t send_errors_{0};
   uint32_t template_send_counter_{0};
 
   // Pre-built template packet buffer

@@ -136,4 +136,28 @@ size_t FlowTableShard::EvictTimedOut(
   return evicted;
 }
 
+size_t FlowTableShard::FlushActive(
+    std::vector<SamuraiFlowRecord>& out_records, size_t max_records) noexcept {
+  if (active_count_ == 0 || max_records == 0) return 0;
+
+  size_t flushed = 0;
+  size_t scanned = 0;
+  size_t start_cursor = eviction_cursor_;
+
+  while (scanned < capacity_ && flushed < max_records && active_count_ > 0) {
+    size_t idx = (start_cursor + scanned) & mask_;
+    auto& entry = table_[idx];
+    if (entry.state == 1) {
+      out_records.push_back(entry);
+      entry.state = 0;
+      active_count_--;
+      flushed++;
+    }
+    scanned++;
+  }
+
+  eviction_cursor_ = (start_cursor + scanned) & mask_;
+  return flushed;
+}
+
 }  // namespace ddos_samurai::telemetry

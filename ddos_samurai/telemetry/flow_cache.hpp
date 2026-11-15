@@ -83,6 +83,9 @@ class alignas(64) FlowTableShard {
   size_t EvictTimedOut(uint64_t now_tsc, uint64_t active_timeout_tsc, uint64_t inactive_timeout_tsc,
                        std::vector<SamuraiFlowRecord>& out_evicted, size_t max_evict = 256) noexcept;
 
+  // Kalan tüm aktif akışları döner ve tabloyu boşaltır (iş sonu / pencere geçişi)
+  size_t FlushActive(std::vector<SamuraiFlowRecord>& out_records, size_t max_records = 4096) noexcept;
+
   void Clear() noexcept;
 
   size_t active_flow_count() const noexcept { return active_count_; }

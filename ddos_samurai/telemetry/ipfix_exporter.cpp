@@ -53,15 +53,25 @@ IpfixExporter::~IpfixExporter() {
 }
 
 bool IpfixExporter::InitSocket() {
-  if (socket_fd_ >= 0) return true;
+  if (socket_fd_ >= 0 && dest_ip_valid_) return true;
 
-  socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-  if (socket_fd_ < 0) return false;
+  struct in_addr resolved{};
+  if (cfg_.collector_ip.empty() || inet_pton(AF_INET, cfg_.collector_ip.c_str(), &resolved) != 1) {
+    dest_ip_valid_ = false;
+    return false;
+  }
+  dest_ip_be_ = resolved.s_addr;
+  dest_ip_valid_ = true;
 
-  // Set non-blocking socket
-  int flags = fcntl(socket_fd_, F_GETFL, 0);
-  if (flags >= 0) {
-    fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK);
+  if (socket_fd_ < 0) {
+    socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_fd_ < 0) return false;
+
+    // Set non-blocking socket
+    int flags = fcntl(socket_fd_, F_GETFL, 0);
+    if (flags >= 0) {
+      fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK);
+    }
   }
 
   return true;
@@ -72,6 +82,7 @@ void IpfixExporter::CloseSocket() {
     ::close(socket_fd_);
     socket_fd_ = -1;
   }
+  dest_ip_valid_ = false;
 }
 
 void IpfixExporter::BuildTemplateSet() {
@@ -245,20 +256,31 @@ bool IpfixExporter::ExportRecords(
   if (!records || count == 0) return true;
   if (!InitSocket()) return false;
 
-  // Send template periodically (e.g. every 20 packets or first packet)
-  bool include_template = (template_send_counter_++ % 20 == 0);
-
-  auto packet = BuildExportPacket(records, count, unix_secs, sys_uptime_ms, include_template);
-
   struct sockaddr_in dest{};
   dest.sin_family = AF_INET;
   dest.sin_port = htons(cfg_.collector_port);
-  inet_pton(AF_INET, cfg_.collector_ip.c_str(), &dest.sin_addr);
+  dest.sin_addr.s_addr = dest_ip_be_;
 
-  ssize_t sent = ::sendto(socket_fd_, packet.data(), packet.size(), MSG_DONTWAIT,
-                          reinterpret_cast<const struct sockaddr*>(&dest), sizeof(dest));
+  // Chunk below standard Ethernet UDP MTU (~1472 B) so large flow flushes never EMSGSIZE.
+  constexpr size_t kMaxRecordsPerDatagram = 24;
+  bool all_ok = true;
+  for (size_t offset = 0; offset < count; offset += kMaxRecordsPerDatagram) {
+    const size_t chunk = std::min(kMaxRecordsPerDatagram, count - offset);
+    // Send template periodically (e.g. every 20 packets or first packet)
+    const bool include_template = (template_send_counter_++ % 20 == 0);
+    auto packet = BuildExportPacket(
+        records + offset, chunk, unix_secs, sys_uptime_ms, include_template);
 
-  return (sent == static_cast<ssize_t>(packet.size()));
+    const ssize_t sent = ::sendto(socket_fd_, packet.data(), packet.size(), MSG_DONTWAIT,
+                                  reinterpret_cast<const struct sockaddr*>(&dest), sizeof(dest));
+    if (sent != static_cast<ssize_t>(packet.size())) {
+      if (exported_packets_ > 0) exported_packets_--;
+      if (exported_records_ >= chunk) exported_records_ -= chunk;
+      send_errors_++;
+      all_ok = false;
+    }
+  }
+  return all_ok;
 }
 
 }  // namespace ddos_samurai::telemetry
