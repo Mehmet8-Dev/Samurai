@@ -21,16 +21,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libzmq3-dev \
     libhiredis-dev \
     libpcap-dev \
+    libnghttp2-dev \
+    libngtcp2-dev \
+    libngtcp2-crypto-gnutls-dev \
+    libnghttp3-dev \
+    libgnutls28-dev \
+    liburing-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
 
-# Configure once, then build the deployable targets (the two daemons + the
-# commodity workers). GPU/DPDK/DOCA backends are gated on their toolchains and
+# Configure once, then build the deployable targets (CLI + daemons + commodity
+# and telco workers). GPU/DPDK/DOCA backends are gated on their toolchains and
 # skip cleanly when absent, so they are omitted from the default image.
 RUN cmake -S ddos_samurai -B build -DCMAKE_BUILD_TYPE=Release \
  && cmake --build build -j "$(nproc)" --target \
+      samurai \
       samurai_master \
       samurai_slave \
       samurai_cpu_worker \
@@ -38,7 +45,8 @@ RUN cmake -S ddos_samurai -B build -DCMAKE_BUILD_TYPE=Release \
       samurai_afxdp_worker \
       samurai_l7_worker \
       samurai_scenario_worker \
-      samurai_defense_worker
+      samurai_defense_worker \
+      samurai_telco_worker
 
 # ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -49,6 +57,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libzmq5 \
     libhiredis0.14 \
     libpcap0.8 \
+    libnghttp2-14 \
+    libngtcp2-9 \
+    libngtcp2-crypto-gnutls2 \
+    libnghttp3-3 \
+    libgnutls30 \
+    liburing2 \
     ca-certificates \
     iproute2 \
     curl \
@@ -60,6 +74,7 @@ RUN useradd -u 10001 -m -s /usr/sbin/nologin samurai
 
 # Install the native binaries on PATH. `--parents` preserves nothing; we flatten
 # every built daemon/worker into /usr/local/bin.
+COPY --from=build /src/build/cli/samurai                  /usr/local/bin/
 COPY --from=build /src/build/control/daemon/samurai_master /usr/local/bin/
 COPY --from=build /src/build/control/daemon/samurai_slave  /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_cpu_worker        /usr/local/bin/
@@ -68,6 +83,7 @@ COPY --from=build /src/build/zmq/samurai_afxdp_worker      /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_l7_worker         /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_scenario_worker   /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_defense_worker    /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_telco_worker      /usr/local/bin/
 
 USER 10001:10001
 WORKDIR /home/samurai
