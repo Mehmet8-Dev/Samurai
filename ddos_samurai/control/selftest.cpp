@@ -3171,6 +3171,125 @@ int main() {
   }
 #endif  // SAMURAI_CONTROL_HAVE_ZMQ
 
+  // --- Hierarchical Region Affinity, ASN Map & Multi-Pool Telco Sizing ---
+  {
+    namespace json = samurai::core::json;
+    const auto topo_parsed = json::Parse(
+        "{\"asn_to_region\":{\"AS9121\":\"tr-ist\",\"15897\":\"tr-ank\",\"3320\":\"eu-fra\"},"
+        "\"region_aliases\":{\"istanbul\":\"tr-ist\"}}");
+    RegionTopology topo;
+    std::string terr;
+    Check(topo_parsed.ok && RegionTopology::FromJson(topo_parsed.value, topo, terr),
+          "region-topo: parses ASN and alias JSON");
+    Check(topo.ResolveRegion(9121, "") == "tr-ist" &&
+              topo.ResolveRegion(0, "ISTANBUL") == "tr-ist",
+          "region-topo: resolves ASN and canonical alias");
+
+    std::map<std::string, WorkerCapabilities> caps;
+    caps["w-ist"].region = "tr-ist";
+    caps["w-ank"].region = "tr-ank";
+    caps["w-eu"].region = "eu-fra";
+    auto rshards = SplitJobToShards(
+        1000, {"w-ist", "w-ank", "w-eu"}, "region", caps, "tr-ist", &topo);
+    Check(Sum(rshards) == 1000 &&
+              rshards[0].packet_count > rshards[1].packet_count &&
+              rshards[1].packet_count >= rshards[2].packet_count,
+          "region-topo: exact PoP tr-ist > country-sibling tr-ank >= eu-fra");
+
+    // Lab sizing safety: reject public base_ip, accept isolated RFC 6598/1918 histogram.
+    const auto bad_pub = json::Parse("{\"lab_base_ip\":\"8.8.8.0\",\"prefix_counts\":{\"24\":2}}");
+    TelcoLabSizingProfile bad_prof;
+    std::string berr;
+    Check(bad_pub.ok && !TelcoLabSizingProfile::FromJson(bad_pub.value, bad_prof, berr),
+          "telco-pool: rejects public IPv4 pool base");
+
+    const auto hist_ok = json::Parse(
+        "{\"name\":\"tr-bng-hist\",\"lab_base_ip\":\"100.64.0.0\","
+        "\"prefix_counts\":{\"20\":2,\"22\":4,\"24\":8}}");
+    TelcoLabSizingProfile hist_prof;
+    std::string herr;
+    Check(hist_ok.ok && TelcoLabSizingProfile::FromJson(hist_ok.value, hist_prof, herr) &&
+              hist_prof.RouteCount() == 14 && hist_prof.buckets.size() == 3,
+          "telco-pool: builds 14 disjoint lab routes from manual histogram");
+
+    auto tspecs = SplitTelcoSubscribers(
+        3000, {"w-ist", "w-ank", "w-eu"}, caps, "tr-ist", "region",
+        "pppoe", 6000, 100, 10, nullptr, 0x0A000001, 0x0A0000FE, &hist_prof, &topo);
+    Check(tspecs.size() == 3 &&
+              tspecs[0].range.count + tspecs[1].range.count + tspecs[2].range.count == 3000 &&
+              tspecs[0].range.count > tspecs[1].range.count &&
+              tspecs[0].range.PoolRouteCount() == 14 &&
+              tspecs[0].range.EstimatedNatTableEntries(64) ==
+                  static_cast<std::uint64_t>(tspecs[0].range.count) * 64ull,
+          "telco-pool: region-weighted subscriber partitioning attaches 14 FIB routes");
+    bool all_safe = true;
+    for (std::uint32_t s = 0; s < 500; ++s) {
+      if (!IsSafeTelcoLabIpv4(tspecs[0].range.GetIpFor(s))) all_safe = false;
+    }
+    Check(all_safe && tspecs[0].range.GetIpFor(0) == 0x64400001u,
+          "telco-pool: multi-pool subscriber IPs stay strictly inside RFC6598/lab space");
+
+    // End-to-end MasterCoordinator telco dispatch using target_asn + regional-bng preset.
+    struct TelcoStubView : MasterView {
+      std::vector<WorkerInfo> ws;
+      std::mutex smu;
+      std::map<std::string, std::string> stats;
+      std::vector<WorkerInfo> Workers() override { return ws; }
+      void SetShardStats(const std::string& sid, const std::string& json) override {
+        std::lock_guard<std::mutex> lk(smu);
+        stats[sid] = json;
+      }
+      bool ShardReported(const std::string& sid) override {
+        std::lock_guard<std::mutex> lk(smu);
+        return stats.count(sid) > 0;
+      }
+      std::string GetShardStats(const std::string& sid) override {
+        std::lock_guard<std::mutex> lk(smu);
+        auto it = stats.find(sid);
+        return it == stats.end() ? "{}" : it->second;
+      }
+    };
+    struct TelcoStubCmd : WorkerCommander {
+      TelcoStubView* view = nullptr;
+      std::map<std::string, std::int64_t> by_worker_count;
+      DispatchOutcome Dispatch(const std::string&, const std::string& shard_id, const std::string&,
+                               const std::string& args_json, std::int64_t pkt_cnt,
+                               std::int64_t) override {
+        const auto ap = samurai::core::json::Parse(args_json);
+        if (ap.ok && ap.value.find("_worker_id")) {
+          by_worker_count[ap.value.find("_worker_id")->as_string("")] += pkt_cnt;
+        }
+        view->SetShardStats(shard_id, "{\"sent\":" + std::to_string(pkt_cnt) + ",\"errors\":0}");
+        return {true, "ok"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override { return {"done", "", "{}"}; }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override { return true; }
+    };
+    TelcoStubView tv;
+    WorkerInfo w1{"w-ist", {{"worker_kinds", "telco"}, {"control_endpoint", "tcp://127.0.0.1:9"}, {"region", "tr-ist"}}, 1000, ""};
+    WorkerInfo w2{"w-eu", {{"worker_kinds", "telco"}, {"control_endpoint", "tcp://127.0.0.1:10"}, {"region", "eu-fra"}}, 1000, ""};
+    tv.ws = {w1, w2};
+    TelcoStubCmd tc;
+    tc.view = &tv;
+    std::int64_t tnow = 1000;
+    MasterCoordinator coord(&tv, &tc, [&]() { return tnow; }, [&](int ms) { tnow += ms; });
+    JobConfig cfg;
+    cfg.is_telco_job = true;
+    cfg.telco_subscribers = 1000;
+    cfg.target_asn = 9121;
+    cfg.region_topology = topo;
+    cfg.telco_pool_profile = TelcoLabSizingProfile::Preset("regional-bng");
+    cfg.job_timeout_s = 10;
+    cfg.master_poll_interval_ms = 5;
+    const JobResult tr = coord.RunSingleJob(cfg, "t-asn-job");
+    Check(tr.rc == 0 && tc.by_worker_count["w-ist"] > tc.by_worker_count["w-eu"] &&
+              tr.snapshot.find("telco_routing_prefixes") &&
+              tr.snapshot.find("telco_routing_prefixes")->as_int(0) == 52 &&
+              tr.snapshot.find("resolved_target_region") &&
+              tr.snapshot.find("resolved_target_region")->as_string("") == "tr-ist",
+          "coord-asn-telco: target_asn + regional-bng weights tr-ist & reports 52 FIB prefixes");
+  }
+
   if (g_failures == 0) {
     std::printf("control selftest: all checks passed\n");
     return 0;

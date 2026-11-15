@@ -289,6 +289,62 @@ void TestAsymmetricSubscriberSharding() {
     TelecomAuditLogger::Instance().PrintSummary(rec);
 }
 
+void TestRegionWeightedAndMultiPoolSharding() {
+    std::cout << "[TEST] 5. Hierarchical Region-Weighted & CGNAT Multi-Pool Subscriber Sharding..." << std::endl;
+
+    RegionTopology topo;
+    topo.asn_to_region[9121] = "tr-ist";
+    topo.asn_to_region[15897] = "tr-ank";
+    topo.region_aliases["istanbul"] = "tr-ist";
+
+    std::map<std::string, WorkerCapabilities> caps;
+    caps["tr-ist-1"].region = "tr-ist";
+    caps["tr-ist-1"].xdp_available = true;
+    caps["tr-ank-1"].region = "tr-ank";
+    caps["eu-fra-1"].region = "eu-fra";
+
+    const TelcoLabSizingProfile profile = TelcoLabSizingProfile::Preset("regional-bng");
+    assert(profile.RouteCount() == 52);  // 4 + 16 + 32 disjoint RFC6598 subnets
+
+    auto specs = SplitTelcoSubscribers(
+        10000,
+        {"tr-ist-1", "tr-ank-1", "eu-fra-1"},
+        caps,
+        "istanbul",
+        "region",
+        "gtpu",
+        10000,
+        100,
+        10,
+        nullptr,
+        0x0A000001,
+        0x0A0000FE,
+        &profile,
+        &topo);
+    assert(specs.size() == 3);
+    assert(specs[0].range.count + specs[1].range.count + specs[2].range.count == 10000);
+    // tr-ist (exact PoP + XDP) > tr-ank (same country tr-*) >= eu-fra (cross-region)
+    assert(specs[0].range.count > specs[1].range.count);
+    assert(specs[1].range.count >= specs[2].range.count);
+    assert(specs[0].range.PoolRouteCount() == 52);
+
+    // Every generated subscriber IP must remain inside RFC 6598 (100.64.0.0/10).
+    for (uint32_t i = 0; i < 4096; ++i) {
+        const uint32_t ip = specs[0].range.GetIpFor(i);
+        assert((ip & 0xFFC00000u) == 0x64400000u);
+        assert(IsSafeTelcoLabIpv4(ip));
+    }
+
+    // Verify JSON round-trip preserves pools accurately.
+    const Value j = specs[0].ToJson();
+    const TelcoShardSpec restored = TelcoShardSpec::FromJson(j);
+    assert(restored.range.pools.size() == 3);
+    assert(restored.range.PoolRouteCount() == 52);
+    assert(restored.range.GetIpFor(1234) == specs[0].range.GetIpFor(1234));
+
+    std::cout << "  -> Hierarchical PoP weighting + 52-prefix RFC6598 CGNAT pool layout: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "=================================================================\n";
     std::cout << "   SAMURAI DISTRIBUTED CLUSTER SHARDING VERIFICATION SUITE       \n";
@@ -298,6 +354,7 @@ int main() {
     TestTelcoShardSpecJsonRoundtrip();
     TestMasterCoordinatorClusterDispatch();
     TestAsymmetricSubscriberSharding();
+    TestRegionWeightedAndMultiPoolSharding();
 
     std::cout << "=================================================================\n";
     std::cout << "  ALL CLUSTER SHARDING TESTS PASSED! (100% VERIFIED)             \n";

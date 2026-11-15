@@ -51,6 +51,7 @@ struct CoordShard {
   int attempt = 0;
   std::string target_region;
   std::string worker_id;  // set on dispatch
+  std::string preferred_worker;
   bool is_telco = false;
   TelcoShardSpec telco_spec;
 };
@@ -90,16 +91,13 @@ bool WorkerRunsKind(const std::map<std::string, std::string>& caps, const std::s
 }
 
 double WorkerDispatchScore(const std::map<std::string, std::string>& caps, const CoordShard& sh,
-                           const std::string& target_region, bool region_aware) {
+                           const std::string& target_region, bool region_aware,
+                           const RegionTopology& topology) {
   double score = 0.0;
-  std::string tr = Lower(Strip(sh.target_region.empty() ? target_region : sh.target_region));
+  std::string tr = topology.CanonicalRegion(sh.target_region.empty() ? target_region : sh.target_region);
   const std::string wr = Lower(Strip(CapStr(caps, "region")));
   if (region_aware && !tr.empty()) {
-    if (wr == tr) {
-      score += 100.0;
-    } else if (!wr.empty() && wr != tr) {
-      score -= 20.0;
-    }
+    score += static_cast<double>(topology.AffinityDelta(wr, tr)) * 20.0;
   }
   const std::string* cap_score = CapPtr(caps, "capacity_score");
   if (cap_score) {
@@ -195,10 +193,12 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
 
   const std::int64_t wait_s = job.job_timeout_s > 0 ? job.job_timeout_s : 120;
   const std::int64_t timeout_ms = job.job_timeout_s * 1000;
+  const std::string target_region =
+      job.region_topology.ResolveRegion(job.target_asn, job.target_region);
+  const std::string master_region = job.region_topology.CanonicalRegion(job.worker_region);
+  const std::string strategy_norm = Lower(Strip(job.shard_strategy.empty() ? "equal" : job.shard_strategy));
   const bool region_aware =
-      job.region_aware_routing || Lower(Strip(job.shard_strategy)) == "region";
-  const std::string target_region = Lower(Strip(job.target_region));
-  const std::string master_region = Lower(Strip(job.worker_region));
+      job.region_aware_routing || strategy_norm == "region" || !target_region.empty();
   const int poll_ms = std::max(1, job.master_poll_interval_ms);
   // Worker flavor this job needs (from base_args["worker"]); shards only go to
   // workers advertising it. Empty (or a legacy worker with no worker_kinds cap)
@@ -221,28 +221,42 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
   if (is_telco) {
     auto w_map = load_workers();
     std::vector<std::string> telco_workers;
+    std::map<std::string, WorkerCapabilities> telco_caps;
     for (const auto& kv : w_map) {
       if (WorkerRunsKind(kv.second.capabilities, "telco")) {
         telco_workers.push_back(kv.first);
+        telco_caps[kv.first] = CapabilitiesFromStrings(kv.second.capabilities);
       }
     }
     if (telco_workers.empty()) {
-      for (const auto& kv : w_map) telco_workers.push_back(kv.first);
+      for (const auto& kv : w_map) {
+        telco_workers.push_back(kv.first);
+        telco_caps[kv.first] = CapabilitiesFromStrings(kv.second.capabilities);
+      }
     }
     if (telco_workers.empty()) {
       telco_workers.push_back("worker-1");
     }
 
+    const std::string telco_strategy =
+        region_aware ? "region" : (strategy_norm.empty() ? "equal" : strategy_norm);
+    const TelcoLabSizingProfile* pool_ptr =
+        job.telco_pool_profile.buckets.empty() ? nullptr : &job.telco_pool_profile;
     auto telco_specs = SplitTelcoSubscribers(
         static_cast<std::uint32_t>(total_workload),
         telco_workers,
+        telco_caps,
+        target_region,
+        telco_strategy,
         job.telco_protocol,
         job.telco_rate_cps,
         job.telco_base_vlan_s,
         job.telco_base_vlan_c,
         nullptr,
         job.telco_base_ip,
-        job.telco_gateway_ip);
+        job.telco_gateway_ip,
+        pool_ptr,
+        &job.region_topology);
 
     int seq = 0;
     for (auto& spec : telco_specs) {
@@ -253,6 +267,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       s.packet_count = spec.range.count;
       s.attempt = 0;
       s.target_region = target_region;
+      s.preferred_worker = spec.worker_id;
       s.is_telco = true;
       s.telco_spec = std::move(spec);
       all_sids.insert(s.shard_id);
@@ -547,13 +562,19 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     while (!pending.empty() && !free_workers.empty()) {
       CoordShard sh = pending.front();
       pending.pop_front();
-      // Select a worker (region-aware if enabled), else the first free one.
+      // Select a worker (preserving initial Telco partition affinity or region score),
+      // else the first free one.
       std::size_t pick = 0;
-      if (region_aware) {
+      const bool honor_preferred = (sh.attempt == 0 && !sh.preferred_worker.empty());
+      if (region_aware || honor_preferred) {
         double best = -1e300;
         for (std::size_t i = 0; i < free_workers.size(); ++i) {
-          const double sc =
-              WorkerDispatchScore(workers[free_workers[i]].capabilities, sh, target_region, true);
+          double sc =
+              WorkerDispatchScore(workers[free_workers[i]].capabilities, sh, target_region,
+                                  region_aware, job.region_topology);
+          if (honor_preferred && free_workers[i] == sh.preferred_worker) {
+            sc += 100000.0;
+          }
           if (sc > best) {
             best = sc;
             pick = i;
@@ -753,6 +774,13 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     snap.set("telco_protocol", Value::Str(job.telco_protocol));
     snap.set("telco_subscribers", Value::Int(total_workload));
     snap.set("cluster_db_port", Value::Int(job.db_port));
+    snap.set("telco_routing_prefixes", Value::Int(job.telco_pool_profile.RouteCount()));
+    if (!job.telco_pool_profile.name.empty()) {
+      snap.set("telco_pool_profile", Value::Str(job.telco_pool_profile.name));
+    }
+  }
+  if (!target_region.empty()) {
+    snap.set("resolved_target_region", Value::Str(target_region));
   }
 
   if (converged_stop) {

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "json.hpp"
+#include "shard.hpp"
 
 namespace samurai::control {
 
@@ -99,8 +100,10 @@ struct JobConfig {
   std::string on_worker_loss = "continue";  // or "abort"
   std::int64_t shard_unit_count = 0;         // 0 => auto from worker count
   bool region_aware_routing = false;
-  std::string shard_strategy = "equal";      // "region" also enables region routing
+  std::string shard_strategy = "equal";      // "region" | "capability" | "equal"
   std::string target_region;
+  std::uint32_t target_asn = 0;              // resolved via region_topology when target_region empty
+  RegionTopology region_topology;
   std::string worker_region;                 // the master's region
   double cross_region_heartbeat_factor = 1.6;
   std::string tenant_namespace;
@@ -122,6 +125,7 @@ struct JobConfig {
   std::uint16_t telco_base_vlan_c = 10;      // 802.1Q Customer Inner VLAN base
   std::uint32_t telco_base_ip = 0x0A000001;  // 10.0.0.1
   std::uint32_t telco_gateway_ip = 0x0A0000FE; // 10.0.0.254
+  TelcoLabSizingProfile telco_pool_profile;  // Optional multi-pool CGNAT/BNG FIB lab profile
   std::uint32_t telco_duration_ms = 0;       // 0 = worker default / bounded by count
   std::uint32_t sctp_rate = 0;
   std::uint32_t diameter_rate = 0;

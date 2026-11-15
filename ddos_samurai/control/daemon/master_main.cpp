@@ -478,9 +478,51 @@ Value RlTransitionJson(const std::string& run_id, int win, double action_rps,
   return o;
 }
 
+bool LoadJsonFileValue(const std::string& path, Value& out, std::string& err) {
+  std::ifstream f(path);
+  if (!f) {
+    err = "cannot open file: " + path;
+    return false;
+  }
+  std::stringstream ss;
+  ss << f.rdbuf();
+  const auto parsed = samurai::core::json::Parse(ss.str());
+  if (!parsed.ok) {
+    err = "invalid JSON in " + path + ": " + parsed.error;
+    return false;
+  }
+  out = parsed.value;
+  return true;
+}
+
+bool ResolveRegionTopologyArg(const std::string& path,
+                              samurai::control::RegionTopology& out,
+                              std::string& err) {
+  if (path.empty()) return true;
+  Value j;
+  if (!LoadJsonFileValue(path, j, err)) return false;
+  return samurai::control::RegionTopology::FromJson(j, out, err);
+}
+
+bool ResolveTelcoPoolProfileArg(const std::string& spec,
+                                samurai::control::TelcoLabSizingProfile& out,
+                                std::string& err) {
+  if (spec.empty()) return true;
+  const std::string low = LowerCopy(spec);
+  if (low == "linear" || low == "regional-bng" || low == "national-cgnat") {
+    out = samurai::control::TelcoLabSizingProfile::Preset(low);
+    return true;
+  }
+  Value j;
+  if (!LoadJsonFileValue(spec, j, err)) return false;
+  return samurai::control::TelcoLabSizingProfile::FromJson(j, out, err);
+}
+
 // Collect the job parameters (CLI or delegated) into a single JSON spec so both
 // the local and cross-region delegated paths build a JobConfig the same way.
-Value JobSpecFromArgs(int argc, char** argv) {
+Value JobSpecFromArgs(int argc, char** argv,
+                      const samurai::control::RegionTopology* preloaded_topo = nullptr,
+                      const samurai::control::TelcoLabSizingProfile* preloaded_pool = nullptr) {
   using namespace samurai::control::daemon;
   Value s = Value::Object();
   s.set("count", Value::Int(OptInt(argc, argv, "--count", 0)));
@@ -491,6 +533,11 @@ Value JobSpecFromArgs(int argc, char** argv) {
   s.set("worker", Value::Str(Opt(argc, argv, "--worker", "cpu")));
   s.set("transport", Value::Str(Opt(argc, argv, "--transport", "")));
   s.set("target_region", Value::Str(Opt(argc, argv, "--target-region", "")));
+  s.set("target_asn", Value::Int(OptInt(argc, argv, "--target-asn", 0)));
+  s.set("shard_strategy", Value::Str(Opt(argc, argv, "--shard-strategy", "")));
+  if (preloaded_topo && (!preloaded_topo->asn_to_region.empty() || !preloaded_topo->region_aliases.empty())) {
+    s.set("region_topology", preloaded_topo->ToJson());
+  }
   s.set("job_timeout_s", Value::Int(OptInt(argc, argv, "--job-timeout-s", 0)));
   s.set("shard_unit_count", Value::Int(OptInt(argc, argv, "--shard-unit-count", 0)));
   s.set("poll_interval_ms", Value::Int(OptInt(argc, argv, "--poll-interval-ms", 250)));
@@ -518,6 +565,12 @@ Value JobSpecFromArgs(int argc, char** argv) {
   s.set("teid_start", Value::Int(OptInt(argc, argv, "--teid-start", 1)));
   s.set("teid_count", Value::Int(OptInt(argc, argv, "--teid-count", 1)));
   s.set("qfi", Value::Int(OptInt(argc, argv, "--qfi", 9)));
+  if (preloaded_pool && !preloaded_pool->buckets.empty()) {
+    s.set("telco_pool_profile", preloaded_pool->ToJson());
+  } else {
+    const std::string p = Opt(argc, argv, "--telco-pool-profile", "");
+    if (!p.empty()) s.set("telco_pool_profile", Value::Str(p));
+  }
 
   // Production IPFIX / NetFlow v9 telemetry fields
   s.set("ipfix_enabled", Value::Bool(OptBoolFlag(argc, argv, "--ipfix-enabled", false)));
@@ -570,9 +623,20 @@ samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leade
   job.leader_epoch = leader_epoch;
   const std::string tr = LowerCopy(gets("target_region", ""));
   job.target_region = tr;
+  job.target_asn = static_cast<std::uint32_t>(std::max<std::int64_t>(0, geti("target_asn", 0)));
+  if (const Value* rt = spec.find("region_topology"); rt && rt->is_object()) {
+    std::string ignored_err;
+    samurai::control::RegionTopology::FromJson(*rt, job.region_topology, ignored_err);
+  }
+  const std::string strat = LowerCopy(gets("shard_strategy", ""));
   job.worker_region = master_region;
-  job.region_aware_routing = !tr.empty();
-  if (!tr.empty()) job.shard_strategy = "region";
+  const std::string eff_region = job.region_topology.ResolveRegion(job.target_asn, tr);
+  job.region_aware_routing = !eff_region.empty() || strat == "region";
+  if (!strat.empty()) {
+    job.shard_strategy = strat;
+  } else if (!eff_region.empty()) {
+    job.shard_strategy = "region";
+  }
 
   const std::string wk = LowerCopy(gets("worker", "cpu"));
   const std::string proto = gets("protocol", "udp");
@@ -604,6 +668,14 @@ samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leade
   job.teid_count =
       static_cast<std::uint32_t>(std::max<std::int64_t>(1, geti("teid_count", 1)));
   job.qfi = static_cast<std::uint8_t>(std::clamp<std::int64_t>(geti("qfi", 9), 0, 255));
+  if (const Value* tp = spec.find("telco_pool_profile")) {
+    if (tp->is_string()) {
+      job.telco_pool_profile = samurai::control::TelcoLabSizingProfile::Preset(tp->as_string(""));
+    } else if (tp->is_object()) {
+      std::string ignored_err;
+      samurai::control::TelcoLabSizingProfile::FromJson(*tp, job.telco_pool_profile, ignored_err);
+    }
+  }
 
   job.ipfix_enabled = getb("ipfix_enabled", false);
   job.ipfix_collector = gets("ipfix_collector", "127.0.0.1");
@@ -698,6 +770,8 @@ void Usage(const char* argv0) {
       "  --telco-gateway-ip IP     BNG/UPF gateway IP (default 10.0.0.254)\n"
       "  --sctp-rate N / --diameter-rate N / --sip-rate N / --enable-srtp\n"
       "  --teid-start N / --teid-count N / --qfi N\n"
+      "  --telco-pool-profile X    isolated CGNAT/BNG pool layout (linear|regional-bng|\n"
+      "                            national-cgnat|PATH_JSON within RFC1918/6598/2544)\n"
       "  Production IPFIX / NetFlow v9 telemetry:\n"
       "  --ipfix-enabled [0|1]     enable live UDP IPFIX/NetFlow v9 flow export\n"
       "  --ipfix-collector IP      collector host (default 127.0.0.1)\n"
@@ -743,6 +817,9 @@ void Usage(const char* argv0) {
       "  --provision-timeout-s N   wait up to N seconds for heartbeat (default 10)\n"
       "  --target-region R         route/delegate this job to region R (region-\n"
       "                            aware shard routing; cross-region delegation)\n"
+      "  --target-asn N            resolve target region via --region-map-file\n"
+      "  --region-map-file PATH    JSON ASN->region and alias topology file\n"
+      "  --shard-strategy S        equal | capability | region (default auto)\n"
       "  --ha-mode MODE            static | file-lock | redis (default off)\n"
       "  --ha-node-id ID           this node's id\n"
       "  --ha-peers CSV            peer node ids (static mode)\n"
@@ -958,6 +1035,35 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "samurai_master: --count must be > 0\n");
     return 2;
   }
+  const std::string shard_strategy = LowerCopy(Opt(argc, argv, "--shard-strategy", ""));
+  if (!shard_strategy.empty() && shard_strategy != "equal" &&
+      shard_strategy != "capability" && shard_strategy != "region") {
+    std::fprintf(stderr,
+                 "samurai_master: invalid --shard-strategy '%s' (equal|capability|region)\n",
+                 shard_strategy.c_str());
+    return 2;
+  }
+  samurai::control::RegionTopology cli_region_topo;
+  {
+    const std::string rmf = Opt(argc, argv, "--region-map-file", "");
+    std::string rerr;
+    if (!ResolveRegionTopologyArg(rmf, cli_region_topo, rerr)) {
+      std::fprintf(stderr, "samurai_master: --region-map-file error: %s\n", rerr.c_str());
+      return 2;
+    }
+  }
+  samurai::control::TelcoLabSizingProfile cli_telco_pool;
+  {
+    const std::string tpp = Opt(argc, argv, "--telco-pool-profile", "");
+    std::string perr;
+    if (!ResolveTelcoPoolProfileArg(tpp, cli_telco_pool, perr)) {
+      std::fprintf(stderr, "samurai_master: --telco-pool-profile error: %s\n", perr.c_str());
+      return 2;
+    }
+  }
+  const std::uint32_t cli_target_asn =
+      static_cast<std::uint32_t>(std::max<long>(0, OptInt(argc, argv, "--target-asn", 0)));
+
   const std::string vector = Opt(argc, argv, "--vector", "basic");
   const double rps = std::strtod(Opt(argc, argv, "--rps", "0").c_str(), nullptr);
   const int expected_workers = OptInt(argc, argv, "--workers", 1);
@@ -1536,8 +1642,9 @@ int main(int argc, char** argv) {
   // Primary job: run it on this region's workers, or delegate the whole job to a
   // peer region when --target-region names a different region.
   if (has_local_job) {
-    const Value spec = JobSpecFromArgs(argc, argv);
-    const std::string tr = LowerCopy(Opt(argc, argv, "--target-region", ""));
+    const Value spec = JobSpecFromArgs(argc, argv, &cli_region_topo, &cli_telco_pool);
+    const std::string tr = cli_region_topo.ResolveRegion(
+        cli_target_asn, Opt(argc, argv, "--target-region", ""));
     if (mm && mm->active() && !tr.empty() && tr != master_region) {
       if (mm->EnqueueJob(tr, spec)) {
         std::printf("samurai_master: delegated job (count=%ld) to region %s\n", effective_count, tr.c_str());
