@@ -23,7 +23,7 @@ bool NeedsValue(int i, int argc, const char* flag) {
 
 void PrintUsage(const char* argv0) {
   std::printf(
-      "usage: %s --worker <cpu|gpu|dpdk|afxdp|afpacket|doca|l7|defense|scenario> [options]\n"
+      "usage: %s --worker <cpu|gpu|dpdk|afxdp|afpacket|doca|l7|defense|scenario|telco> [options]\n"
       "\n"
       "options:\n"
       "  --worker NAME       worker backend to run (required)\n"
@@ -33,7 +33,7 @@ void PrintUsage(const char* argv0) {
       "  --count N           packet count (default: 1000)\n"
       "  --size N            packet size in bytes (default: 64)\n"
       "  --rps F             target rate; 0 = as fast as possible (default: 0)\n"
-      "  --protocol NAME     l4 protocol, e.g. udp/tcp (default: udp)\n"
+      "  --protocol NAME     l4/telco protocol, e.g. udp/tcp/pppoe/sctp/diameter/sip-rtp/gtpu (default: udp)\n"
       "  --vector NAME       attack vector label (default: flood)\n"
       "  --pin-cpu N         pin worker to CPU core (default: -1 = none)\n"
       "  --timeout-ms N      per-recv timeout on the events channel (default: 5000)\n"
@@ -49,11 +49,23 @@ void PrintUsage(const char* argv0) {
       "  --keepalive         reuse L7 connections across requests (default: off)\n"
       "  --host-header NAME  L7 Host/SNI override (default: target IP)\n"
       "  --l7-timeout-ms N   L7 per-request timeout ms (default: 5000)\n"
-      "  --sctp-rate N       target rate for SCTP associations/chunks\n"
-      "  --diameter-rate N   target rate for Diameter CCR transactions\n"
-      "  --diameter-ccr-rate N alias for --diameter-rate\n"
-      "  --sip-rate N        target rate for SIP calls\n"
-      "  --enable-srtp       enable SRTP encrypted audio stream\n"
+      "  --telco-subscribers N      number of Telco subscribers (default: 100)\n"
+      "  --telco-subscriber-start N starting subscriber index (default: 0)\n"
+      "  --telco-cps N              Telco subscriber/setup rate CPS (default: 50)\n"
+      "  --telco-duration-ms N      Telco bounded duration in ms (default: 5000)\n"
+      "  --vlan-s N                 Telco outer QinQ S-VLAN base (default: 100)\n"
+      "  --vlan-c N                 Telco inner C-VLAN base (default: 100)\n"
+      "  --sctp-rate N              target rate for SCTP associations/chunks\n"
+      "  --diameter-rate N          target rate for Diameter CCR transactions\n"
+      "  --diameter-ccr-rate N      alias for --diameter-rate\n"
+      "  --sip-rate N               target rate for SIP calls\n"
+      "  --enable-srtp              enable SRTP encrypted audio stream\n"
+      "  --ipfix-enabled            enable live IPFIX/NetFlow telemetry export\n"
+      "  --ipfix-collector IP       IPFIX collector IPv4 (default: 127.0.0.1)\n"
+      "  --ipfix-port N             IPFIX UDP collector port (default: 4739)\n"
+      "  --ipfix-sample-rate N      IPFIX 1-in-N packet sampling rate (default: 1000)\n"
+      "  --ipfix-netflow-v9         emit NetFlow v9 instead of IPFIX v10\n"
+      "  --ipfix-domain-id N        IPFIX observation domain id (default: 1)\n"
       "  --list-profiles     list the available workload profiles and exit\n"
       "  --allow-public-target        permit non-private/loopback targets\n"
       "  --allow-target IP|CIDR       allowlist a target (repeatable)\n"
@@ -135,6 +147,7 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
     } else if (a == "--vector") {
       if (!NeedsValue(i, argc, "--vector")) return ParseStatus::kError;
       out.job.attack_vector = argv[++i];
+      out.vector_explicit = true;
     } else if (a == "--pin-cpu") {
       if (!NeedsValue(i, argc, "--pin-cpu")) return ParseStatus::kError;
       out.job.pin_cpu = static_cast<std::int32_t>(std::strtol(argv[++i], nullptr, 10));
@@ -208,14 +221,64 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
     } else if (a == "--sctp-rate") {
       if (!NeedsValue(i, argc, "--sctp-rate")) return ParseStatus::kError;
       out.sctp_rate = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      out.job.sctp_rate = out.sctp_rate;
     } else if (a == "--diameter-rate" || a == "--diameter-ccr-rate") {
       if (!NeedsValue(i, argc, a.c_str())) return ParseStatus::kError;
       out.diameter_rate = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      out.job.diameter_rate = out.diameter_rate;
     } else if (a == "--sip-rate") {
       if (!NeedsValue(i, argc, "--sip-rate")) return ParseStatus::kError;
       out.sip_rate = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+      out.job.sip_rate = out.sip_rate;
     } else if (a == "--enable-srtp") {
       out.enable_srtp = true;
+      out.job.enable_srtp = true;
+    } else if (a == "--telco-subscribers" || a == "--subscriber-count") {
+      if (!NeedsValue(i, argc, a.c_str())) return ParseStatus::kError;
+      out.job.telco_subscribers = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--telco-subscriber-start" || a == "--subscriber-start") {
+      if (!NeedsValue(i, argc, a.c_str())) return ParseStatus::kError;
+      out.job.telco_subscriber_start = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--telco-cps" || a == "--cps") {
+      if (!NeedsValue(i, argc, a.c_str())) return ParseStatus::kError;
+      out.job.telco_rate_cps = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--telco-duration-ms") {
+      if (!NeedsValue(i, argc, "--telco-duration-ms")) return ParseStatus::kError;
+      out.job.telco_duration_ms = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--vlan-s") {
+      if (!NeedsValue(i, argc, "--vlan-s")) return ParseStatus::kError;
+      out.job.telco_base_vlan_s = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--vlan-c") {
+      if (!NeedsValue(i, argc, "--vlan-c")) return ParseStatus::kError;
+      out.job.telco_base_vlan_c = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--telco-base-ip") {
+      if (!NeedsValue(i, argc, "--telco-base-ip")) return ParseStatus::kError;
+      out.job.telco_base_ip = argv[++i];
+    } else if (a == "--telco-gateway-ip") {
+      if (!NeedsValue(i, argc, "--telco-gateway-ip")) return ParseStatus::kError;
+      out.job.telco_gateway_ip = argv[++i];
+    } else if (a == "--db-port") {
+      if (!NeedsValue(i, argc, "--db-port")) return ParseStatus::kError;
+      out.job.telco_db_port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--ipfix-enabled") {
+      out.job.ipfix_enabled = true;
+    } else if (a == "--ipfix-collector") {
+      if (!NeedsValue(i, argc, "--ipfix-collector")) return ParseStatus::kError;
+      out.job.ipfix_collector = argv[++i];
+    } else if (a == "--ipfix-port") {
+      if (!NeedsValue(i, argc, "--ipfix-port")) return ParseStatus::kError;
+      out.job.ipfix_port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--ipfix-sample-rate") {
+      if (!NeedsValue(i, argc, "--ipfix-sample-rate")) return ParseStatus::kError;
+      out.job.ipfix_sample_rate = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--ipfix-netflow-v9") {
+      out.job.ipfix_netflow_v9 = true;
+    } else if (a == "--ipfix-domain-id") {
+      if (!NeedsValue(i, argc, "--ipfix-domain-id")) return ParseStatus::kError;
+      out.job.ipfix_domain_id = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+    } else if (a == "--ipfix-export-interval-ms") {
+      if (!NeedsValue(i, argc, "--ipfix-export-interval-ms")) return ParseStatus::kError;
+      out.job.ipfix_export_interval_ms = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
     } else if (a == "--teid-start") {
       if (!NeedsValue(i, argc, "--teid-start")) return ParseStatus::kError;
       out.job.teid_start = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));

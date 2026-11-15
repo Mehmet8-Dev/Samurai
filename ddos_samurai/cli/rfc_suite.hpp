@@ -49,6 +49,13 @@ struct Rfc3511Result {
   bool passed = false;
 };
 
+struct Rfc3511Sample {
+  double achieved_cps = 0.0;
+  double p99_latency_ms = 0.0;
+  uint32_t max_concurrency = 0;
+  bool ok = true;
+};
+
 struct Rfc8219Config {
   bool ipv6_enabled = true;
   bool deep_inspection_enabled = true;
@@ -59,6 +66,12 @@ struct Rfc8219Result {
   double ipv6_zero_loss_gbps = 0.0;
   double inspection_pass_rate_pct = 100.0;
   bool passed = false;
+};
+
+struct Rfc8219Sample {
+  double inspection_pass_rate_pct = 0.0;
+  double measured_gbps = 0.0;
+  bool ok = true;
 };
 
 struct RfcSuiteResult {
@@ -77,13 +90,25 @@ class RfcSuiteEngine {
       const Rfc2544Config& cfg,
       std::function<double(double trial_rps)> trial_runner = {});
 
+  static Rfc2544Result Run2544BinarySearchMeasured(
+      const Rfc2544Config& cfg,
+      std::function<Rfc2544Trial(double trial_rps)> trial_runner);
+
   static Rfc3511Result Run3511Benchmark(
       const Rfc3511Config& cfg,
       std::function<double(double cps)> cps_runner = {});
 
+  static Rfc3511Result Run3511BenchmarkMeasured(
+      const Rfc3511Config& cfg,
+      std::function<Rfc3511Sample(double cps)> cps_runner);
+
   static Rfc8219Result Run8219Benchmark(
       const Rfc8219Config& cfg,
       std::function<double(double gbps)> inspection_runner = {});
+
+  static Rfc8219Result Run8219BenchmarkMeasured(
+      const Rfc8219Config& cfg,
+      std::function<Rfc8219Sample(double gbps)> inspection_runner);
 
   static RfcSuiteResult RunAll(
       const Rfc2544Config& c2544,
@@ -93,6 +118,15 @@ class RfcSuiteEngine {
       std::function<double(double cps)> cps_runner = {},
       std::function<double(double gbps)> inspection_runner = {},
       bool live_dataplane = false);
+
+  static RfcSuiteResult RunAllMeasured(
+      const Rfc2544Config& c2544,
+      const Rfc3511Config& c3511,
+      const Rfc8219Config& c8219,
+      std::function<Rfc2544Trial(double trial_rps)> trial_runner,
+      std::function<Rfc3511Sample(double cps)> cps_runner,
+      std::function<Rfc8219Sample(double gbps)> inspection_runner,
+      bool live_dataplane = true);
 };
 
 class RfcReportGenerator {

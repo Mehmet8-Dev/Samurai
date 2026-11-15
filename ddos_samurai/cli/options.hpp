@@ -34,6 +34,7 @@ struct CliOptions {
   std::string license_key;                 // --license-key KEY
   std::string license_file;                // --license-file PATH
   bool confirm = false;                    // --confirm: confirm live dataplane execution
+  bool vector_explicit = false;            // internal: true when --vector was explicitly supplied
   // Telecom rate and protocol controls
   uint32_t sctp_rate = 0;                  // --sctp-rate N
   uint32_t diameter_rate = 0;              // --diameter-rate N / --diameter-ccr-rate N

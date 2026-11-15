@@ -38,7 +38,7 @@ std::optional<std::string> Validate(const CliOptions& opt) {
   if (opt.job.target_port == 0) {
     return "--port must be between 1 and 65535";
   }
-  if (opt.job.packet_count == 0) {
+  if (opt.job.packet_count == 0 && !(opt.worker_name == "telco" && opt.job.telco_duration_ms > 0)) {
     return "--count must be >= 1";
   }
   if (opt.job.packet_size < 1 || opt.job.packet_size > 65535) {

@@ -8,78 +8,140 @@
 
 namespace samurai::cli {
 
-Rfc2544Result RfcSuiteEngine::Run2544BinarySearch(
+Rfc2544Result RfcSuiteEngine::Run2544BinarySearchMeasured(
     const Rfc2544Config& cfg,
-    std::function<double(double trial_rps)> trial_runner) {
+    std::function<Rfc2544Trial(double trial_rps)> trial_runner) {
   Rfc2544Result res;
   double low = cfg.min_rate_rps;
   double high = cfg.max_rate_rps;
   double best_zero_loss_rps = 0.0;
 
   for (int iter = 1; iter <= cfg.max_iterations; ++iter) {
-    if ((high - low) < cfg.resolution_rps) break;
+    if (iter > 1 && (high - low) < cfg.resolution_rps) break;
     const double mid_rps = (low + high) / 2.0;
 
-    double loss_pct = 0.0;
-    if (trial_runner) {
-      loss_pct = trial_runner(mid_rps);
-    } else {
-      // Default simulated response curve for testing binary search
-      loss_pct = (mid_rps > 800000.0) ? ((mid_rps - 800000.0) / 10000.0) : 0.0;
-    }
-
     Rfc2544Trial trial;
-    trial.iteration = iter;
-    trial.rate_rps = mid_rps;
-    trial.sent_packets = static_cast<uint64_t>(mid_rps * cfg.trial_duration_s);
-    trial.loss_pct = loss_pct;
-    trial.received_packets = static_cast<uint64_t>(trial.sent_packets * (1.0 - (loss_pct / 100.0)));
-    trial.passed = (loss_pct <= cfg.tolerance_loss_pct);
+    if (trial_runner) {
+      trial = trial_runner(mid_rps);
+      trial.iteration = iter;
+      if (trial.rate_rps <= 0.0) trial.rate_rps = mid_rps;
+    } else {
+      const double loss_pct = (mid_rps > 800000.0) ? ((mid_rps - 800000.0) / 10000.0) : 0.0;
+      trial.iteration = iter;
+      trial.rate_rps = mid_rps;
+      trial.sent_packets = static_cast<uint64_t>(mid_rps * cfg.trial_duration_s);
+      trial.loss_pct = loss_pct;
+      trial.received_packets = static_cast<uint64_t>(trial.sent_packets * (1.0 - (loss_pct / 100.0)));
+    }
+    trial.passed = (trial.loss_pct <= cfg.tolerance_loss_pct) && (trial.sent_packets > 0);
     res.trials.push_back(trial);
 
     if (trial.passed) {
-      best_zero_loss_rps = std::max(best_zero_loss_rps, mid_rps);
-      low = mid_rps;  // Try higher rate
+      best_zero_loss_rps = std::max(best_zero_loss_rps, trial.rate_rps);
+      low = mid_rps;
     } else {
-      high = mid_rps; // Backoff lower
+      high = mid_rps;
     }
   }
 
   res.max_zero_loss_rps = best_zero_loss_rps;
   res.mpps = best_zero_loss_rps / 1000000.0;
-  // Calculate Gbps: (RPS * packet_bytes * 8) / 1e9
   res.max_zero_loss_gbps = (best_zero_loss_rps * cfg.packet_size_bytes * 8.0) / 1000000000.0;
   res.passed = (best_zero_loss_rps >= cfg.min_rate_rps);
+  return res;
+}
+
+Rfc2544Result RfcSuiteEngine::Run2544BinarySearch(
+    const Rfc2544Config& cfg,
+    std::function<double(double trial_rps)> trial_runner) {
+  return Run2544BinarySearchMeasured(
+      cfg,
+      [cfg, trial_runner](double mid_rps) -> Rfc2544Trial {
+        Rfc2544Trial trial;
+        const double loss_pct = trial_runner
+            ? trial_runner(mid_rps)
+            : ((mid_rps > 800000.0) ? ((mid_rps - 800000.0) / 10000.0) : 0.0);
+        trial.rate_rps = mid_rps;
+        trial.sent_packets = static_cast<uint64_t>(mid_rps * cfg.trial_duration_s);
+        trial.loss_pct = loss_pct;
+        trial.received_packets =
+            static_cast<uint64_t>(trial.sent_packets * (1.0 - (std::clamp(loss_pct, 0.0, 100.0) / 100.0)));
+        return trial;
+      });
+}
+
+Rfc3511Result RfcSuiteEngine::Run3511BenchmarkMeasured(
+    const Rfc3511Config& cfg,
+    std::function<Rfc3511Sample(double cps)> cps_runner) {
+  Rfc3511Result res;
+  if (cps_runner) {
+    const Rfc3511Sample sample = cps_runner(cfg.target_cps);
+    res.max_cps = sample.achieved_cps;
+    res.max_concurrent_connections =
+        sample.max_concurrency > 0 ? sample.max_concurrency : cfg.max_concurrency;
+    res.p99_latency_ms = sample.p99_latency_ms;
+    res.passed = sample.ok && (res.max_cps >= (cfg.target_cps * 0.9)) &&
+                 (cfg.latency_cap_ms <= 0.0 || res.p99_latency_ms <= cfg.latency_cap_ms);
+  } else {
+    res.max_cps = cfg.target_cps;
+    res.max_concurrent_connections = cfg.max_concurrency;
+    res.p99_latency_ms = 0.0;  // Dry-run: no dataplane latency measured
+    res.passed = (res.max_cps >= (cfg.target_cps * 0.9));
+  }
   return res;
 }
 
 Rfc3511Result RfcSuiteEngine::Run3511Benchmark(
     const Rfc3511Config& cfg,
     std::function<double(double cps)> cps_runner) {
-  Rfc3511Result res;
-  if (cps_runner) {
-    res.max_cps = cps_runner(cfg.target_cps);
-  } else {
-    res.max_cps = cfg.target_cps;
+  if (!cps_runner) {
+    return Run3511BenchmarkMeasured(cfg, {});
   }
-  res.max_concurrent_connections = cfg.max_concurrency;
-  res.p99_latency_ms = 4.2;  // Baseline low latency
-  res.passed = (res.max_cps >= (cfg.target_cps * 0.9));
+  return Run3511BenchmarkMeasured(
+      cfg,
+      [cfg, cps_runner](double cps) -> Rfc3511Sample {
+        Rfc3511Sample sample;
+        sample.achieved_cps = cps_runner(cps);
+        sample.max_concurrency = cfg.max_concurrency;
+        sample.p99_latency_ms = 0.0;
+        sample.ok = sample.achieved_cps > 0.0;
+        return sample;
+      });
+}
+
+Rfc8219Result RfcSuiteEngine::Run8219BenchmarkMeasured(
+    const Rfc8219Config& cfg,
+    std::function<Rfc8219Sample(double gbps)> inspection_runner) {
+  Rfc8219Result res;
+  if (inspection_runner) {
+    const Rfc8219Sample sample = inspection_runner(cfg.target_gbps);
+    res.inspection_pass_rate_pct = std::clamp(sample.inspection_pass_rate_pct, 0.0, 100.0);
+    res.ipv6_zero_loss_gbps = sample.measured_gbps;
+    res.passed = sample.ok && (res.inspection_pass_rate_pct >= 99.0) &&
+                 (res.ipv6_zero_loss_gbps > 0.0);
+  } else {
+    res.inspection_pass_rate_pct = 100.0;
+    res.ipv6_zero_loss_gbps = cfg.target_gbps;
+    res.passed = true;
+  }
   return res;
 }
 
 Rfc8219Result RfcSuiteEngine::Run8219Benchmark(
     const Rfc8219Config& cfg,
     std::function<double(double gbps)> inspection_runner) {
-  Rfc8219Result res;
-  if (inspection_runner) {
-    res.inspection_pass_rate_pct = inspection_runner(cfg.target_gbps);
-  } else {
-    res.inspection_pass_rate_pct = 100.0;
+  if (!inspection_runner) {
+    return Run8219BenchmarkMeasured(cfg, {});
   }
-  res.ipv6_zero_loss_gbps = cfg.target_gbps;
-  res.passed = (res.inspection_pass_rate_pct >= 99.0);
-  return res;
+  return Run8219BenchmarkMeasured(
+      cfg,
+      [cfg, inspection_runner](double gbps) -> Rfc8219Sample {
+        Rfc8219Sample sample;
+        sample.inspection_pass_rate_pct = std::clamp(inspection_runner(gbps), 0.0, 100.0);
+        sample.measured_gbps = (cfg.target_gbps * sample.inspection_pass_rate_pct) / 100.0;
+        sample.ok = true;
+        return sample;
+      });
 }
 
 RfcSuiteResult RfcSuiteEngine::RunAll(
@@ -96,6 +158,25 @@ RfcSuiteResult RfcSuiteEngine::RunAll(
   res.rfc2544 = Run2544BinarySearch(c2544, trial_runner);
   res.rfc3511 = Run3511Benchmark(c3511, cps_runner);
   res.rfc8219 = Run8219Benchmark(c8219, inspection_runner);
+  res.overall_passed = (res.rfc2544.passed && res.rfc3511.passed && res.rfc8219.passed);
+  res.score = res.overall_passed ? 100.0 : 50.0;
+  return res;
+}
+
+RfcSuiteResult RfcSuiteEngine::RunAllMeasured(
+    const Rfc2544Config& c2544,
+    const Rfc3511Config& c3511,
+    const Rfc8219Config& c8219,
+    std::function<Rfc2544Trial(double trial_rps)> trial_runner,
+    std::function<Rfc3511Sample(double cps)> cps_runner,
+    std::function<Rfc8219Sample(double gbps)> inspection_runner,
+    bool live_dataplane) {
+  RfcSuiteResult res;
+  res.live_dataplane = live_dataplane;
+  res.execution_mode = live_dataplane ? "LIVE_DATAPLANE" : "SIMULATED_DRY_RUN";
+  res.rfc2544 = Run2544BinarySearchMeasured(c2544, trial_runner);
+  res.rfc3511 = Run3511BenchmarkMeasured(c3511, cps_runner);
+  res.rfc8219 = Run8219BenchmarkMeasured(c8219, inspection_runner);
   res.overall_passed = (res.rfc2544.passed && res.rfc3511.passed && res.rfc8219.passed);
   res.score = res.overall_passed ? 100.0 : 50.0;
   return res;
