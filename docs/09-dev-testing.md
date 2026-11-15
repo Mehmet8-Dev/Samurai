@@ -25,16 +25,16 @@ Each major architectural layer includes a standalone native validation harness:
 
 ```bash
 # 1. Control Plane, Shard Engine, and RPC Wire Tests
-./build/ddos_samurai/control/samurai_control_selftest
+./build/samurai/control/samurai_control_selftest
 
 # 2. L7 Stateful Transport, QUIC, and Custom TCP Tests
-./build/ddos_samurai/l7_emu_native/samurai_l7_selftest
+./build/samurai/l7_emu_native/samurai_l7_selftest
 
 # 3. Scenario Engine (DSL, Compiler, and SLA Gates)
-./build/ddos_samurai/scenario_engine_native/samurai_scenario_engine_selftest
+./build/samurai/scenario_engine_native/samurai_scenario_engine_selftest
 
 # 4. Licensing, HMAC, and Access Token Tests
-./build/ddos_samurai/licensing/samurai_licensing_selftest
+./build/samurai/licensing/samurai_licensing_selftest
 ```
 
 ---

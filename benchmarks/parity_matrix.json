@@ -247,7 +247,7 @@
       "id": "l4_top_speed",
       "layer": "L4",
       "comparison": "higher_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "effective_pps",
         "unit": "pps"
       },
@@ -260,7 +260,7 @@
       "id": "l4_wire_loss",
       "layer": "L4",
       "comparison": "lower_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "wire_loss_est_pct",
         "unit": "percent"
       },
@@ -273,7 +273,7 @@
       "id": "l4_pacing_accuracy",
       "layer": "L4",
       "comparison": "higher_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "rate_accuracy_pct",
         "unit": "percent"
       },
@@ -286,7 +286,7 @@
       "id": "l7_stateful_scale",
       "layer": "L7",
       "comparison": "higher_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "l7_active_sessions_peak",
         "unit": "sessions"
       },
@@ -299,7 +299,7 @@
       "id": "l7_conn_rate",
       "layer": "L7",
       "comparison": "higher_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "l7_conn_rate",
         "unit": "connections_per_second"
       },
@@ -312,7 +312,7 @@
       "id": "l7_handshake_latency",
       "layer": "L7",
       "comparison": "lower_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "l7_handshake_p99_ms",
         "unit": "milliseconds"
       },
@@ -325,7 +325,7 @@
       "id": "l7_h1_reuse_ratio",
       "layer": "L7",
       "comparison": "higher_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "l7_h1_conn_reuse_ratio",
         "unit": "ratio"
       },
@@ -338,7 +338,7 @@
       "id": "l7_h2_reuse_ratio",
       "layer": "L7",
       "comparison": "higher_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "l7_h2_lane_reuse_ratio",
         "unit": "ratio"
       },
@@ -351,7 +351,7 @@
       "id": "l7_h2_active_streams_peak",
       "layer": "L7",
       "comparison": "higher_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "l7_h2_active_streams_peak",
         "unit": "streams"
       },
@@ -364,7 +364,7 @@
       "id": "l7_epoll_wakeup_efficiency",
       "layer": "L7",
       "comparison": "lower_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "l7_epoll_wakeups",
         "unit": "wakeups"
       },
@@ -377,7 +377,7 @@
       "id": "l7_scheduler_queue_depth",
       "layer": "L7",
       "comparison": "lower_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "l7_scheduler_queue_depth_peak",
         "unit": "queue_depth"
       },
@@ -390,7 +390,7 @@
       "id": "l7_alloc_pressure",
       "layer": "L7",
       "comparison": "lower_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "l7_alloc_count",
         "unit": "allocations"
       },
@@ -403,7 +403,7 @@
       "id": "h2_goaway_replacements",
       "layer": "L7",
       "comparison": "lower_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "h2_goaway_replacements",
         "unit": "replacements"
       },
@@ -416,7 +416,7 @@
       "id": "h2_drain_evictions",
       "layer": "L7",
       "comparison": "lower_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "h2_drain_evictions",
         "unit": "evictions"
       },
@@ -429,7 +429,7 @@
       "id": "h2_stream_pool_reuse_hits",
       "layer": "L7",
       "comparison": "higher_is_better",
-      "ddos_samurai": {
+      "samurai": {
         "report_field": "h2_stream_pool_reuse_hits",
         "unit": "hits"
       },

@@ -21,16 +21,16 @@ class TestCpuNativeCppSelftest(unittest.TestCase):
             "-std=c++20",
             "-O2",
             "-I",
-            str(repo / "ddos_samurai" / "cpu_native"),
-            str(repo / "ddos_samurai" / "cpu_native" / "native_selftest.cpp"),
+            str(repo / "samurai" / "cpu_native"),
+            str(repo / "samurai" / "cpu_native" / "native_selftest.cpp"),
             # engine.cpp = Katman-1 primitive'ler; Katman-2 paket üretimi
             # spoofing/packets/pool/amp'te tek kopya. cpu_native_static ile
             # aynı kaynak seti; dedup sonrası çift tanım yok.
-            str(repo / "ddos_samurai" / "cpu_native" / "engine.cpp"),
-            str(repo / "ddos_samurai" / "cpu_native" / "spoofing.cpp"),
-            str(repo / "ddos_samurai" / "cpu_native" / "packets.cpp"),
-            str(repo / "ddos_samurai" / "cpu_native" / "pool.cpp"),
-            str(repo / "ddos_samurai" / "cpu_native" / "amp.cpp"),
+            str(repo / "samurai" / "cpu_native" / "engine.cpp"),
+            str(repo / "samurai" / "cpu_native" / "spoofing.cpp"),
+            str(repo / "samurai" / "cpu_native" / "packets.cpp"),
+            str(repo / "samurai" / "cpu_native" / "pool.cpp"),
+            str(repo / "samurai" / "cpu_native" / "amp.cpp"),
             "-o",
             str(binary),
         ]

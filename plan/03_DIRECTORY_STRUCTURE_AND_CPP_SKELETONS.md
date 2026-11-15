@@ -3,24 +3,24 @@
 
 > **Yazar:** Samurai Core Architecture Team  
 > **Tarih:** 29 Ekim 2026  
-> **Konum:** `ddos_samurai/plan/03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md`  
+> **Konum:** `samurai/plan/03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md`  
 > **Bağlantılı Dokümanlar:**  
-> - [`README.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/README.md)  
-> - [`01_TELCO_ENGINE_ARCHITECTURE.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/01_TELCO_ENGINE_ARCHITECTURE.md)  
-> - [`02_STATEFUL_AND_STATELESS_PROTOCOLS.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/02_STATEFUL_AND_STATELESS_PROTOCOLS.md)  
+> - [`README.md`](README.md)  
+> - [`01_TELCO_ENGINE_ARCHITECTURE.md`](01_TELCO_ENGINE_ARCHITECTURE.md)  
+> - [`02_STATEFUL_AND_STATELESS_PROTOCOLS.md`](02_STATEFUL_AND_STATELESS_PROTOCOLS.md)  
 
 ---
 
 ## 1. Dizin ve Dosya Hiyerarşisi
 
-Samurai projesinin mevcut mimarisinde (`ddos_samurai/`):
-- **Tek Native DPDK Katmanı:** [`ddos_samurai/dpdk/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/dpdk/) altında (`dpdk_core.hpp`, `dpdk_core.cpp`) konsolide edilmiştir. Dolayısıyla telekom motorunun içinde mükerrer/ikinci bir `dpdk/` dizini **açılmaz**; mevcut `dpdk_core` kullanılır.
-- **Telekom Motoru Kütüphanesi:** Mevcut [`ddos_samurai/telecom/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/) dizini altında toplanır.
-- **Worker Daemon:** Diğer tüm worker'lar gibi projenin ana ZMQ dizini olan [`ddos_samurai/zmq/daemon/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/) altında yer alır.
+Samurai projesinin mevcut mimarisinde (`samurai/`):
+- **Tek Native DPDK Katmanı:** [`samurai/dpdk/`](../samurai/dpdk) altında (`dpdk_core.hpp`, `dpdk_core.cpp`) konsolide edilmiştir. Dolayısıyla telekom motorunun içinde mükerrer/ikinci bir `dpdk/` dizini **açılmaz**; mevcut `dpdk_core` kullanılır.
+- **Telekom Motoru Kütüphanesi:** Mevcut [`samurai/telecom/`](../samurai/telecom) dizini altında toplanır.
+- **Worker Daemon:** Diğer tüm worker'lar gibi projenin ana ZMQ dizini olan [`samurai/zmq/daemon/`](../samurai/zmq/daemon) altında yer alır.
 
 ```
-ddos_samurai/
-├── dpdk/                                 # MEVCUT: DDoSamurai'nin TEK Native DPDK Çekirdeği
+samurai/
+├── dpdk/                                 # MEVCUT: Samurai'nin TEK Native DPDK Çekirdeği
 │   ├── dpdk_core.hpp                     # Port yapılandırması, mempool, RSS ve RX/TX burst soyutlaması
 │   └── dpdk_core.cpp                     # rte_eth_rx_burst / rte_eth_tx_burst hat hızı I/O
 │
@@ -87,7 +87,7 @@ ddos_samurai/
 struct rte_mbuf;
 struct rte_mempool;
 
-namespace ddos_samurai::telecom {
+namespace samurai::telecom {
 
 struct TelcoSessionContext;
 
@@ -151,7 +151,7 @@ public:
     virtual std::string_view GetProtocolName() const noexcept = 0;
 };
 
-} // namespace ddos_samurai::telecom
+} // namespace samurai::telecom
 ```
 
 ---
@@ -163,7 +163,7 @@ public:
 
 #include <cstdint>
 
-namespace ddos_samurai::telecom {
+namespace samurai::telecom {
 
 enum class SessionState : uint8_t {
     IDLE = 0,
@@ -238,7 +238,7 @@ struct alignas(64) TelcoSessionContext {
 };
 static_assert(sizeof(TelcoSessionContext) == 128, "TelcoSessionContext tam 2 cache line (128 bayt) olmalidir!");
 
-} // namespace ddos_samurai::telecom
+} // namespace samurai::telecom
 ```
 
 ---
@@ -248,13 +248,13 @@ static_assert(sizeof(TelcoSessionContext) == 128, "TelcoSessionContext tam 2 cac
 ```cpp
 #pragma once
 
-#include "ddos_samurai/telecom/core/session_context.hpp"
+#include "samurai/telecom/core/session_context.hpp"
 #include <cstdint>
 #include <memory>
 #include <atomic>
 #include <vector>
 
-namespace ddos_samurai::telecom {
+namespace samurai::telecom {
 
 class SessionManager {
 public:
@@ -310,7 +310,7 @@ private:
     TelcoSessionContext** hash_buckets_{nullptr};
 };
 
-} // namespace ddos_samurai::telecom
+} // namespace samurai::telecom
 ```
 
 ---
@@ -320,11 +320,11 @@ private:
 ```cpp
 #pragma once
 
-#include "ddos_samurai/telecom/core/session_context.hpp"
+#include "samurai/telecom/core/session_context.hpp"
 #include <cstdint>
 #include <functional>
 
-namespace ddos_samurai::telecom {
+namespace samurai::telecom {
 
 class HierarchicalTimingWheel {
 public:
@@ -363,17 +363,17 @@ private:
     void RemoveFromList(TelcoSessionContext** head, TelcoSessionContext* session);
 };
 
-} // namespace ddos_samurai::telecom
+} // namespace samurai::telecom
 ```
 
 ---
 
 ### 2.4 ZMQ Wire Protocol Uzantısı: `wire_protocol.h`
 
-Mevcut `ddos_samurai/zmq/daemon/wire_protocol.h` dosyasına eklenecek telekom modülleri:
+Mevcut `samurai/zmq/daemon/wire_protocol.h` dosyasına eklenecek telekom modülleri:
 
 ```cpp
-// ddos_samurai/zmq/daemon/wire_protocol.h içerisine eklenecek:
+// samurai/zmq/daemon/wire_protocol.h içerisine eklenecek:
 
 enum class WorkerKind : std::uint8_t {
   CPU = 1,
@@ -428,10 +428,10 @@ struct TelcoStatsPayload {
 
 ### 2.5 ZMQ Worker Daemon İskeleti ve CMake Bağlantısı: `telco_worker.cpp`
 
-Tüm Samurai worker daemon'ları gibi (`cpu_worker.cpp`, `dpdk_worker.cpp`, `l7_worker.cpp`), yeni `telco_worker.cpp` de doğrudan `ddos_samurai/zmq/daemon/` altında yer alır ve `ddos_samurai/zmq/CMakeLists.txt` içerisine `add_samurai_worker` makrosuyla eklenir:
+Tüm Samurai worker daemon'ları gibi (`cpu_worker.cpp`, `dpdk_worker.cpp`, `l7_worker.cpp`), yeni `telco_worker.cpp` de doğrudan `samurai/zmq/daemon/` altında yer alır ve `samurai/zmq/CMakeLists.txt` içerisine `add_samurai_worker` makrosuyla eklenir:
 
 ```cmake
-# ddos_samurai/zmq/CMakeLists.txt içine eklenecek yapılandırma:
+# samurai/zmq/CMakeLists.txt içine eklenecek yapılandırma:
 add_samurai_worker(samurai_telco_worker daemon/telco_worker.cpp)
 target_include_directories(samurai_telco_worker PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}/../telecom
@@ -455,12 +455,12 @@ if(DPDK_FOUND)
 endif()
 ```
 
-#### 2.5.1 Orkestratör Kaydı: `ddos_samurai/orchestrator/worker_registry.hpp`
+#### 2.5.1 Orkestratör Kaydı: `samurai/orchestrator/worker_registry.hpp`
 
 Samurai'nin Supervisor ve Shard yöneticisi tarafından worker'ın otomatik tanınması için tabloya eklenir:
 
 ```cpp
-// ddos_samurai/orchestrator/worker_registry.hpp içine eklenecek:
+// samurai/orchestrator/worker_registry.hpp içine eklenecek:
 inline constexpr WorkerEntry kWorkerTable[] = {
     {samurai::wire::WorkerKind::CPU, "cpu", "samurai_cpu_worker"},
     {samurai::wire::WorkerKind::GPU, "gpu", "samurai_gpu_worker"},
@@ -475,15 +475,15 @@ inline constexpr WorkerEntry kWorkerTable[] = {
 };
 ```
 
-#### 2.5.2 `ddos_samurai/zmq/daemon/telco_worker.cpp` İskeleti:
+#### 2.5.2 `samurai/zmq/daemon/telco_worker.cpp` İskeleti:
 
 ```cpp
 #include "wire_protocol.h"
 #include "worker_common.hpp"
 #include "zmq_worker_base.hpp"
-#include "ddos_samurai/telecom/core/session_manager.hpp"
-#include "ddos_samurai/telecom/core/hierarchical_timing_wheel.hpp"
-#include "ddos_samurai/dpdk/dpdk_core.hpp"
+#include "samurai/telecom/core/session_manager.hpp"
+#include "samurai/telecom/core/hierarchical_timing_wheel.hpp"
+#include "samurai/dpdk/dpdk_core.hpp"
 #include <zmq.h>
 #include <atomic>
 #include <chrono>
@@ -492,7 +492,7 @@ inline constexpr WorkerEntry kWorkerTable[] = {
 
 using namespace samurai::wire;
 using namespace samurai::daemon;
-using namespace ddos_samurai::telecom;
+using namespace samurai::telecom;
 
 int main(int argc, char** argv) {
     std::string jobs_endpoint = "ipc:///tmp/samurai_jobs_telco";
@@ -584,12 +584,12 @@ int main(int argc, char** argv) {
 ### 2.6 Faz 1: PPPoE İkili Başlıkları ve Motor İskeleti: `pppoe_types.hpp` & `pppoe_engine.hpp`
 
 ```cpp
-// ddos_samurai/telecom/protocols/stateful/pppoe/pppoe_types.hpp
+// samurai/telecom/protocols/stateful/pppoe/pppoe_types.hpp
 #pragma once
 
 #include <cstdint>
 
-namespace ddos_samurai::telecom::pppoe {
+namespace samurai::telecom::pppoe {
 
 inline constexpr uint16_t ETHERTYPE_PPPOE_DISCOVERY = 0x8863;
 inline constexpr uint16_t ETHERTYPE_PPPOE_SESSION   = 0x8864;
@@ -649,20 +649,20 @@ struct PppControlHeader {
 };
 #pragma pack(pop)
 
-} // namespace ddos_samurai::telecom::pppoe
+} // namespace samurai::telecom::pppoe
 ```
 
 #### `pppoe_engine.hpp` İskeleti:
 
 ```cpp
-// ddos_samurai/telecom/protocols/stateful/pppoe/pppoe_engine.hpp
+// samurai/telecom/protocols/stateful/pppoe/pppoe_engine.hpp
 #pragma once
 
-#include "ddos_samurai/telecom/core/telco_protocol_if.hpp"
-#include "ddos_samurai/telecom/core/session_manager.hpp"
+#include "samurai/telecom/core/telco_protocol_if.hpp"
+#include "samurai/telecom/core/session_manager.hpp"
 #include "pppoe_types.hpp"
 
-namespace ddos_samurai::telecom::pppoe {
+namespace samurai::telecom::pppoe {
 
 class PppoeEngine final : public ITelcoProtocol {
 public:
@@ -701,7 +701,7 @@ private:
     void ProcessIpcp(const uint8_t* payload, uint16_t len, TelcoSessionContext* session);
 };
 
-} // namespace ddos_samurai::telecom::pppoe
+} // namespace samurai::telecom::pppoe
 ```
 
 ---

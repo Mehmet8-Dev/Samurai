@@ -16,7 +16,7 @@ This document standardizes execution profiles for benchmarking, Continuous Integ
 Designed for non-root local debugging and functional verification.
 
 ```bash
-./build/ddos_samurai/cli/samurai --profile dev --target 127.0.0.1 --confirm
+./build/samurai/cli/samurai --profile dev --target 127.0.0.1 --confirm
 ```
 
 **KPI Acceptance Gates:**
@@ -35,7 +35,7 @@ Designed for non-root local debugging and functional verification.
 Designed for automated pull request validation in virtualized runners with limited raw socket privileges.
 
 ```bash
-./build/ddos_samurai/cli/samurai --profile ci_safe --target 127.0.0.1 --confirm
+./build/samurai/cli/samurai --profile ci_safe --target 127.0.0.1 --confirm
 ```
 
 **KPI Acceptance Gates:**
@@ -54,7 +54,7 @@ Designed for automated pull request validation in virtualized runners with limit
 Requires root / `CAP_NET_RAW` / `CAP_NET_ADMIN` privileges, hugepages, and dedicated physical NIC interfaces.
 
 ```bash
-sudo ./build/ddos_samurai/cli/samurai \
+sudo ./build/samurai/cli/samurai \
   --profile dedicated_lab \
   --worker afxdp \
   --interface eth0 \

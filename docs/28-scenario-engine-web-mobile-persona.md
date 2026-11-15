@@ -36,7 +36,7 @@ Scenarios are authored in structured JSON or illustrated via YAML:
 To execute persona scenarios using the native CLI front-end:
 
 ```bash
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker scenario \
   --scenario-file docs/scenario_web_mobile.yaml \
   --scenario-mode enforce \

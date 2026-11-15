@@ -1,0 +1,120 @@
+{{- /*
+Native slave workload. The pod spec is identical for the DaemonSet and
+Deployment forms, so it is defined once in the "samurai.slavePodSpec"
+helper below and referenced by both. The slave connects out to the master and
+runs worker binaries from --worker-dir (/usr/local/bin in the native image).
+*/ -}}
+{{- define "samurai.slavePodSpec" -}}
+serviceAccountName: {{ include "samurai.serviceAccountName" . }}
+{{- with .Values.image.pullSecrets }}
+imagePullSecrets:
+{{ toYaml . | indent 2 }}
+{{- end }}
+securityContext:
+{{ toYaml .Values.securityContext | indent 2 }}
+containers:
+  - name: slave
+    image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+    imagePullPolicy: {{ .Values.image.pullPolicy }}
+    securityContext:
+{{ toYaml .Values.containerSecurityContext | indent 6 }}
+    env:
+      - name: SAMURAI_CLUSTER_SECRET
+        valueFrom:
+          secretKeyRef:
+            name: {{ include "samurai.fullname" . }}-auth
+            key: cluster_secret
+    args:
+      - samurai_slave
+      - --control-endpoints
+      - tcp://{{ include "samurai.fullname" . }}-master:{{ .Values.master.service.port }}
+      - --control-listen
+      - tcp://0.0.0.0:5099
+      - --tenant-namespace
+      - {{ .Values.auth.tenantNamespace | quote }}
+      - --worker-region
+      - {{ .Values.region.workerRegion | quote }}
+      - --worker
+      - {{ .Values.slave.worker | quote }}
+      - --worker-dir
+      - /usr/local/bin
+{{- if .Values.curve.enabled }}
+      # CURVE public key of the master; encrypts the outbound control channel.
+      - --curve-server-public
+      - {{ required "curve.serverPublic is required when curve.enabled" .Values.curve.serverPublic | quote }}
+{{- end }}
+{{- range .Values.slave.extraArgs }}
+      - {{ . | quote }}
+{{- end }}
+    ports:
+      - containerPort: 5099
+        name: control
+    readinessProbe:
+      tcpSocket:
+        port: control
+      initialDelaySeconds: 5
+      periodSeconds: 5
+    livenessProbe:
+      tcpSocket:
+        port: control
+      initialDelaySeconds: 10
+      periodSeconds: 10
+    resources:
+{{ toYaml .Values.resources | indent 6 }}
+nodeSelector:
+{{ toYaml .Values.nodeSelector | indent 2 }}
+tolerations:
+{{ toYaml .Values.tolerations | indent 2 }}
+affinity:
+{{ toYaml .Values.affinity | indent 2 }}
+{{- end -}}
+{{- if eq .Values.slave.mode "daemonset" }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "samurai.fullname" . }}-slave
+  labels:
+    app.kubernetes.io/name: {{ include "samurai.name" . }}
+    app.kubernetes.io/component: slave
+spec:
+  updateStrategy:
+{{ toYaml .Values.slave.daemonsetUpdateStrategy | indent 4 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "samurai.name" . }}
+      app.kubernetes.io/component: slave
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "samurai.name" . }}
+        app.kubernetes.io/component: slave
+      annotations:
+{{ toYaml .Values.podAnnotations | indent 8 }}
+    spec:
+{{ include "samurai.slavePodSpec" . | indent 6 }}
+{{- else }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "samurai.fullname" . }}-slave
+  labels:
+    app.kubernetes.io/name: {{ include "samurai.name" . }}
+    app.kubernetes.io/component: slave
+spec:
+  replicas: {{ .Values.slave.replicas }}
+  strategy:
+{{ toYaml .Values.slave.updateStrategy | indent 4 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "samurai.name" . }}
+      app.kubernetes.io/component: slave
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "samurai.name" . }}
+        app.kubernetes.io/component: slave
+      annotations:
+{{ toYaml .Values.podAnnotations | indent 8 }}
+    spec:
+{{ include "samurai.slavePodSpec" . | indent 6 }}
+{{- end }}

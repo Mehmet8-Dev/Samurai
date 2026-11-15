@@ -1,6 +1,6 @@
 # 13 - Native HTTP Management REST API (`:8089`)
 
-When launched with `--management-listen`, `samurai_master` initializes an embedded, zero-dependency C++ HTTP REST server built directly upon POSIX non-blocking sockets (`ddos_samurai/control/management_api.cpp`).
+When launched with `--management-listen`, `samurai_master` initializes an embedded, zero-dependency C++ HTTP REST server built directly upon POSIX non-blocking sockets (`samurai/control/management_api.cpp`).
 
 ![Samurai Distributed Security & Control Plane](assets/diagrams/samurai_distributed_security.svg)
 

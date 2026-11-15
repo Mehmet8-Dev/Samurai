@@ -4,7 +4,7 @@
 
 ## Purpose
 
-This handbook defines the formal evaluation framework for runs executed via the Samurai Network Resilience Platform (`./build/ddos_samurai/cli/samurai`) and its benchmark pipeline. It elevates performance evaluation beyond simple execution ("Did it run?") to rigorous technical certification ("Is the result valid, statistically comparable, and publishable?").
+This handbook defines the formal evaluation framework for runs executed via the Samurai Network Resilience Platform (`./build/samurai/cli/samurai`) and its benchmark pipeline. It elevates performance evaluation beyond simple execution ("Did it run?") to rigorous technical certification ("Is the result valid, statistically comparable, and publishable?").
 
 This document answers core operational questions:
 

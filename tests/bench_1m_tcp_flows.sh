@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TASK-TEST-L2-02: DDoSamurai tcpdp 1,000,000 (1M) TCP Active Flows Benchmark Suite
+# TASK-TEST-L2-02: Samurai tcpdp 1,000,000 (1M) TCP Active Flows Benchmark Suite
 #
-# Target Code: ddos_samurai/l4/tcp_dataplane_core.hpp
-#              ddos_samurai/l4/tcp_dataplane_core.cpp
-#              ddos_samurai/l4/test_1m_tcp_flows.cpp
+# Target Code: samurai/l4/tcp_dataplane_core.hpp
+#              samurai/l4/tcp_dataplane_core.cpp
+#              samurai/l4/test_1m_tcp_flows.cpp
 #
 # Metrics Evaluated:
 #   1. RFC 1071 IPv4 + TCP Checksum Calculation & Verification Gate.
@@ -35,7 +35,7 @@ MD_REPORT="${OUTPUT_DIR}/README.md"
 mkdir -p "$OUTPUT_DIR"
 
 echo "================================================================================"
-echo "  [TASK-TEST-L2-02] DDoSamurai tcpdp 1,000,000 (1M) Active Flows Benchmark"
+echo "  [TASK-TEST-L2-02] Samurai tcpdp 1,000,000 (1M) Active Flows Benchmark"
 echo "================================================================================"
 echo " Host Environment:"
 echo "   CPU:           $(LANG=C lscpu | grep 'Model name:' | sed 's/Model name:[ \t]*//' || uname -m)"
@@ -52,7 +52,7 @@ echo "==========================================================================
 
 # 1. Build/Ensure binary is up to date
 echo "[+] Building test_1m_tcp_flows binary..."
-cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/ddos_samurai" >/dev/null
+cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/samurai" >/dev/null
 cmake --build "$BUILD_DIR" --target test_1m_tcp_flows -j"$(nproc)"
 
 # 2. Execute 1M Flow Benchmark
@@ -79,7 +79,7 @@ with open(json_file, 'r') as f:
 
 utc_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-md_content = f"""# DDoSamurai tcpdp 1,000,000 (1M) Active TCP Flows Benchmark Report
+md_content = f"""# Samurai tcpdp 1,000,000 (1M) Active TCP Flows Benchmark Report
 
 - **Date:** {utc_time}
 - **Status:** **{d.get('status')}**

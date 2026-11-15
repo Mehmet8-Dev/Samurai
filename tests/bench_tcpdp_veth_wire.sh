@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DDoSamurai tcpdp Real-Wire (netns + veth + AF_PACKET) Benchmark & Verification
+# Samurai tcpdp Real-Wire (netns + veth + AF_PACKET) Benchmark & Verification
 #
 # Sets up an isolated network namespace with a virtual Ethernet pair (`v_cli` <==> `v_srv`),
 # configures on-link IPv4 routing + static ARP neighbor entries (so the host kernel never
@@ -34,7 +34,7 @@ mkdir -p "$OUTPUT_DIR"
 # and re-enter via `unshare -r -n`, `sudo -n unshare -n`, or Docker `chroot /host unshare -n`.
 if [[ "${VETH_INNER_NS:-0}" != "1" ]]; then
   echo "[+] Building test_tcpdp_veth_wire and test_customtcp_ownwire_l7..."
-  cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/ddos_samurai" >/dev/null
+  cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/samurai" >/dev/null
   cmake --build "$BUILD_DIR" --target test_tcpdp_veth_wire test_customtcp_ownwire_l7 -j"$(nproc)"
 
   if unshare -r -n -- ip link show >/dev/null 2>&1; then
@@ -97,5 +97,5 @@ if [[ -x "$OWNWIRE_L7_BIN" ]]; then
   echo "--------------------------------------------------------------------------------"
   echo "[PHASE 3] Shared-Nothing Multi-Shard L7 HTTP/1.1 over Real veth Wire..."
   ip link del v_cli 2>/dev/null || true
-  OWNWIRE_INNER=1 OWNWIRE_FLOWS=16 "${REPO_ROOT}/ddos_samurai/zmq/daemon/run_customtcp_ownwire_veth.sh" "$OWNWIRE_L7_BIN" http1
+  OWNWIRE_INNER=1 OWNWIRE_FLOWS=16 "${REPO_ROOT}/samurai/zmq/daemon/run_customtcp_ownwire_veth.sh" "$OWNWIRE_L7_BIN" http1
 fi

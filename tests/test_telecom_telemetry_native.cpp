@@ -15,7 +15,7 @@
 #include <cstring>
 #include <arpa/inet.h>
 
-using namespace ddos_samurai;
+using namespace samurai;
 
 void test_bfd_engine() {
   std::cout << "[TEST] Running BfdEngine verification..." << std::endl;

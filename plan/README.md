@@ -3,28 +3,28 @@
 
 > **Tarih:** 29 Ekim 2026  
 > **Aktif Git Dalı:** `feat/telecom-engine-integration`  
-> **Konum:** `ddos_samurai/plan/`  
+> **Konum:** `samurai/plan/`  
 > **Mimari Hedef:** Saf Modern C++ (C++17/C++20), DPDK Hat Hızı (Wire-Speed Zero-Copy), Samurai Dağıtık ZMQ Kontrol Düzlemi, Modüler Eklenti Mimarisi (`ITelcoProtocol`), RtBrick BNG Blaster (Abone/Erişim FSM & O(1) Timing Wheel) ve Open5GS (GTP/PFCP Mobil Tünelleri) Entegrasyon Modeli.
 
 ---
 
 ## 1. Yönetici Özeti ve Mimari Vizyon
 
-DDoSamurai; donanım düzeyinde DPDK, AF_XDP ve DOCA GPUNetIO, kullanıcı uzayında RFC 6675 SACK destekli durum bilgili TCP motoru (`TcpDataplaneCore`), L7 ve telemetri altyapısına sahiptir. 
+Samurai; donanım düzeyinde DPDK, AF_XDP ve DOCA GPUNetIO, kullanıcı uzayında RFC 6675 SACK destekli durum bilgili TCP motoru (`TcpDataplaneCore`), L7 ve telemetri altyapısına sahiptir. 
 
-Geliştirilecek olan **Samurai Telecom Engine (`ddos_samurai/telecom/`)**, projeyi yalnızca bir siber güvenlik ve stres testi aracı olmaktan çıkarıp, telekom operatörlerinin omurga ve kenar ağlarında (BNG/BRAS, CGNAT, 4G/5G UPF, ISP Peering ve Taşıyıcı Ethernet) **milyonlarca gerçek aboneyi ve mobil tüneli hat hızında emüle eden, doğrulayan ve test eden endüstri standardı bir telekom doğrulama platformuna** dönüştürür.
+Geliştirilecek olan **Samurai Telecom Engine (`samurai/telecom/`)**, projeyi yalnızca bir siber güvenlik ve stres testi aracı olmaktan çıkarıp, telekom operatörlerinin omurga ve kenar ağlarında (BNG/BRAS, CGNAT, 4G/5G UPF, ISP Peering ve Taşıyıcı Ethernet) **milyonlarca gerçek aboneyi ve mobil tüneli hat hızında emüle eden, doğrulayan ve test eden endüstri standardı bir telekom doğrulama platformuna** dönüştürür.
 
 ### 1.1 Temel Mimari İlkeler (Core Axioms)
 
 1. **Mevcut DPDK Katmanının Konsolidasyonu (Tek Sorumluluk):**  
-   Telekom motoru içinde fazladan/iç bir `dpdk/` dizini açılmaz. Tüm donanım I/O işlemleri projenin tek native DPDK çekirdeği olan [`ddos_samurai/dpdk/dpdk_core.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/dpdk/dpdk_core.hpp) üzerinden yürütülür. Ortak API kullanılsa dahi kuyruk sahipliği (queue ownership), NUMA yerleşimi, mbuf bellek havuzları ve burst boyutları telekom iş yükü özelinde izole edilir.
+   Telekom motoru içinde fazladan/iç bir `dpdk/` dizini açılmaz. Tüm donanım I/O işlemleri projenin tek native DPDK çekirdeği olan [`samurai/dpdk/dpdk_core.hpp`](../samurai/dpdk/dpdk_core.hpp) üzerinden yürütülür. Ortak API kullanılsa dahi kuyruk sahipliği (queue ownership), NUMA yerleşimi, mbuf bellek havuzları ve burst boyutları telekom iş yükü özelinde izole edilir.
 2. **Kontrol Düzlemi ile Veri Düzleminin Kesin Ayrımı:**  
    - **Kontrol Düzlemi (Control Plane):** Test senaryolarının başlatılması, iş dağıtımı ve periyodik telemetri toplama işlemleri ZMQ IPC (`ipc:///tmp/samurai_jobs_*` ve `ipc:///tmp/samurai_events_*`) ile yürütülür. **Paket başına ZMQ mesajlaşması KESİNLİKLE YAPILMAZ.**
    - **Veri Düzlemi (Data Plane):** Paket ayrıştırma, oturum tablosu aramaları, FSM güncellemeleri ve TX enjeksiyonu doğrudan CPU/DPDK halkaları (`rte_ring`) ve paylaşılan bellek üzerinde döner.
 3. **Mevcut L2/L3 Altyapısının Olgunluk Seviyesine Göre Sınıflandırılması:**  
    Bir paketi sınıflandırmak, o protokolün tüm oturum yaşam döngüsünü yönetebilmek demek değildir. Mevcut bileşenler net sınıflandırılır:
-   - **Hazır:** [`LockfreeArpTable`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/lockfree_l2l3_cache.hpp), [`LockfreeNdTable`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/lockfree_l2l3_cache.hpp), [`BfdEngine`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/l2l3_stack/bfd_engine.hpp) (FSM & keepalive negotiation).
-   - **Genişletilebilir:** [`L2L3FastpathWiring`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/l2l3_fastpath_wiring.hpp) (temel çerçeve ayrımı var, telekom tünel demux eklenecek), [`DhcpStateMachine`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/l2l3_stack/dhcp_state_machine.hpp) (tekil DORA var, 1M+ abone kira çarkı eklenecek).
+   - **Hazır:** [`LockfreeArpTable`](../samurai/telecom/lockfree_l2l3_cache.hpp), [`LockfreeNdTable`](../samurai/telecom/lockfree_l2l3_cache.hpp), [`BfdEngine`](../samurai/l7_emu_native/l2l3_stack/bfd_engine.hpp) (FSM & keepalive negotiation).
+   - **Genişletilebilir:** [`L2L3FastpathWiring`](../samurai/telecom/l2l3_fastpath_wiring.hpp) (temel çerçeve ayrımı var, telekom tünel demux eklenecek), [`DhcpStateMachine`](../samurai/l7_emu_native/l2l3_stack/dhcp_state_machine.hpp) (tekil DORA var, 1M+ abone kira çarkı eklenecek).
    - **Eksik:** PPPoE Discovery + Session (LCP/PAP/CHAP/IPCP) uçtan uca FSM, GTP-U/PFCP mobil tünelleri.
 4. **Tek Protokol Odaklı Aşamalı Geliştirme (Single Protocol First):**  
    Tüm protokolleri (PPPoE, DHCP, GTP-U, PFCP, 802.1X) aynı anda bitirmeye çalışmak yerine, önce **PPPoE (Discovery + LCP/PAP/CHAP/IPCP)** baştan sona çalışan, ölçülebilen ve dağıtık çalıştırılabilen bir referans olarak tamamlanacak; ardından ortak mimari diğer protokollere yaygınlaştırılacaktır.
@@ -39,9 +39,9 @@ Bu dizindeki plan dokümanları, telekom motorunun her katmanını derinlemesine
 
 | Doküman | Başlık | Kapsam |
 |---|---|---|
-| [`01_TELCO_ENGINE_ARCHITECTURE.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/01_TELCO_ENGINE_ARCHITECTURE.md) | **Telecom Engine Çekirdek Mimarisi** | `ITelcoProtocol` modüler arayüzü, 128-bayt hizalı abone oturum yöneticisi (`SessionManager`), BNG Blaster esinli zamanlayıcı çarkı (`HierarchicalTimingWheel`), DPDK Ring veri akışı, Supervisor IPC ve `ddos_samurai/zmq/daemon/telco_worker.cpp` daemon tasarımı. |
-| [`02_STATEFUL_AND_STATELESS_PROTOCOLS.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/02_STATEFUL_AND_STATELESS_PROTOCOLS.md) | **Durumlu ve Durumsuz Protokoller** | **Durumlu:** PPPoE (LCP/PAP/CHAP/IPCP), DHCPv4/v6, BFD, 802.1X EAP, GTP-U tünelleri ve PFCP oturumları. **Durumsuz:** Hat hızında stateless GTP-U payload basıcı, QinQ (802.1ad) taraması, ARP/ND CoPP stres üreteçleri. |
-| [`03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md) | **Dizin Düzeni ve Saf C++ İskeletleri** | `ddos_samurai/telecom/` modüler motoru, `worker_registry.hpp` kaydı, `telco_worker.cpp` IPC döngüsü, CMake yapılandırması ve 5 aşamalı doğrulama planı. |
+| [`01_TELCO_ENGINE_ARCHITECTURE.md`](01_TELCO_ENGINE_ARCHITECTURE.md) | **Telecom Engine Çekirdek Mimarisi** | `ITelcoProtocol` modüler arayüzü, 128-bayt hizalı abone oturum yöneticisi (`SessionManager`), BNG Blaster esinli zamanlayıcı çarkı (`HierarchicalTimingWheel`), DPDK Ring veri akışı, Supervisor IPC ve `samurai/zmq/daemon/telco_worker.cpp` daemon tasarımı. |
+| [`02_STATEFUL_AND_STATELESS_PROTOCOLS.md`](02_STATEFUL_AND_STATELESS_PROTOCOLS.md) | **Durumlu ve Durumsuz Protokoller** | **Durumlu:** PPPoE (LCP/PAP/CHAP/IPCP), DHCPv4/v6, BFD, 802.1X EAP, GTP-U tünelleri ve PFCP oturumları. **Durumsuz:** Hat hızında stateless GTP-U payload basıcı, QinQ (802.1ad) taraması, ARP/ND CoPP stres üreteçleri. |
+| [`03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md`](03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md) | **Dizin Düzeni ve Saf C++ İskeletleri** | `samurai/telecom/` modüler motoru, `worker_registry.hpp` kaydı, `telco_worker.cpp` IPC döngüsü, CMake yapılandırması ve 5 aşamalı doğrulama planı. |
 
 ---
 
@@ -68,7 +68,7 @@ Bu dizindeki plan dokümanları, telekom motorunun her katmanını derinlemesine
                      | Sadece START/STOP/CONFIG                              | Sadece Periyodik Telemetri
                      v                                                       ^ (1 saniyede bir Snapshot)
 +--------------------------------------------------------------------------------------------------+
-|              SAMURAI TELCO WORKER DAEMON (ddos_samurai/zmq/daemon/telco_worker.cpp)              |
+|              SAMURAI TELCO WORKER DAEMON (samurai/zmq/daemon/telco_worker.cpp)              |
 |--------------------------------------------------------------------------------------------------|
 |  [ KONTROL VE FSM İŞ PARÇACIĞI (Slowpath Core) ]                                                 |
 |  - Hierarchical Timing Wheel (1ms hassasiyet, O(1) BFD/LCP/DHCP zamanlayıcı çarkı)               |
@@ -81,7 +81,7 @@ Bu dizindeki plan dokümanları, telekom motorunun her katmanını derinlemesine
           | (PPPoE Disc, LCP, DHCP DORA)                                             | (Tx Kontrol Paketleri)
           |                                                                          v
 +--------------------------------------------------------------------------------------------------+
-|               SAMURAI DPDK VERİ DÜZLEMİ (ddos_samurai/dpdk/dpdk_core.hpp / .cpp)                 |
+|               SAMURAI DPDK VERİ DÜZLEMİ (samurai/dpdk/dpdk_core.hpp / .cpp)                 |
 |--------------------------------------------------------------------------------------------------|
 |  - samurai::dpdk::ReceiveBurst (32-64 mbuf hat hızı alım)                                       |
 |  - L2L3FastpathWiring::ClassifyFrame (Donanım mbuf ayrıştırma & Fastpath/Slowpath demux)         |

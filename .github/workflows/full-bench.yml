@@ -51,12 +51,12 @@ jobs:
 
       - name: Build Native Binaries and Workers via CMake
         run: |
-          cmake -B build -S ddos_samurai -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
 
       - name: Build AF_XDP and pacing extensions
         run: |
-          make -C ddos_samurai all || make -C ddos_samurai xdp pacing
+          make -C samurai all || make -C samurai xdp pacing
 
       - name: Execute Native Benchmarks
         run: |
@@ -77,8 +77,8 @@ jobs:
           ./build/zmq/test_stateful_fastpath_l7
 
           echo "=== 5. HTTP/2 and HTTP/3 E2E Matrix ==="
-          ./ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh ./build/l7_emu_native/test_kernel_threaded_h2
-          ./ddos_samurai/l7_emu_native/run_kernel_threaded_h3_e2e.sh ./build/l7_emu_native/test_kernel_threaded_h3
+          ./samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh ./build/l7_emu_native/test_kernel_threaded_h2
+          ./samurai/l7_emu_native/run_kernel_threaded_h3_e2e.sh ./build/l7_emu_native/test_kernel_threaded_h3
 
       - name: Upload Benchmark Reports
         if: always()

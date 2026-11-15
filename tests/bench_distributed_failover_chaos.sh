@@ -2,11 +2,11 @@
 # ==============================================================================
 # TASK-TEST-L5-01: Distributed Master/Slave Dynamic Rebalancing Under Worker Chaos (kill -9)
 #
-# Target Code: ddos_samurai/control/master_coordinator.cpp
-#              ddos_samurai/control/master_coordinator.hpp
-#              ddos_samurai/control/master_adapters.cpp
-#              ddos_samurai/control/daemon/master_main.cpp
-#              ddos_samurai/control/daemon/slave_main.cpp
+# Target Code: samurai/control/master_coordinator.cpp
+#              samurai/control/master_coordinator.hpp
+#              samurai/control/master_adapters.cpp
+#              samurai/control/daemon/master_main.cpp
+#              samurai/control/daemon/slave_main.cpp
 #
 # Task Description:
 #   Launch 1 Master and 4 Slave worker processes for a 10,000,000 packet job.
@@ -57,7 +57,7 @@ echo "==========================================================================
 # 1. Ensure binaries are built
 if [ ! -f "$MASTER_BIN" ] || [ ! -f "$SLAVE_BIN" ] || [ ! -f "$SELFTEST_BIN" ]; then
   echo "[+] Building project binaries via CMake..."
-  cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/ddos_samurai"
+  cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/samurai"
   cmake --build "$BUILD_DIR" -j4
 fi
 
@@ -246,7 +246,7 @@ report_md = f"""# TASK-TEST-L5-01 Benchmark Report: Distributed Master/Slave Dyn
 
 **Task Code:** TASK-TEST-L5-01  
 **Target Layer:** Layer 5 (Distributed Control Plane & High Availability)  
-**Target Subsystem:** Master Job Dispatch Coordinator ([`master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp))  
+**Target Subsystem:** Master Job Dispatch Coordinator ([`master_coordinator.cpp`](../../../samurai/control/master_coordinator.cpp))  
 **Timestamp (UTC):** 2026-10-22T12:00:00Z  
 **Host Environment:** Linux 6.14.0-37-generic x86_64  
 **Cluster Topology:** 1 Master (`samurai_master`) + 4 Slaves (`samurai_slave`)  

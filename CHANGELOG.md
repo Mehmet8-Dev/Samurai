@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - First formal GitHub Release workflow with SemVer tag strategy.
-- Single-source package versioning (`ddos_samurai/__init__.py` as source of truth).
+- Single-source package versioning (`samurai/__init__.py` as source of truth).
 
 ### Changed
 - Replaced codename-only runtime version exposure with SemVer (`2.0.0`).

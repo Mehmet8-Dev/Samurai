@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from ddos_samurai.models.rl import ActionSpec, build_dataset
-from ddos_samurai.models.rl.config import RLConfig
+from samurai.models.rl import ActionSpec, build_dataset
+from samurai.models.rl.config import RLConfig
 
 
 def _rec(win, transport, *, rst=0, ctimeout=0, retrans=0, tclose=0,

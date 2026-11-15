@@ -17,7 +17,7 @@ The defense evaluation layer is engineered to:
 
 ## 2. Native C++ Defense Worker Architecture (`samurai_defense_worker`)
 
-[`defense_worker.cpp`](../ddos_samurai/zmq/daemon/defense_worker.cpp) operates as an autonomous native worker:
+[`defense_worker.cpp`](../samurai/zmq/daemon/defense_worker.cpp) operates as an autonomous native worker:
 - **Supervisor Integration:** Attaches to dedicated Unix IPC channels (`ipc:///tmp/samurai_jobs_defense`) managed by the ZMQ Supervisor.
 - **Dynamic Perturbation Testing:** Injects micro-variations into packet sizes, TCP window sizes, header orders, and timing intervals to test the sensitivity boundary of defense classifiers.
 - **Metric Telemetry:** Continuously streams anomaly scores, classified drop ratios, and bypass confidence metrics back to the control plane.
@@ -28,7 +28,7 @@ The defense evaluation layer is engineered to:
 
 ```bash
 # Execute defense resilience validation
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker defense \
   --target 10.0.0.50 \
   --port 80 \

@@ -1,0 +1,12 @@
+{{- if .Values.slave.podDisruptionBudget.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "samurai.fullname" . }}-slave
+spec:
+  maxUnavailable: {{ .Values.slave.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "samurai.name" . }}
+      app.kubernetes.io/component: slave
+{{- end -}}

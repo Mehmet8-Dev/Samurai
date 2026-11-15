@@ -1,4 +1,4 @@
-# DDoSamurai WAF/IPS resilience lab.
+# Samurai WAF/IPS resilience lab.
 #
 # A *defended* HTTP target you own, built to REACT to load so the closed-loop
 # autopilot (samurai_master --closed-loop --rl-corpus) records real

@@ -13,8 +13,8 @@ import json
 
 import numpy as np
 
-from ddos_samurai.models.rl import build_dataset
-from ddos_samurai.models.rl.config import RLConfig
+from samurai.models.rl import build_dataset
+from samurai.models.rl.config import RLConfig
 
 # Feature layout with mask bits on: 11 base + 9 mask = 20, then 2*V block features.
 _BASE = 20

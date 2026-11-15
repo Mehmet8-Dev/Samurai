@@ -76,7 +76,7 @@ flowchart TB
     CS --> AUD
 ```
 
-### Source Modules and Functional Breakdown (`ddos_samurai/control/`)
+### Source Modules and Functional Breakdown (`samurai/control/`)
 
 | Module / Source File | Architecture Role & Responsibilities |
 | :--- | :--- |

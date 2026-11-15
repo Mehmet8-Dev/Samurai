@@ -4,11 +4,11 @@
 > **Yazar:** Samurai Core Architecture Team  
 > **Tarih:** 29 Ekim 2026  
 > **Aktif Git Dalı:** `feat/telecom-engine-integration`  
-> **Konum:** `ddos_samurai/plan/01_TELCO_ENGINE_ARCHITECTURE.md`  
+> **Konum:** `samurai/plan/01_TELCO_ENGINE_ARCHITECTURE.md`  
 > **Bağlantılı Dokümanlar:**  
-> - [`README.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/README.md)  
-> - [`02_STATEFUL_AND_STATELESS_PROTOCOLS.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/02_STATEFUL_AND_STATELESS_PROTOCOLS.md)  
-> - [`03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md)  
+> - [`README.md`](README.md)  
+> - [`02_STATEFUL_AND_STATELESS_PROTOCOLS.md`](02_STATEFUL_AND_STATELESS_PROTOCOLS.md)  
+> - [`03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md`](03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md)  
 
 ---
 
@@ -44,13 +44,13 @@ Bir protokol paketini tanımak veya sınıflandırabilmek, o protokolün tüm du
 
 | Bileşen | Konum | Durum | Açıklama ve Yol Haritası |
 |---|---|---|---|
-| **`LockfreeArpTable`** | [`ddos_samurai/telecom/lockfree_l2l3_cache.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/lockfree_l2l3_cache.hpp) | **HAZIR** | 64-bayt hizalı, kilitli olmayan (atomic sequence/epoch), hat hızında O(1) MAC çözümleme tablosu. Telekom motorunda doğrudan kullanılır. |
-| **`LockfreeNdTable`** | [`ddos_samurai/telecom/lockfree_l2l3_cache.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/lockfree_l2l3_cache.hpp) | **HAZIR** | IPv6 Neighbor Discovery için wait-free önbellek tablosu. |
-| **`BfdEngine`** | [`ddos_samurai/l7_emu_native/l2l3_stack/bfd_engine.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/l2l3_stack/bfd_engine.hpp) | **HAZIR** | RFC 5880/5881 durum makinesi, asenkron keepalive ve failover tespiti. Telekom BFD oturumlarında kullanılır. |
-| **`L2L3FastpathWiring`** | [`ddos_samurai/telecom/l2l3_fastpath_wiring.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/l2l3_fastpath_wiring.hpp) | **GENİŞLETİLEBİLİR** | Çerçeve sınıflandırması (`ControlFrameType::Pppoe`, `Dhcp`, `Bfd`, vb.) hazır; ancak GTP-U ve PFCP tünel başlık ayrıştırması eklenecektir. |
-| **`DhcpStateMachine`** | [`ddos_samurai/l7_emu_native/l2l3_stack/dhcp_state_machine.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/l2l3_stack/dhcp_state_machine.hpp) | **GENİŞLETİLEBİLİR** | Tekil DORA durumları uygulanmış; 1M+ abone eşzamanlı kira yenileme çarkı (`HierarchicalTimingWheel`) entegrasyonu eklenecektir. |
-| **`PppoeEngine`** | Planlanan: `ddos_samurai/telecom/protocols/stateful/pppoe/` | **EKSİK (Faz 1)** | Discovery (PADI/PADO/PADR/PADS/PADT) ve Session (LCP/PAP/CHAP/IPCP) FSM'leri uçtan uca uygulanacaktır. |
-| **`GtpuEngine` / `PfcpEngine`** | Planlanan: `ddos_samurai/telecom/protocols/stateful/mobile/` | **EKSİK (Faz 2)** | 3GPP TS 29.281 / 29.244 tünel yönetimi ve TEID eşleme motoru uygulanacaktır. |
+| **`LockfreeArpTable`** | [`samurai/telecom/lockfree_l2l3_cache.hpp`](../samurai/telecom/lockfree_l2l3_cache.hpp) | **HAZIR** | 64-bayt hizalı, kilitli olmayan (atomic sequence/epoch), hat hızında O(1) MAC çözümleme tablosu. Telekom motorunda doğrudan kullanılır. |
+| **`LockfreeNdTable`** | [`samurai/telecom/lockfree_l2l3_cache.hpp`](../samurai/telecom/lockfree_l2l3_cache.hpp) | **HAZIR** | IPv6 Neighbor Discovery için wait-free önbellek tablosu. |
+| **`BfdEngine`** | [`samurai/l7_emu_native/l2l3_stack/bfd_engine.hpp`](../samurai/l7_emu_native/l2l3_stack/bfd_engine.hpp) | **HAZIR** | RFC 5880/5881 durum makinesi, asenkron keepalive ve failover tespiti. Telekom BFD oturumlarında kullanılır. |
+| **`L2L3FastpathWiring`** | [`samurai/telecom/l2l3_fastpath_wiring.hpp`](../samurai/telecom/l2l3_fastpath_wiring.hpp) | **GENİŞLETİLEBİLİR** | Çerçeve sınıflandırması (`ControlFrameType::Pppoe`, `Dhcp`, `Bfd`, vb.) hazır; ancak GTP-U ve PFCP tünel başlık ayrıştırması eklenecektir. |
+| **`DhcpStateMachine`** | [`samurai/l7_emu_native/l2l3_stack/dhcp_state_machine.hpp`](../samurai/l7_emu_native/l2l3_stack/dhcp_state_machine.hpp) | **GENİŞLETİLEBİLİR** | Tekil DORA durumları uygulanmış; 1M+ abone eşzamanlı kira yenileme çarkı (`HierarchicalTimingWheel`) entegrasyonu eklenecektir. |
+| **`PppoeEngine`** | Planlanan: `samurai/telecom/protocols/stateful/pppoe/` | **EKSİK (Faz 1)** | Discovery (PADI/PADO/PADR/PADS/PADT) ve Session (LCP/PAP/CHAP/IPCP) FSM'leri uçtan uca uygulanacaktır. |
+| **`GtpuEngine` / `PfcpEngine`** | Planlanan: `samurai/telecom/protocols/stateful/mobile/` | **EKSİK (Faz 2)** | 3GPP TS 29.281 / 29.244 tünel yönetimi ve TEID eşleme motoru uygulanacaktır. |
 
 ---
 
@@ -59,7 +59,7 @@ Bir protokol paketini tanımak veya sınıflandırabilmek, o protokolün tüm du
 Tüm telekom protokolleri standart bir C++ soyutlamasına dayanır:
 
 ```cpp
-namespace ddos_samurai::telecom {
+namespace samurai::telecom {
 
 class ITelcoProtocol {
 public:
@@ -86,7 +86,7 @@ public:
     virtual std::string_view GetProtocolName() const noexcept = 0;
 };
 
-} // namespace ddos_samurai::telecom
+} // namespace samurai::telecom
 ```
 
 ---
@@ -104,7 +104,7 @@ Hat hızında (100 GbE / 148.8 Mpps) çalışan bir veri düzleminde her pakette
 ### 4.2 Bellek Düzeni: `TelcoSessionContext` (alignas(64) - Tam 128 Bayt)
 
 ```cpp
-namespace ddos_samurai::telecom {
+namespace samurai::telecom {
 
 enum class SessionState : uint8_t {
     IDLE = 0,
@@ -170,7 +170,7 @@ struct alignas(64) TelcoSessionContext {
 };
 static_assert(sizeof(TelcoSessionContext) == 128, "TelcoSessionContext tam 2 cache line (128 bayt) olmalidir!");
 
-} // namespace ddos_samurai::telecom
+} // namespace samurai::telecom
 ```
 
 ### 4.3 Donanım Hızlandırmalı 5-Tuple Arama (SSE4.2 / AVX2 CRC32 Hash)
@@ -219,7 +219,7 @@ Geleneksel Min-Heap tabanlı zamanlayıcılar ($O(\log N)$) 1 milyon abone ölç
 
 ## 6. DPDK Veri Düzlemi ve Donanım İzolasyonu
 
-Ağ kartı donanım erişimi için Samurai'nin merkezi DPDK çekirdeği ([`ddos_samurai/dpdk/dpdk_core.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/dpdk/dpdk_core.hpp)) kullanılır.
+Ağ kartı donanım erişimi için Samurai'nin merkezi DPDK çekirdeği ([`samurai/dpdk/dpdk_core.hpp`](../samurai/dpdk/dpdk_core.hpp)) kullanılır.
 
 ### 6.1 Donanım Optimizasyon Kuralları
 1. **Kuyruk Sahipliği (Queue Ownership):** Her worker çekirdeğine özel donanım TX ve RX kuyruğu atanır. Çekirdekler arası kilit (spinlock/mutex) KESİNLİKLE KULLANILMAZ.
@@ -231,7 +231,7 @@ Ağ kartı donanım erişimi için Samurai'nin merkezi DPDK çekirdeği ([`ddos_
        |
        v  samurai::dpdk::ReceiveBurst (64 rte_mbuf)
 +---------------------------------------------------------------------------------+
-|               L2L3FastpathWiring::ClassifyFrame (ddos_samurai/telecom/)          |
+|               L2L3FastpathWiring::ClassifyFrame (samurai/telecom/)          |
 +---------------------------------------------------------------------------------+
 | 1. VLAN / QinQ Başlıklarını Çöz (802.1Q / 802.1ad)                              |
 | 2. ControlFrameType Tespiti:                                                    |
@@ -257,8 +257,8 @@ Ağ kartı donanım erişimi için Samurai'nin merkezi DPDK çekirdeği ([`ddos_
 ## 7. ZMQ Dağıtık ve Yerel Kontrol Düzlemi (Gelişmiş Sharding Mimarisi)
 
 ### 7.1 Yerel Süreç Orkestrasyonu (Supervisor IPC)
-- **Yönetici:** [`ddos_samurai/orchestrator/supervisor.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/orchestrator/supervisor.cpp)
-- **Kayıt:** [`ddos_samurai/orchestrator/worker_registry.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/orchestrator/worker_registry.hpp) tablosuna `{WorkerKind::TELCO, "telco", "samurai_telco_worker"}` eklenir.
+- **Yönetici:** [`samurai/orchestrator/supervisor.cpp`](../samurai/orchestrator/supervisor.cpp)
+- **Kayıt:** [`samurai/orchestrator/worker_registry.hpp`](../samurai/orchestrator/worker_registry.hpp) tablosuna `{WorkerKind::TELCO, "telco", "samurai_telco_worker"}` eklenir.
 - **Soketler:** Supervisor süreci `fork/exec` ile başlatırken parametre olarak verir:
   - `--job-endpoint ipc:///tmp/samurai_jobs_telco` (ZMQ PULL)
   - `--event-endpoint ipc:///tmp/samurai_events_telco` (ZMQ PUSH)

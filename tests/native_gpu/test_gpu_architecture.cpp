@@ -21,9 +21,9 @@
 
 #include <cuda_runtime.h>
 
-#include "ddos_samurai/gpu_packet_cuda/tx_backend_geforce_p2p.cuh"
-#include "ddos_samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh"
-#include "ddos_samurai/l7_emu_native/custom_quic_stack/quic_cuda_crypto.hpp"
+#include "samurai/gpu_packet_cuda/tx_backend_geforce_p2p.cuh"
+#include "samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh"
+#include "samurai/l7_emu_native/custom_quic_stack/quic_cuda_crypto.hpp"
 
 extern "C" {
   int samurai_gpu_packet_set_kernel_mode(int mode);
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
 
   std::printf("\n");
   std::printf("====================================================================================================\n");
-  std::printf("      DDoSamurai HIGH-PERFORMANCE GPU ARCHITECTURE VALIDATION & BENCHMARK SUITE                     \n");
+  std::printf("      Samurai HIGH-PERFORMANCE GPU ARCHITECTURE VALIDATION & BENCHMARK SUITE                     \n");
   std::printf("====================================================================================================\n");
 
   // ---------------------------------------------------------------------------
@@ -212,14 +212,14 @@ int main(int argc, char** argv) {
   std::printf("\n[SECTION 2: COMMODITY GPU (GEFORCE BAR1 P2P DMA) ENGINE VERIFICATION]\n");
 
 
-  void* lib_handle = dlopen("ddos_samurai/libgpu_packet_cuda.so", RTLD_NOW);
-  TEST_CHECK(lib_handle != nullptr, "dlopen('ddos_samurai/libgpu_packet_cuda.so') successful");
+  void* lib_handle = dlopen("samurai/libgpu_packet_cuda.so", RTLD_NOW);
+  TEST_CHECK(lib_handle != nullptr, "dlopen('samurai/libgpu_packet_cuda.so') successful");
   if (!lib_handle) {
     std::printf("FATAL: Cannot load libgpu_packet_cuda.so: %s\n", dlerror());
     return 1;
   }
 
-  auto get_p2p_api = reinterpret_cast<ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pApiV1* (*)()>(
+  auto get_p2p_api = reinterpret_cast<samurai::gpu_packet_cuda::p2p::GeforceP2pApiV1* (*)()>(
       dlsym(lib_handle, "samurai_geforce_p2p_get_api_v1"));
   TEST_CHECK(get_p2p_api != nullptr, "Symbol 'samurai_geforce_p2p_get_api_v1' exported from C ABI");
 
@@ -234,7 +234,7 @@ int main(int argc, char** argv) {
 
   int ring_handle = -1;
   char err_buf[512] = {0};
-  ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 cfg{};
+  samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 cfg{};
   std::strncpy(cfg.pci_gpu_bdf, "0000:01:00.0", sizeof(cfg.pci_gpu_bdf) - 1);
   cfg.ring_slot_count = 1024;
   cfg.slot_stride = 2048;
@@ -314,7 +314,7 @@ int main(int argc, char** argv) {
   // Verify FAIL-CLOSED behavior when no NIC DMA transport is bound (NO AF_PACKET FALLBACK, NO FAKE COUNTERS)
   uint32_t transmitted = 999;
   rc = api->nic_tx_burst(ring_handle, 64, &transmitted, err_buf, sizeof(err_buf));
-  ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pTxStats pre_stats{};
+  samurai::gpu_packet_cuda::p2p::GeforceP2pTxStats pre_stats{};
   (void)api->get_stats(ring_handle, &pre_stats, err_buf, sizeof(err_buf));
   TEST_CHECK(rc < 0 && transmitted == 0 && pre_stats.tx_packets == 0 && pre_stats.tx_errors == 1,
              "Fail-closed verified: nic_tx_burst refuses fake TX when no NIC DMA transport is bound");
@@ -327,7 +327,7 @@ int main(int argc, char** argv) {
   } dma_ctx;
   dma_ctx.mapped_iova = bar1_base != 0 ? bar1_base : 0x6000000000ULL;
 
-  ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pNicTransportOpsV1 transport_ops{};
+  samurai::gpu_packet_cuda::p2p::GeforceP2pNicTransportOpsV1 transport_ops{};
   transport_ops.user_ctx = &dma_ctx;
   transport_ops.dma_map_region = [](void* uctx, void* host_ptr, uint64_t iova, size_t len, uint32_t /*page_sz*/) -> int {
     if (!uctx || !host_ptr || len == 0 || iova == 0) return -1;
@@ -391,7 +391,7 @@ int main(int argc, char** argv) {
              "api->gpu_verify_rx_slots CUDA kernel validates all 64 Ethernet/IPv4 headers & checksums in BAR1");
 
   // Telemetry accounting
-  ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pTxStats stats{};
+  samurai::gpu_packet_cuda::p2p::GeforceP2pTxStats stats{};
   rc = api->get_stats(ring_handle, &stats, err_buf, sizeof(err_buf));
   TEST_CHECK(rc == 0 && stats.tx_packets == 64 && stats.tx_bytes == 64 * 60 &&
              stats.rx_packets == 64 && stats.rx_bytes == 64 * 60 &&
@@ -450,7 +450,7 @@ int main(int argc, char** argv) {
   int raw_sock = ::socket(AF_PACKET, SOCK_RAW, IPPROTO_RAW);
   if (p2p_fd >= 0 && raw_sock >= 0) {
     int hw_ring = -1;
-    ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 hw_cfg{};
+    samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 hw_cfg{};
     std::strncpy(hw_cfg.pci_gpu_bdf, g_results.pci_bdf.c_str(), sizeof(hw_cfg.pci_gpu_bdf) - 1);
     hw_cfg.ring_slot_count = 256;
     hw_cfg.slot_stride = 2048;
@@ -601,7 +601,7 @@ int main(int argc, char** argv) {
   std::printf("\n[SECTION 2C: GPU-INITIATED NIC TX DESCRIPTOR & MMIO DOORBELL VERIFICATION]\n");
   {
     int db_ring = -1;
-    ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 db_ring_cfg{};
+    samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 db_ring_cfg{};
     std::strncpy(db_ring_cfg.pci_gpu_bdf, "0000:01:00.0", sizeof(db_ring_cfg.pci_gpu_bdf) - 1);
     db_ring_cfg.ring_slot_count = 256;
     db_ring_cfg.slot_stride = 2048;
@@ -631,7 +631,7 @@ int main(int argc, char** argv) {
     std::memset(host_desc_ring, 0, 32 * 16);
 
     // 1. Realtek r8169 GPU-Initiated Doorbell (TPPoll @ 0x38 = 0x40, 16-byte Rtl8169TxDesc)
-    ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pDoorbellConfigV1 r8169_db{};
+    samurai::gpu_packet_cuda::p2p::GeforceP2pDoorbellConfigV1 r8169_db{};
     r8169_db.nic_driver_type = 0u;  // kRealtekR8169
     r8169_db.queue_id = 0u;
     r8169_db.tx_ring_size = 32u;
@@ -674,7 +674,7 @@ int main(int argc, char** argv) {
     // Verify hardware backpressure protection: descriptors still have DescOwn=1, so next burst must not clobber them
     uint32_t bp_submitted = 99u;
     db_rc = api->gpu_doorbell_tx_burst(db_ring, db_slots, db_lens, 8u, &bp_submitted, err_buf, sizeof(err_buf));
-    ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pTxStats db_stats{};
+    samurai::gpu_packet_cuda::p2p::GeforceP2pTxStats db_stats{};
     api->get_stats(db_ring, &db_stats, err_buf, sizeof(err_buf));
     TEST_CHECK(db_rc == 0 && bp_submitted == 0u && db_stats.gpu_ring_full_backpressure == 8u &&
                db_stats.gpu_doorbell_kicks == 1u,
@@ -689,7 +689,7 @@ int main(int argc, char** argv) {
     cudaHostGetDevicePointer(&dev_ixgbe_mmio, host_ixgbe_mmio, 0);
     std::memset(host_ixgbe_mmio, 0, 32768);
 
-    ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pDoorbellConfigV1 ixgbe_db{};
+    samurai::gpu_packet_cuda::p2p::GeforceP2pDoorbellConfigV1 ixgbe_db{};
     ixgbe_db.nic_driver_type = 2u;  // kIntelIxgbe
     ixgbe_db.queue_id = 3u;
     ixgbe_db.tx_ring_size = 32u;
@@ -723,7 +723,7 @@ int main(int argc, char** argv) {
   std::printf("\n[SECTION 2D: AUTONOMOUS BARE-METAL GPU-PMD & PERSISTENT KERNEL DIRECT DOORBELL]\n");
   {
     int auto_ring = -1;
-    ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 auto_ring_cfg{};
+    samurai::gpu_packet_cuda::p2p::GeforceP2pConfigV1 auto_ring_cfg{};
     std::strncpy(auto_ring_cfg.pci_gpu_bdf, "0000:01:00.0", sizeof(auto_ring_cfg.pci_gpu_bdf) - 1);
     auto_ring_cfg.ring_slot_count = 256;
     auto_ring_cfg.slot_stride = 2048;
@@ -746,10 +746,10 @@ int main(int argc, char** argv) {
     std::memset(host_auto_desc, 0, 32 * 16);
 
     const uint64_t fake_desc_iova = 0x1A000000ULL;
-    const bool pmd_e1000_ok = ddos_samurai::gpu_packet_cuda::p2p::doorbell::host_init_nic_pmd_tx_ring_mmio(
+    const bool pmd_e1000_ok = samurai::gpu_packet_cuda::p2p::doorbell::host_init_nic_pmd_tx_ring_mmio(
         host_pmd_mmio,
         16384,
-        ddos_samurai::gpu_packet_cuda::p2p::doorbell::NicHardwareDriverType::kIntelE1000e,
+        samurai::gpu_packet_cuda::p2p::doorbell::NicHardwareDriverType::kIntelE1000e,
         0u,
         fake_desc_iova,
         32u);
@@ -763,12 +763,12 @@ int main(int argc, char** argv) {
 
     // 2. Bind with kDoorbellFlagInitPmdRegs | kDoorbellFlagAutoReapOnWrap on Realtek r8169
     std::memset(host_pmd_mmio, 0, 16384);
-    ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pDoorbellConfigV1 auto_db_cfg{};
+    samurai::gpu_packet_cuda::p2p::GeforceP2pDoorbellConfigV1 auto_db_cfg{};
     auto_db_cfg.nic_driver_type = 0u; // r8169
     auto_db_cfg.queue_id = 0u;
     auto_db_cfg.tx_ring_size = 32u;
-    auto_db_cfg.flags = ddos_samurai::gpu_packet_cuda::p2p::doorbell::kDoorbellFlagInitPmdRegs |
-                        ddos_samurai::gpu_packet_cuda::p2p::doorbell::kDoorbellFlagAutoReapOnWrap;
+    auto_db_cfg.flags = samurai::gpu_packet_cuda::p2p::doorbell::kDoorbellFlagInitPmdRegs |
+                        samurai::gpu_packet_cuda::p2p::doorbell::kDoorbellFlagAutoReapOnWrap;
     auto_db_cfg.host_tx_desc_ring = host_auto_desc;
     auto_db_cfg.dev_tx_desc_ring = dev_auto_desc;
     auto_db_cfg.tx_desc_ring_iova = fake_desc_iova;
@@ -786,10 +786,10 @@ int main(int argc, char** argv) {
     uint64_t dev_txq_handle = 0ull;
     uint32_t txq_mkey_be = 0u;
     auto_rc = api->get_gpu_txq_handle(auto_ring, &dev_txq_handle, &txq_mkey_be, err_buf, sizeof(err_buf));
-    auto* txq_ctx = reinterpret_cast<const ddos_samurai::gpu_packet_cuda::p2p::doorbell::GeforceP2pGpuDeviceTxq*>(dev_txq_handle);
+    auto* txq_ctx = reinterpret_cast<const samurai::gpu_packet_cuda::p2p::doorbell::GeforceP2pGpuDeviceTxq*>(dev_txq_handle);
     TEST_CHECK(auto_rc == 0 && dev_txq_handle != 0ull &&
-               txq_mkey_be == ddos_samurai::gpu_packet_cuda::p2p::doorbell::kGeforceP2pDoorbellMkeyBe &&
-               txq_ctx != nullptr && txq_ctx->magic == ddos_samurai::gpu_packet_cuda::p2p::doorbell::kGeforceP2pDeviceTxqMagic,
+               txq_mkey_be == samurai::gpu_packet_cuda::p2p::doorbell::kGeforceP2pDoorbellMkeyBe &&
+               txq_ctx != nullptr && txq_ctx->magic == samurai::gpu_packet_cuda::p2p::doorbell::kGeforceP2pDeviceTxqMagic,
                "api->get_gpu_txq_handle returns valid GeforceP2pGpuDeviceTxq with magic GFP2PTXQ & MKey GPDB");
 
     // 4. Test completion reaping on ring wrap (Burst 1 fills ring; Burst 2 reaps and reclaims descriptors)
@@ -803,7 +803,7 @@ int main(int argc, char** argv) {
     auto_rc = api->gpu_doorbell_tx_burst(auto_ring, burst_slots, burst_lens, 32u, &sub1, err_buf, sizeof(err_buf));
     uint32_t sub2 = 0u;
     auto_rc = api->gpu_doorbell_tx_burst(auto_ring, burst_slots, burst_lens, 32u, &sub2, err_buf, sizeof(err_buf));
-    ddos_samurai::gpu_packet_cuda::p2p::GeforceP2pTxStats auto_stats{};
+    samurai::gpu_packet_cuda::p2p::GeforceP2pTxStats auto_stats{};
     api->get_stats(auto_ring, &auto_stats, err_buf, sizeof(err_buf));
     std::printf("  * [Autonomous GPU-PMD] Burst 1 submitted=%u, Burst 2 submitted=%u, reaped_completions=%llu, kicks=%llu\n",
                 sub1, sub2, (unsigned long long)auto_stats.gpu_reaped_completions, (unsigned long long)auto_stats.gpu_doorbell_kicks);
@@ -870,7 +870,7 @@ int main(int argc, char** argv) {
   std::printf("\n[SECTION 3: QUIC CRYPTOGRAPHIC COPROCESSOR ENGINE VERIFICATION]\n");
 
   // Test 3.1: RFC 9001 Appendix A.1 Official IETF Self-Test
-  const bool selftest_pass = ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_crypto_selftest();
+  const bool selftest_pass = samurai::l7_emu_native::custom_quic_stack::quic_cuda_crypto_selftest();
   TEST_CHECK(selftest_pass, "RFC 9001 Appendix A.1 byte-exact HKDF + AES-128-ECB Header Protection match");
   g_results.rfc9001_selftest_pass = selftest_pass;
 
@@ -879,11 +879,11 @@ int main(int argc, char** argv) {
   for (int scale : key_scales) {
     std::vector<uint8_t> dcids(scale * 8u, 0x83);
     std::vector<uint8_t> scids(scale * 8u, 0x12);
-    std::vector<ddos_samurai::l7_emu_native::custom_quic_stack::QuicInitialKeyMaterial> mats(scale);
+    std::vector<samurai::l7_emu_native::custom_quic_stack::QuicInitialKeyMaterial> mats(scale);
 
     uint64_t ns = 0;
     const auto t0 = std::chrono::steady_clock::now();
-    bool ok = ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_derive_initial_keys_batch(
+    bool ok = samurai::l7_emu_native::custom_quic_stack::quic_cuda_derive_initial_keys_batch(
         dcids.data(), scids.data(), scale, mats.data(), &ns);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0;
@@ -908,7 +908,7 @@ int main(int argc, char** argv) {
 
     uint64_t ns = 0;
     const auto t0 = std::chrono::steady_clock::now();
-    bool ok = ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_aes128_hp_mask_batch(
+    bool ok = samurai::l7_emu_native::custom_quic_stack::quic_cuda_aes128_hp_mask_batch(
         hp_keys.data(), samples.data(), scale, masks.data(), &ns);
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0;
@@ -928,7 +928,7 @@ int main(int argc, char** argv) {
   // Test 3.4: Batch AEAD Encryption (AES-128-GCM and ChaCha20-Poly1305)
   constexpr int kAeadCount = 10000;
   constexpr size_t kStride = 1500;
-  std::vector<ddos_samurai::l7_emu_native::custom_quic_stack::QuicAeadBatchItem> aead_items(kAeadCount);
+  std::vector<samurai::l7_emu_native::custom_quic_stack::QuicAeadBatchItem> aead_items(kAeadCount);
   std::vector<uint8_t> pkt_bufs(kAeadCount * kStride, 0x55);
 
   for (int i = 0; i < kAeadCount; ++i) {
@@ -945,7 +945,7 @@ int main(int argc, char** argv) {
   // AES-128-GCM
   uint64_t gcm_ns = 0;
   const auto t0_gcm = std::chrono::steady_clock::now();
-  bool gcm_ok = ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_aes128_gcm_encrypt_batch(
+  bool gcm_ok = samurai::l7_emu_native::custom_quic_stack::quic_cuda_aes128_gcm_encrypt_batch(
       aead_items.data(), pkt_bufs.data(), kStride, kAeadCount, &gcm_ns);
   const auto t1_gcm = std::chrono::steady_clock::now();
   const double gcm_ms = std::chrono::duration<double>(t1_gcm - t0_gcm).count() * 1000.0;
@@ -960,7 +960,7 @@ int main(int argc, char** argv) {
   // ChaCha20-Poly1305
   uint64_t chacha_ns = 0;
   const auto t0_chacha = std::chrono::steady_clock::now();
-  bool chacha_ok = ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_chacha20_poly1305_encrypt_batch(
+  bool chacha_ok = samurai::l7_emu_native::custom_quic_stack::quic_cuda_chacha20_poly1305_encrypt_batch(
       aead_items.data(), pkt_bufs.data(), kStride, kAeadCount, &chacha_ns);
   const auto t1_chacha = std::chrono::steady_clock::now();
   const double chacha_ms = std::chrono::duration<double>(t1_chacha - t0_chacha).count() * 1000.0;
@@ -973,7 +973,7 @@ int main(int argc, char** argv) {
   g_results.chacha20_pps = chacha_pps;
 
   // Test 3.5: Cryptographic Telemetry Accounting (Strict Real CUDA GPU Kernel Verification)
-  auto telem = ddos_samurai::l7_emu_native::custom_quic_stack::quic_cuda_crypto_get_telemetry();
+  auto telem = samurai::l7_emu_native::custom_quic_stack::quic_cuda_crypto_get_telemetry();
   std::printf("  --> QUIC CUDA Telemetry: gpu_available=%d, kernel_launches=%llu, initial_keys=%llu, hp_masks=%llu, aead_pkts=%llu\n",
               telem.gpu_available ? 1 : 0,
               (unsigned long long)telem.kernel_launches,

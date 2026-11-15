@@ -22,7 +22,7 @@ class Test100kTcpFlows(unittest.TestCase):
         """Execute compiled C++ test_100k_tcp_flows binary if available."""
         candidate_paths = [
             os.path.abspath(os.path.join(os.path.dirname(__file__), "../build/l4/test_100k_tcp_flows")),
-            os.path.abspath(os.path.join(os.path.dirname(__file__), "../ddos_samurai/build/l4/test_100k_tcp_flows")),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "../samurai/build/l4/test_100k_tcp_flows")),
         ]
         bin_path = next((p for p in candidate_paths if os.path.exists(p)), None)
         if bin_path:

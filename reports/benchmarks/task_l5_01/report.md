@@ -2,7 +2,7 @@
 
 **Task Code:** TASK-TEST-L5-01  
 **Target Layer:** Layer 5 (Distributed Control Plane & High Availability)  
-**Target Subsystem:** Master Job Dispatch Coordinator ([`master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp))  
+**Target Subsystem:** Master Job Dispatch Coordinator ([`master_coordinator.cpp`](../../../samurai/control/master_coordinator.cpp))  
 **Timestamp (UTC):** 2026-10-22T12:00:00Z  
 **Host Environment:** Linux 6.14.0-37-generic x86_64  
 **Cluster Topology:** 1 Master (`samurai_master`) + 4 Slaves (`samurai_slave`)  

@@ -4,11 +4,11 @@
 > **Yazar:** Samurai Core Architecture Team  
 > **Tarih:** 29 Ekim 2026  
 > **Aktif Git Dalı:** `feat/telecom-engine-integration`  
-> **Konum:** `ddos_samurai/plan/02_STATEFUL_AND_STATELESS_PROTOCOLS.md`  
+> **Konum:** `samurai/plan/02_STATEFUL_AND_STATELESS_PROTOCOLS.md`  
 > **Bağlantılı Dokümanlar:**  
-> - [`README.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/README.md)  
-> - [`01_TELCO_ENGINE_ARCHITECTURE.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/01_TELCO_ENGINE_ARCHITECTURE.md)  
-> - [`03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/plan/03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md)  
+> - [`README.md`](README.md)  
+> - [`01_TELCO_ENGINE_ARCHITECTURE.md`](01_TELCO_ENGINE_ARCHITECTURE.md)  
+> - [`03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md`](03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md)  
 
 ---
 
@@ -115,7 +115,7 @@ sequenceDiagram
 
 ### 3.2 BFD (Bidirectional Forwarding Detection - RFC 5880 / 5881)
 - Mikro-saniye seviyesinde hızlı hat arıza tespiti (10ms iletim, 30ms algılama).
-- Samurai bünyesindeki [`BfdEngine`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/l2l3_stack/bfd_engine.hpp) doğrudan yeniden kullanılır.
+- Samurai bünyesindeki [`BfdEngine`](../samurai/l7_emu_native/l2l3_stack/bfd_engine.hpp) doğrudan yeniden kullanılır.
 
 ---
 

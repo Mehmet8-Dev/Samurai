@@ -89,7 +89,7 @@ trap cleanup EXIT INT TERM
 if [[ "$PROTO" == "all" || "$PROTO" == "h3" || "$PROTO" == "http3" || "$PROTO" == "quic" ]]; then
   echo "[SETUP] Launching real HTTP/3 server (aioquic multi-worker) for authentic network benchmarks..."
   SRV_OUT="$(mktemp)"
-  H3_SERVER_WORKERS="${H3_SERVER_WORKERS:-6}" python3 "$ROOT_DIR/ddos_samurai/l7_emu_native/test_h3_server.py" >"$SRV_OUT" 2>&1 &
+  H3_SERVER_WORKERS="${H3_SERVER_WORKERS:-6}" python3 "$ROOT_DIR/samurai/l7_emu_native/test_h3_server.py" >"$SRV_OUT" 2>&1 &
   SRV_PID=$!
 
   for _ in $(seq 1 100); do

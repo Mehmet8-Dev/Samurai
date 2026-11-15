@@ -1,6 +1,6 @@
 # 04 - CPU Packet Builder & Traffic Synthesis Engine
 
-In the CPU dataplane, high-speed packet synthesis, dynamic header encoding, and source address permutation are executed natively in C++ within the [`ddos_samurai/cpu_native/`](file://ddos_samurai/cpu_native/) module.
+In the CPU dataplane, high-speed packet synthesis, dynamic header encoding, and source address permutation are executed natively in C++ within the [`samurai/cpu_native/`](file://samurai/cpu_native/) module.
 
 ---
 

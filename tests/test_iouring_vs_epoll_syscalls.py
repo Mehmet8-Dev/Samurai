@@ -33,7 +33,7 @@ class TestIoUringVsEpollSyscalls(unittest.TestCase):
             raise unittest.SkipTest("cmake not found on system")
 
         cls.build_dir.mkdir(parents=True, exist_ok=True)
-        cmake_src = cls.repo_root / "ddos_samurai"
+        cmake_src = cls.repo_root / "samurai"
         subprocess.run([cmake_bin, "-B", str(cls.build_dir), "-S", str(cmake_src)], check=True, capture_output=True, text=True)
         res = subprocess.run([cmake_bin, "--build", str(cls.build_dir), "--target", "test_kernel_threaded_io_uring", "-j4"], capture_output=True, text=True)
         if res.returncode != 0:

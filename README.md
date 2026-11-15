@@ -80,11 +80,11 @@ make -j$(nproc)
 ```
 
 The build produces the following native binaries under `build/`:
-- `build/ddos_samurai/cli/samurai` (Primary CLI tool)
-- `build/ddos_samurai/control/daemon/samurai_master` (Distributed Master daemon)
-- `build/ddos_samurai/control/daemon/samurai_slave` (Distributed Worker node daemon)
-- `build/ddos_samurai/zmq/daemon/samurai_*_worker` (All native dataplane worker engines)
-- `build/ddos_samurai/*_selftest` (Unit test and self-test verification suites)
+- `build/samurai/cli/samurai` (Primary CLI tool)
+- `build/samurai/control/daemon/samurai_master` (Distributed Master daemon)
+- `build/samurai/control/daemon/samurai_slave` (Distributed Worker node daemon)
+- `build/samurai/zmq/daemon/samurai_*_worker` (All native dataplane worker engines)
+- `build/samurai/*_selftest` (Unit test and self-test verification suites)
 
 ---
 
@@ -94,7 +94,7 @@ The build produces the following native binaries under `build/`:
 
 ```bash
 # High-speed UDP packet test via CPU engine
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker cpu \
   --target 192.168.1.100 \
   --port 80 \
@@ -103,7 +103,7 @@ The build produces the following native binaries under `build/`:
   --confirm
 
 # AF_XDP Kernel-Bypass zero-copy line-rate test
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker afxdp \
   --target 10.0.0.1 \
   --interface eth0 \
@@ -112,7 +112,7 @@ The build produces the following native binaries under `build/`:
   --confirm
 
 # Stateful HTTP/2 simulation test
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker l7 \
   --target 10.0.0.50 \
   --port 443 \
@@ -121,7 +121,7 @@ The build produces the following native binaries under `build/`:
   --confirm
 
 # Multi-step stateful user scenario execution
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker scenario \
   --scenario-file docs/scenario_web_mobile.yaml \
   --confirm
@@ -133,7 +133,7 @@ Scale workloads horizontally across multiple baremetal servers:
 
 #### **Master Node (`samurai_master`):**
 ```bash
-./build/ddos_samurai/control/daemon/samurai_master \
+./build/samurai/control/daemon/samurai_master \
   --control-listen tcp://0.0.0.0:5099 \
   --api-listen 0.0.0.0:8089 \
   --target 10.0.0.50 \
@@ -146,7 +146,7 @@ Scale workloads horizontally across multiple baremetal servers:
 #### **Worker Node (`samurai_slave`):**
 Run on each agent/generator machine:
 ```bash
-./build/ddos_samurai/control/daemon/samurai_slave \
+./build/samurai/control/daemon/samurai_slave \
   --control-endpoints tcp://<MASTER_IP>:5099 \
   --worker afxdp \
   --interface eth0
@@ -181,13 +181,13 @@ Run the built-in C++ validation binaries to verify subsystems in isolated enviro
 
 ```bash
 # Verify Distributed Control Plane and RPC wire protocol
-./build/ddos_samurai/control/samurai_control_selftest
+./build/samurai/control/samurai_control_selftest
 
 # Verify Stateful L7 Engine and Protocol Bridges
-./build/ddos_samurai/l7_emu_native/samurai_l7_selftest
+./build/samurai/l7_emu_native/samurai_l7_selftest
 
 # Verify Scenario Engine and SLA Verification
-./build/ddos_samurai/scenario_engine_native/samurai_scenario_engine_selftest
+./build/samurai/scenario_engine_native/samurai_scenario_engine_selftest
 ```
 
 ---

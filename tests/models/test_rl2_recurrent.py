@@ -13,7 +13,7 @@ import json
 import numpy as np
 import pytest
 
-from ddos_samurai.models.rl import PolicyArtifact, build_dataset, load_policy, save_policy
+from samurai.models.rl import PolicyArtifact, build_dataset, load_policy, save_policy
 
 
 def _golden_recurrent() -> PolicyArtifact:
@@ -163,8 +163,8 @@ def _corpus(path, *, episodes=8, windows=10):
 
 def test_train_rl2_exports_and_evaluates(tmp_path):
     pytest.importorskip("torch")
-    from ddos_samurai.models.rl.rl2 import RL2Config, train_rl2
-    from ddos_samurai.models.rl.ope import FQEConfig, evaluate_policy
+    from samurai.models.rl.rl2 import RL2Config, train_rl2
+    from samurai.models.rl.ope import FQEConfig, evaluate_policy
 
     ds = build_dataset(_corpus(tmp_path / "c.ndjson"))
     assert not ds.block_present() and not ds.ban_present()  # base state for RL²
@@ -193,8 +193,8 @@ def test_train_rl2_exports_and_evaluates(tmp_path):
 
 def test_train_rl2_rejects_block_dataset(tmp_path):
     pytest.importorskip("torch")
-    from ddos_samurai.models.rl.config import RLConfig
-    from ddos_samurai.models.rl.rl2 import train_rl2
+    from samurai.models.rl.config import RLConfig
+    from samurai.models.rl.rl2 import train_rl2
 
     cfg = RLConfig(variant_block_features=True)
     ds = build_dataset(_corpus(tmp_path / "c.ndjson"), cfg)

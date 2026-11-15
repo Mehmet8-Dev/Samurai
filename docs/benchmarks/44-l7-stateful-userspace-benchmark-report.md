@@ -4,7 +4,7 @@
 * **Test Environment:** Linux x86_64 (AMD Ryzen 5 5600H, 12 Logical Cores)
 * **Architectural Scope:** HTTP/1.1 (H1), HTTP/2 (H2 h2c/cleartext), HTTP/3 (H3 QUIC)
 * **Dataplane Architecture:** TRex ASTF-aligned Shared-Nothing multi-driver userspace stack (`ShardedFastpathDriver` / `TcpDataplaneCore` + `InMemoryShardPeer` + native `ngtcp2` + `nghttp3`) — Zero kernel TCP client sockets, zero external packet forwarding (In-Memory / Pure C++ loopback).
-* **Harness Binary:** [`ddos_samurai/zmq/daemon/bench_l7_stateful_userspace.cpp`](../../ddos_samurai/zmq/daemon/bench_l7_stateful_userspace.cpp)
+* **Harness Binary:** [`samurai/zmq/daemon/bench_l7_stateful_userspace.cpp`](../../samurai/zmq/daemon/bench_l7_stateful_userspace.cpp)
 * **Automation Harness:** [`tests/bench_l7_stateful_userspace.sh`](../../tests/bench_l7_stateful_userspace.sh)
 * **Raw Metric Data:** [`docs/benchmarks/l7_stateful_benchmark_results.json`](l7_stateful_benchmark_results.json)
 

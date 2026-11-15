@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 
-from ddos_samurai.models.rl import build_variant_prior, fingerprint_corpus
-from ddos_samurai.models.rl.schemas import UNKNOWN
+from samurai.models.rl import build_variant_prior, fingerprint_corpus
+from samurai.models.rl.schemas import UNKNOWN
 
 # Reuse the synthetic-corpus builders from the fingerprint test.
 from tests.models.test_rl_fingerprint import _rec, _fully_blocked, _write

@@ -62,7 +62,7 @@ jobs:
 
       - name: Build Release Binaries via CMake
         run: |
-          cmake -B build -S ddos_samurai -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
 
       - name: Certify Release via Selftests
@@ -88,7 +88,7 @@ jobs:
 
       - name: Build Docker Production Image
         run: |
-          docker build -f Dockerfile -t "ddos-samurai:${{ needs.validate-tag.outputs.resolved_tag }}" .
+          docker build -f Dockerfile -t "samurai:${{ needs.validate-tag.outputs.resolved_tag }}" .
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

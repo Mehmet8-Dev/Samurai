@@ -83,7 +83,7 @@ def run_test_file(test_file):
 def main():
     """Master test runner"""
     
-    print_header("🔍 DDOSAMURAI COMPREHENSIVE TEST SUITE 🔍")
+    print_header("🔍 SAMURAI COMPREHENSIVE TEST SUITE 🔍")
     
     print(f"{Colors.BOLD}Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Colors.ENDC}")
     print(f"{Colors.BOLD}Python version: {sys.version.split()[0]}{Colors.ENDC}")

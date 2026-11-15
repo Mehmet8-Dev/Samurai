@@ -40,7 +40,7 @@ Samurai includes native C++ leader election algorithms for multi-master clusters
 
 ### 3.1 File-Lock Lease Mode (Shared Storage / Single Host)
 ```bash
-./build/ddos_samurai/control/daemon/samurai_master \
+./build/samurai/control/daemon/samurai_master \
   --control-listen tcp://0.0.0.0:5099 \
   --ha-mode file-lock \
   --ha-node-id master-1 \
@@ -51,7 +51,7 @@ Samurai includes native C++ leader election algorithms for multi-master clusters
 
 ### 3.2 Static Peer Consensus Mode (Explicit Master Peers)
 ```bash
-./build/ddos_samurai/control/daemon/samurai_master \
+./build/samurai/control/daemon/samurai_master \
   --control-listen tcp://0.0.0.0:5099 \
   --ha-mode static \
   --ha-node-id master-1 \

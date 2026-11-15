@@ -1,6 +1,6 @@
 # Sıfır CPU Bağımlı Persistent Kernel Veri Düzlemi (Persistent Dataplane Kernel) Mimarisi
 
-**Proje:** DDoSamurai Yüksek Başarımlı Paket Motoru (Zero-CPU Persistent Dataplane)  
+**Proje:** Samurai Yüksek Başarımlı Paket Motoru (Zero-CPU Persistent Dataplane)  
 **Yazar:** Antigravity Sistem Araştırma ve Çekirdek Mühendisliği  
 **Tarih:** 31 Ekim 2026  
 **Hedef Donanım:** NVIDIA GeForce / AMD Ryzen Platformu  
@@ -16,7 +16,7 @@ Geleneksel CUDA paket motorlarında her bir paket grubu (batch) için host taraf
 3. **Akış Yönetimi ve Hız Kontrolü (Pacing/Rate Limiting):** Saniyede milyonlarca paketin hassas zaman damgaları ve kota (quota) refilleri ile basılması CPU tarafında jitter oluşturur.
 
 ### Çözüm: Persistent Dataplane Kernel
-DDoSamurai, GPU Streaming Multiprocessor'ları (SM) üzerinde sürekli çalışan tek bir **Persistent Kernel (`persistent_dataplane_kernel`)** döngüsü kurmuştur:
+Samurai, GPU Streaming Multiprocessor'ları (SM) üzerinde sürekli çalışan tek bir **Persistent Kernel (`persistent_dataplane_kernel`)** döngüsü kurmuştur:
 * Kernel sistem başladığında **bir kez başlatılır** ve arka planda GPU üzerinde sonsuz döngüde çalışır.
 * Akışlar (streams), kotalar (quotas), TCP/UDP durum makineleri ve sahte IP havuzları GPU cihaz belleğinde saklanır.
 * Paketler doğrudan Vulkan BAR1 GDDR6 adreslerine yazılır.

@@ -21,7 +21,7 @@ This guide covers common diagnostic procedures, error symptoms, and resolution s
 - **Root Cause:** Creating raw sockets and XDP XSK bindings requires `CAP_NET_RAW` and `CAP_NET_ADMIN` privileges.
 - **Remediation:** Execute via `sudo` or grant persistent Linux capabilities to the compiled binary:
   ```bash
-  sudo setcap cap_net_raw,cap_net_admin=eip ./build/ddos_samurai/zmq/daemon/samurai_afxdp_worker
+  sudo setcap cap_net_raw,cap_net_admin=eip ./build/samurai/zmq/daemon/samurai_afxdp_worker
   ```
 
 ---

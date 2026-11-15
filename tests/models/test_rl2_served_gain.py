@@ -27,9 +27,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from ddos_samurai.models.rl import build_dataset, load_policy, save_policy
-from ddos_samurai.models.rl.rl2 import RL2Config, train_rl2
-from ddos_samurai.models.rl.train import IQLConfig, train_iql
+from samurai.models.rl import build_dataset, load_policy, save_policy
+from samurai.models.rl.rl2 import RL2Config, train_rl2
+from samurai.models.rl.train import IQLConfig, train_iql
 
 MIN_RPS, MAX_RPS = 50.0, 500.0
 C_LO, C_HI = 140.0, 360.0

@@ -1,6 +1,6 @@
 # 07 - Target Safety & RFC Compliance Verification
 
-Samurai enforces strict safety boundaries (`ddos_samurai/core/target_safety.cpp` and `ddos_samurai/cli/validation.cpp`) to prevent accidental transmission to unauthorized subnets or critical public infrastructure.
+Samurai enforces strict safety boundaries (`samurai/core/target_safety.cpp` and `samurai/cli/validation.cpp`) to prevent accidental transmission to unauthorized subnets or critical public infrastructure.
 
 ---
 
@@ -19,13 +19,13 @@ Samurai enforces strict safety boundaries (`ddos_samurai/core/target_safety.cpp`
 
 ```bash
 # Allow tests only against an explicitly defined lab subnet
-./build/ddos_samurai/cli/samurai --allow-target 192.168.10.0/24 ...
+./build/samurai/cli/samurai --allow-target 192.168.10.0/24 ...
 
 # Explicitly ban a production management subnet
-./build/ddos_samurai/cli/samurai --safety-global-deny-target 10.0.0.0/24 ...
+./build/samurai/cli/samurai --safety-global-deny-target 10.0.0.0/24 ...
 
 # Authorized public target testing
-./build/ddos_samurai/cli/samurai --allow-public-target --target 203.0.113.10 ...
+./build/samurai/cli/samurai --allow-public-target --target 203.0.113.10 ...
 ```
 
 ---
@@ -36,8 +36,8 @@ To verify the mathematical and structural correctness of synthesized packet head
 
 ```bash
 # Verify compliant RFC packet structures
-./build/ddos_samurai/cli/samurai --rfc-suite positive
+./build/samurai/cli/samurai --rfc-suite positive
 
 # Verify packet filters and anomaly rejection
-./build/ddos_samurai/cli/samurai --rfc-suite negative
+./build/samurai/cli/samurai --rfc-suite negative
 ```

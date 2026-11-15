@@ -86,7 +86,7 @@ $$\text{Coefficient of Variation (CV)} = \frac{\sigma}{\mu} = \frac{0.141}{6.332
 ## 4. Test Suite Verification
 
 - **Pytest Suite:** `pytest tests/test_distributed_failover_chaos.py -v` (3 passed in 26.96s)
-- **C++ Native Selftest:** `./build/ddos_samurai --selftest` (100% passed)
+- **C++ Native Selftest:** `./build/samurai --selftest` (100% passed)
 
 ---
 

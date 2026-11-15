@@ -1,4 +1,4 @@
-# DDoSamurai tcpdp 1,000,000 (1M) Active TCP Flows Benchmark Report
+# Samurai tcpdp 1,000,000 (1M) Active TCP Flows Benchmark Report
 
 - **Date:** 2026-10-17 14:57:53 UTC
 - **Status:** **PASSED**

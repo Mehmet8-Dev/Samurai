@@ -1,4 +1,4 @@
-"""Pure-Python LeverShield mirror (ddos_samurai/models/rl/shield.py).
+"""Pure-Python LeverShield mirror (samurai/models/rl/shield.py).
 
 These lock the port to the native control/lever_shield.hpp Govern/Blocked logic and
 the dataset block-feature encoding it reads at OPE time. Torch-free on purpose — the
@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from ddos_samurai.models.rl import LeverShield
-from ddos_samurai.models.rl.schemas import UNKNOWN
-from ddos_samurai.models.rl.shield import best_success_from_states, govern_batch
+from samurai.models.rl import LeverShield
+from samurai.models.rl.schemas import UNKNOWN
+from samurai.models.rl.shield import best_success_from_states, govern_batch
 
 
 def _shield(best, floor=0.10):

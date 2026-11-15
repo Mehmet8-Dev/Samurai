@@ -90,13 +90,13 @@ echo ""; echo ">>>>>> RETRAIN on the WHOLE accumulated pool (data/rl-corpus/*.nd
 "$PY" - "$ART" <<'PYEOF'
 import sys, glob
 import numpy as np
-from ddos_samurai.models.rl import build_dataset, save_policy
-from ddos_samurai.models.rl.action_spec import MAHORAGA
-from ddos_samurai.models.rl.reward import EffectiveThroughputReward
-from ddos_samurai.models.rl.config import RLConfig
-from ddos_samurai.models.rl.rl2 import train_rl2, RL2Config
-from ddos_samurai.models.rl.train import train_iql, IQLConfig
-from ddos_samurai.models.rl.ope import evaluate_policy
+from samurai.models.rl import build_dataset, save_policy
+from samurai.models.rl.action_spec import MAHORAGA
+from samurai.models.rl.reward import EffectiveThroughputReward
+from samurai.models.rl.config import RLConfig
+from samurai.models.rl.rl2 import train_rl2, RL2Config
+from samurai.models.rl.train import train_iql, IQLConfig
+from samurai.models.rl.ope import evaluate_policy
 
 art = sys.argv[1]
 files = sorted(glob.glob("data/rl-corpus/*.ndjson"))

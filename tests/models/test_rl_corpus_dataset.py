@@ -13,9 +13,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ddos_samurai.models.rl import RLConfig, build_dataset, load_transitions
-from ddos_samurai.models.rl.reward import SloProgressReward, slo_overshoot
-from ddos_samurai.models.rl.schemas import DefenseSignals, RawState, SloThresholds, Transition
+from samurai.models.rl import RLConfig, build_dataset, load_transitions
+from samurai.models.rl.reward import SloProgressReward, slo_overshoot
+from samurai.models.rl.schemas import DefenseSignals, RawState, SloThresholds, Transition
 
 
 def _rec(
@@ -147,7 +147,7 @@ def test_reward_rewards_healthy_progress_and_penalizes_breach(tmp_path):
 
 
 def test_effective_throughput_reward_prefers_served_over_rejected_load():
-    from ddos_samurai.models.rl import EffectiveThroughputReward
+    from samurai.models.rl import EffectiveThroughputReward
 
     cfg = RLConfig()
     reward = EffectiveThroughputReward(cfg)
@@ -177,7 +177,7 @@ def test_effective_throughput_reward_prefers_served_over_rejected_load():
 
 
 def test_effective_throughput_served_counts_raw_2xx_not_rps_times_ratio():
-    from ddos_samurai.models.rl import EffectiveThroughputReward
+    from samurai.models.rl import EffectiveThroughputReward
 
     reward = EffectiveThroughputReward(RLConfig())
     # Both windows HONOR the same load (100 2xx), but the dropper offered 10x the
@@ -199,7 +199,7 @@ def test_effective_throughput_served_counts_raw_2xx_not_rps_times_ratio():
 
 
 def test_effective_throughput_penalizes_flow_level_defense():
-    from ddos_samurai.models.rl import EffectiveThroughputReward
+    from samurai.models.rl import EffectiveThroughputReward
 
     # Identical HTTP status breakdown (200 2xx, 50 4xx), but the second window is
     # hit by a connection-level IPS: 80% of connections dropped + 10% H2 resets.

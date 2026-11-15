@@ -1,6 +1,6 @@
 # Tüketici Sınıfı GPU (GeForce) Otonom Bare-Metal PMD ve GPU-Initiated Doorbell Mimarisi
 
-**Proje:** DDoSamurai Yüksek Başarımlı Paket Motoru (Autonomous Bare-Metal GPU PMD)  
+**Proje:** Samurai Yüksek Başarımlı Paket Motoru (Autonomous Bare-Metal GPU PMD)  
 **Yazar:** Antigravity Sistem Araştırma ve Çekirdek Mühendisliği  
 **Tarih:** 31 Ekim 2026  
 **Hedef Donanım:** Tüketici Sınıfı NVIDIA GeForce GPU (GTX 1650 / RTX Serisi) + Standart PCIe NIC (Realtek / Intel / Mellanox)  
@@ -31,8 +31,8 @@ CUDA GPU (GDDR6)           CPU lcore (DRAM / L3)               PCIe NIC (MMIO)
 2. 40 Gbps / 100 Gbps hat hızlarında 64 baytlık paket akışını doyurmak için gereken 60–148 Mpps paket oranı, 4 ila 8 adet izole CPU çekirdeğini (lcore) tamamen tüketir.
 3. Kurumsal dünyada NVIDIA, bu sorunu **DOCA GPUNetIO** adını verdiği donanımsal mekanizma ile çözmektedir; ancak DOCA GPUNetIO, kurumsal BlueField DPU ve ConnectX ağ kartları ile A100/H100 kurumsal GPU'larına yazılımsal ve donanımsal lisans anahtarlarıyla kilitlenmiştir. Tüketici sınıfı GeForce GTX/RTX kartlarda çalıştırılamaz.
 
-### DDoSamurai Çözümü: Bare-Metal GPU PMD ve GPU-Initiated Doorbell
-DDoSamurai, harici bir CPU DPDK işlemcisine veya kurumsal DOCA kütüphanesine ihtiyaç duymadan;
+### Samurai Çözümü: Bare-Metal GPU PMD ve GPU-Initiated Doorbell
+Samurai, harici bir CPU DPDK işlemcisine veya kurumsal DOCA kütüphanesine ihtiyaç duymadan;
 * Tüketici sınıfı GeForce GPU'ların doğrudan ağ kartı fiziksel PCIe MMIO BAR yazmaçlarına erişmesini sağlar (`cudaHostRegisterIoMemory`).
 * Donanım TX descriptor'larını GPU warp iş parçacıklarının doğrudan oluşturmasını sağlar.
 * Doorbell tıklamasını (`TPPoll`, `TDT`, `BlueFlame`) GPU içinden tek bir PCIe `Memory Write (MWr)` TLP paketi olarak ağ kartına basar.
@@ -65,7 +65,7 @@ Tüketici sınıfı GeForce sürücülerinde ve Linux çekirdeğinde sysfs üzer
 Bu sayede GPU çekirdeği (CUDA kernel), `dev_nic_mmio_base + offset` adresine doğrudan bir `st.global.u32` (veya `st.global.u8`) talimatı vererek PCIe köprüsü üzerinden ağ kartının yazmaçına `Memory Write (MWr)` TLP paketi gönderebilir.
 
 ```cpp
-// ddos_samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh
+// samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh
 __device__ inline void device_mmio_write8(volatile uint8_t* addr, uint8_t val) {
   __threadfence_system(); // Sistem genelinde (PCIe Root Complex) bellek çiti
   *addr = val;
@@ -81,7 +81,7 @@ __device__ inline void device_mmio_write32(volatile uint32_t* addr, uint32_t val
 
 ## 3. Çoklu Satıcı (Multi-Vendor) TX Descriptor Mimarisi
 
-Farklı ağ kartı üreticileri (Realtek, Intel, Mellanox) DMA iletimi için bellekte 16 baytlık veya 64 baytlık özel tanımlayıcı (descriptor) halkaları kullanır. DDoSamurai Bare-Metal GPU PMD, bu yapıları doğrudan GPU bellek modelinde tanımlamıştır:
+Farklı ağ kartı üreticileri (Realtek, Intel, Mellanox) DMA iletimi için bellekte 16 baytlık veya 64 baytlık özel tanımlayıcı (descriptor) halkaları kullanır. Samurai Bare-Metal GPU PMD, bu yapıları doğrudan GPU bellek modelinde tanımlamıştır:
 
 ### 1. Realtek RTL8168/RTL8169/RTL8411 (`Rtl8169TxDesc`)
 16 baytlık donanım TX tanımlayıcısı:
@@ -120,10 +120,10 @@ Gelişmiş 16 baytlık iletim tanımlayıcısı:
 
 ## 4. GPU-Side Completion Reaper & Backpressure Mekanizması
 
-Halka yapısında paket iletimi gerçekleştikçe ağ kartı DMA işlemi tamamlanan descriptor'ların sahiplik bitini (`DescOwn` veya `DD - Descriptor Done`) temizler. Geleneksel sistemlerde bunu CPU yoklar (polling). DDoSamurai Bare-Metal GPU PMD'de ise bu işlem **tamamen GPU warp seviyesinde** otonom yapılır:
+Halka yapısında paket iletimi gerçekleştikçe ağ kartı DMA işlemi tamamlanan descriptor'ların sahiplik bitini (`DescOwn` veya `DD - Descriptor Done`) temizler. Geleneksel sistemlerde bunu CPU yoklar (polling). Samurai Bare-Metal GPU PMD'de ise bu işlem **tamamen GPU warp seviyesinde** otonom yapılır:
 
 ```cpp
-// ddos_samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh
+// samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh
 __device__ inline uint32_t device_reap_nic_tx_descriptor(
     GeforceP2pGpuDeviceTxq* txq,
     uint32_t max_to_reap) {
@@ -157,4 +157,4 @@ Live sistemde (AMD Ryzen 5 5600H + NVIDIA GeForce GTX 1650 + Realtek Gigabit RTL
 | **Ring-Wrap Otonom Reaping** | 32 Tamamlanma | `gpu_reaped_completions == 32u`, 0 Backpressure Drop |
 | **CPU Müdahalesi** | %0 (Sıfır Thread) | CPU çekirdekleri tamamen boştadır |
 
-Bu mimari ile DDoSamurai, kurumsal Mellanox DOCA lisanslarına ihtiyaç kalmaksızın tüketici sınıfı donanımlarda telekom ve yük testi yapabilecek tam otonom bir veri düzlemine kavuşmuştur.
+Bu mimari ile Samurai, kurumsal Mellanox DOCA lisanslarına ihtiyaç kalmaksızın tüketici sınıfı donanımlarda telekom ve yük testi yapabilecek tam otonom bir veri düzlemine kavuşmuştur.

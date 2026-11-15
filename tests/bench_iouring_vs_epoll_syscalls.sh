@@ -2,8 +2,8 @@
 # ==============================================================================
 # TASK-TEST-L3-01: Multi-Reactor io_uring vs epoll 100K Request Syscall & Latency Benchmark
 #
-# Target Code: ddos_samurai/l7_emu_native/io_uring_compat.hpp
-#              ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp
+# Target Code: samurai/l7_emu_native/io_uring_compat.hpp
+#              samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp
 #
 # Task Description:
 #   Execute 100,000 HTTP/1.1 requests under concurrency=32 against both
@@ -51,7 +51,7 @@ echo "==========================================================================
 # 1. Ensure binary is built
 if [ ! -f "$BIN_PATH" ]; then
   echo "[+] Building test_kernel_threaded_io_uring binary..."
-  cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/ddos_samurai"
+  cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/samurai"
   cmake --build "$BUILD_DIR" --target test_kernel_threaded_io_uring -j4
 fi
 

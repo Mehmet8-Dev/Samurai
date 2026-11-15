@@ -5,9 +5,9 @@
 * **Task / Issue Tracking:** `TASK-TEST-L3-02` ([test_task.md](file://test_task.md#L182-L188), [SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L99-L104))
 * **Architectural Layer:** Layer 3 (L7 Protocol Emulation & Transport Cryptographic Offload Architecture)
 * **Affected Files:**
-  * [`ddos_samurai/l7_emu_native/test_kernel_threaded_h2.cpp`](file://ddos_samurai/l7_emu_native/test_kernel_threaded_h2.cpp)
-  * [`ddos_samurai/l7_emu_native/test_h2_tls_server.py`](file://ddos_samurai/l7_emu_native/test_h2_tls_server.py)
-  * [`ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh`](file://ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh)
+  * [`samurai/l7_emu_native/test_kernel_threaded_h2.cpp`](file://samurai/l7_emu_native/test_kernel_threaded_h2.cpp)
+  * [`samurai/l7_emu_native/test_h2_tls_server.py`](file://samurai/l7_emu_native/test_h2_tls_server.py)
+  * [`samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh`](file://samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh)
   * [`tests/bench_h2_ktls_vs_memory_bio.sh`](file://tests/bench_h2_ktls_vs_memory_bio.sh)
   * [`tests/test_h2_ktls_vs_memory_bio.py`](file://tests/test_h2_ktls_vs_memory_bio.py)
   * [`reports/benchmarks/task_l3_02/report.md`](file://reports/benchmarks/task_l3_02/report.md)
@@ -132,11 +132,11 @@ To reproduce these benchmark results on any Linux system with kTLS support:
 
 ```bash
 # 1. Compile test binaries
-cmake -B build -S ddos_samurai
+cmake -B build -S samurai
 cmake --build build --target test_kernel_threaded_h2 -j4
 
 # 2. Run full H2 regression matrix (6/6 tests)
-bash ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh
+bash samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh
 
 # 3. Run automated multi-run benchmark harness
 bash tests/bench_h2_ktls_vs_memory_bio.sh

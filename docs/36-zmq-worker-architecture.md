@@ -8,12 +8,12 @@ This document outlines the ZeroMQ (ZMQ) inter-process communication (IPC) and cl
 
 ## 1. Architectural Boundaries
 
-1. **Native Supervisor Layer (`ddos_samurai/orchestrator/supervisor.cpp`):**
+1. **Native Supervisor Layer (`samurai/orchestrator/supervisor.cpp`):**
    - Launched by CLI or Slave daemons.
    - Allocates dedicated Unix IPC sockets (`ipc:///tmp/samurai_jobs_*` and `ipc:///tmp/samurai_events_*`).
    - Dispatches `START_JOB`, `STOP_JOB`, and `SHUTDOWN` control frames.
 
-2. **Heterogeneous Native Dataplane Workers (`ddos_samurai/zmq/daemon/`):**
+2. **Heterogeneous Native Dataplane Workers (`samurai/zmq/daemon/`):**
    - `samurai_cpu_worker`
    - `samurai_afxdp_worker`
    - `samurai_dpdk_worker`
@@ -23,7 +23,7 @@ This document outlines the ZeroMQ (ZMQ) inter-process communication (IPC) and cl
    - `samurai_scenario_worker`
    - `samurai_defense_worker`
 
-3. **Cluster Distributed Control Plane (`ddos_samurai/control/`):**
+3. **Cluster Distributed Control Plane (`samurai/control/`):**
    - Operates between `samurai_master` (ZMQ ROUTER) and `samurai_slave` (ZMQ DEALER) over encrypted TCP channels (`tcp://<MASTER_IP>:5099`).
 
 ---

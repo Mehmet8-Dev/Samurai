@@ -22,8 +22,8 @@ import pytest
 
 torch = pytest.importorskip("torch")  # training needs torch; serving/reload does not
 
-from ddos_samurai.models.rl import build_dataset, load_policy, save_policy
-from ddos_samurai.models.rl.rl2 import RL2Config, train_rl2
+from samurai.models.rl import build_dataset, load_policy, save_policy
+from samurai.models.rl.rl2 import RL2Config, train_rl2
 
 
 def _write_corpus(path, *, episodes=24, windows=8, seed=0):

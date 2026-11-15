@@ -36,14 +36,14 @@ jobs:
           import subprocess
           import sys
 
-          init_path = pathlib.Path("ddos_samurai/__init__.py")
+          init_path = pathlib.Path("samurai/__init__.py")
           if not init_path.exists():
-              print("ddos_samurai/__init__.py does not exist")
+              print("samurai/__init__.py does not exist")
               sys.exit(1)
           content = init_path.read_text(encoding="utf-8")
           match = re.search(r'^__version__\s*=\s*"([^"]+)"', content, flags=re.MULTILINE)
           if not match:
-              print("Could not parse __version__ from ddos_samurai/__init__.py")
+              print("Could not parse __version__ from samurai/__init__.py")
               sys.exit(1)
 
           version = str(match.group(1)).strip()
@@ -64,7 +64,7 @@ jobs:
           if event_name == "pull_request" and base_ref:
               try:
                   base_content = subprocess.check_output(
-                      ["git", "show", f"origin/{base_ref}:ddos_samurai/__init__.py"],
+                      ["git", "show", f"origin/{base_ref}:samurai/__init__.py"],
                       text=True,
                       stderr=subprocess.DEVNULL,
                   )
@@ -115,12 +115,12 @@ jobs:
 
       - name: Configure and build native targets via CMake
         run: |
-          cmake -B build -S ddos_samurai -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
 
       - name: Build AF_XDP and pacing extensions
         run: |
-          make -C ddos_samurai all || make -C ddos_samurai xdp pacing
+          make -C samurai all || make -C samurai xdp pacing
 
       - name: Run Core & Control Selftests
         run: |
@@ -142,11 +142,11 @@ jobs:
 
       - name: Run E2E HTTP/2 Matrix (io_uring, epoll, TLS, kTLS)
         run: |
-          ./ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh ./build/l7_emu_native/test_kernel_threaded_h2
+          ./samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh ./build/l7_emu_native/test_kernel_threaded_h2
 
       - name: Run E2E HTTP/3 QUIC (Threaded & Serial)
         run: |
-          ./ddos_samurai/l7_emu_native/run_kernel_threaded_h3_e2e.sh ./build/l7_emu_native/test_kernel_threaded_h3
+          ./samurai/l7_emu_native/run_kernel_threaded_h3_e2e.sh ./build/l7_emu_native/test_kernel_threaded_h3
 
       - name: Run CLI RFC Benchmark Suite
         run: |
@@ -188,9 +188,9 @@ jobs:
 
       - name: Build native layer required by Python tests
         run: |
-          cmake -B build -S ddos_samurai -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
-          make -C ddos_samurai all || make -C ddos_samurai xdp pacing
+          make -C samurai all || make -C samurai xdp pacing
 
       - name: Install Python package in editable mode
         run: |
@@ -218,13 +218,13 @@ jobs:
 
       - name: Verify Helm chart linting
         run: |
-          helm lint deploy/helm/ddos-samurai
+          helm lint deploy/helm/samurai
 
       - name: Verify Helm template generation
         run: |
-          helm template test-release deploy/helm/ddos-samurai > /tmp/samurai-rendered.yaml
+          helm template test-release deploy/helm/samurai > /tmp/samurai-rendered.yaml
           test -s /tmp/samurai-rendered.yaml
-          helm template test-release deploy/helm/ddos-samurai -f deploy/helm/ddos-samurai/values-prod.yaml > /tmp/samurai-prod-rendered.yaml
+          helm template test-release deploy/helm/samurai -f deploy/helm/samurai/values-prod.yaml > /tmp/samurai-prod-rendered.yaml
           test -s /tmp/samurai-prod-rendered.yaml
 
       - name: Validate distributed compose file
@@ -234,9 +234,9 @@ jobs:
 
       - name: Build Native Docker image
         run: |
-          docker build -f Dockerfile -t ddos-samurai:ci .
+          docker build -f Dockerfile -t samurai:ci .
 
       - name: Container Smoke Check (samurai_master help)
         run: |
-          docker run --rm ddos-samurai:ci samurai_master --help
-          docker run --rm ddos-samurai:ci samurai_slave --help
+          docker run --rm samurai:ci samurai_master --help
+          docker run --rm samurai:ci samurai_slave --help

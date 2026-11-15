@@ -8,12 +8,12 @@ Samurai (Codename: **Shogun**) is an enterprise-grade, high-performance network 
 
 ## 1. Architectural Layers
 
-### A) Native CLI Layer (`ddos_samurai/cli/`)
+### A) Native CLI Layer (`samurai/cli/`)
 - **Binary:** `samurai`
 - **Source Modules:** `main.cpp`, `args.cpp`, `validation.cpp`, `profiles.cpp`, `kpi_gate.cpp`, `reporting.cpp`, `rfc_suite.cpp`
 - **Responsibilities:** Command-line argument parsing, security boundaries and allowlists (`TargetSafety`), profile compilation, RFC suite execution, and local job spawning via the ZMQ Supervisor engine.
 
-### B) Distributed Control Plane (`ddos_samurai/control/`)
+### B) Distributed Control Plane (`samurai/control/`)
 - **Master Daemon:** `samurai_master` (`daemon/master_main.cpp`)
 - **Slave Daemon:** `samurai_slave` (`daemon/slave_main.cpp`)
 - **Interconnect:** Asynchronous ZMQ ROUTER / DEALER RPC transport (`control_server.cpp`, `control_client.cpp`, `control_wire.hpp`).
@@ -25,11 +25,11 @@ Samurai (Codename: **Shogun**) is an enterprise-grade, high-performance network 
   - `control_auth.cpp` & `jwt.cpp`: HMAC-SHA256 JWT tokens and Role-Based Access Control (RBAC).
   - `multimaster.cpp`: Inter-region multi-master cluster federation.
 
-### C) Native Orchestrator & Supervisor (`ddos_samurai/orchestrator/`)
+### C) Native Orchestrator & Supervisor (`samurai/orchestrator/`)
 - **Modules:** `supervisor.cpp`, `worker_registry.hpp`
 - **Responsibilities:** Receives `JobOptions` envelopes from Master, Slave, or CLI, creates dedicated Unix IPC channels (`ipc:///tmp/samurai_jobs_*`), launches native worker processes via `fork()` / `execvp()`, collects telemetry snapshots, and ensures clean termination.
 
-### D) Heterogeneous Native Dataplane Workers (`ddos_samurai/zmq/daemon/`)
+### D) Heterogeneous Native Dataplane Workers (`samurai/zmq/daemon/`)
 - `samurai_gpu_worker`: NVIDIA CUDA warp-parallel packet generator (`kernels_l4.cuh`).
 - `samurai_doca_worker`: NVIDIA BlueField DPU & DOCA GPUNetIO direct memory dataplane.
 - `samurai_afxdp_worker`: Linux kernel-bypass AF_XDP zero-copy UMEM socket engine.
@@ -40,11 +40,11 @@ Samurai (Codename: **Shogun**) is an enterprise-grade, high-performance network 
 - `samurai_cpu_worker`: Optimized raw socket and packet ring fallback engine.
 
 ### E) Hardware & Protocol Acceleration Engines
-- `ddos_samurai/l4/`: `tcp_dataplane_core.cpp` (64-shard lock-striped userspace TCP stack).
-- `ddos_samurai/l7_emu_native/`: `engine.cpp`, `bridge.cpp`, `custom_quic_stack/`, `l2l3_stack/`.
-- `ddos_samurai/scenario_engine_native/`: `compiler.cpp`, `scheduler.cpp`, `sla.cpp`.
-- `ddos_samurai/cpu_native/`: `engine.cpp`, `packets.cpp`, `spoofing.cpp`, `amp.cpp`.
-- `ddos_samurai/core/`: `target_safety.cpp`, `logging.hpp`, `json.hpp`.
+- `samurai/l4/`: `tcp_dataplane_core.cpp` (64-shard lock-striped userspace TCP stack).
+- `samurai/l7_emu_native/`: `engine.cpp`, `bridge.cpp`, `custom_quic_stack/`, `l2l3_stack/`.
+- `samurai/scenario_engine_native/`: `compiler.cpp`, `scheduler.cpp`, `sla.cpp`.
+- `samurai/cpu_native/`: `engine.cpp`, `packets.cpp`, `spoofing.cpp`, `amp.cpp`.
+- `samurai/core/`: `target_safety.cpp`, `logging.hpp`, `json.hpp`.
 
 ---
 
@@ -52,7 +52,7 @@ Samurai (Codename: **Shogun**) is an enterprise-grade, high-performance network 
 
 ### 1. Standalone Local Execution
 ```bash
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker <cpu|afxdp|dpdk|gpu|doca|l7|scenario> \
   --target <TARGET_IP> \
   --port 80 \
@@ -63,19 +63,19 @@ Samurai (Codename: **Shogun**) is an enterprise-grade, high-performance network 
 ### 2. Distributed Multi-Node Cluster
 - **Master Node:**
   ```bash
-  ./build/ddos_samurai/control/daemon/samurai_master \
+  ./build/samurai/control/daemon/samurai_master \
     --control-listen tcp://0.0.0.0:5099 \
     --count 100000000 \
     --target 10.0.0.50
   ```
 - **Slave Node:**
   ```bash
-  ./build/ddos_samurai/control/daemon/samurai_slave \
+  ./build/samurai/control/daemon/samurai_slave \
     --control-endpoints <MASTER_IP>:5099 \
     --worker afxdp
   ```
 
 ### 3. Integrated Self-Test Suites
-- `./build/ddos_samurai/control/samurai_control_selftest`
-- `./build/ddos_samurai/l7_emu_native/samurai_l7_selftest`
-- `./build/ddos_samurai/scenario_engine_native/samurai_scenario_engine_selftest`
+- `./build/samurai/control/samurai_control_selftest`
+- `./build/samurai/l7_emu_native/samurai_l7_selftest`
+- `./build/samurai/scenario_engine_native/samurai_scenario_engine_selftest`

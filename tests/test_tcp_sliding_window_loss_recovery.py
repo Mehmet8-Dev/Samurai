@@ -36,7 +36,7 @@ class TestTcpSlidingWindowLossRecovery(unittest.TestCase):
             raise unittest.SkipTest("cmake not found on system")
 
         cls.build_dir.mkdir(parents=True, exist_ok=True)
-        cmake_src = cls.repo_root / "ddos_samurai"
+        cmake_src = cls.repo_root / "samurai"
         config_cmd = [cmake_bin, "-B", str(cls.build_dir), "-S", str(cmake_src)]
         subprocess.run(config_cmd, check=True, capture_output=True, text=True)
 

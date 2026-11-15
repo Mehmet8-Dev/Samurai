@@ -6,7 +6,7 @@ Samurai incorporates cryptographically signed, hardware-bound licensing mechanis
 
 ---
 
-## 1. Native C++ Licensing Subsystem (`ddos_samurai/licensing/`)
+## 1. Native C++ Licensing Subsystem (`samurai/licensing/`)
 
 - **`hwid.cpp` / `hwid.hpp`:** Derives immutable, collision-resistant hardware identifiers (HWID) from CPU model/microcode, primary NIC MAC addresses, and motherboard DMI/SMBIOS serial numbers.
 - **`cache.cpp` / `cache.hpp`:** Manages encrypted local license caching on disk with tamper-detection checksums.
@@ -36,5 +36,5 @@ Samurai incorporates cryptographically signed, hardware-bound licensing mechanis
 The licensing engine includes a dedicated native test binary to verify HWID extraction and cryptographic signature validation:
 
 ```bash
-./build/ddos_samurai/licensing/samurai_licensing_selftest
+./build/samurai/licensing/samurai_licensing_selftest
 ```

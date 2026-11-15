@@ -30,13 +30,13 @@ import sys
 import numpy as np
 
 # Run as a script (sys.path[0] is this file's dir, not the repo root), so add the repo
-# root explicitly to import the ddos_samurai package.
+# root explicitly to import the samurai package.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from ddos_samurai.models.rl import build_dataset
-from ddos_samurai.models.rl.action_spec import MAHORAGA
-from ddos_samurai.models.rl.config import RLConfig
-from ddos_samurai.models.rl.reward import EffectiveThroughputReward
+from samurai.models.rl import build_dataset
+from samurai.models.rl.action_spec import MAHORAGA
+from samurai.models.rl.config import RLConfig
+from samurai.models.rl.reward import EffectiveThroughputReward
 
 ARMS = ("aimd", "ff", "rl2")
 LABEL = {"aimd": "AIMD  ", "ff": "FF    ", "rl2": "RL²   "}

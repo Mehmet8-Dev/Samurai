@@ -5,11 +5,11 @@
 * **Task / Issue Tracking:** `TASK-TEST-L3-01` ([test_task.md](file://test_task.md#L162-L182), [SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L81-L98))
 * **Architectural Layer:** Layer 3 (L7 Protocol Emulation & Transport Reactor Architecture)
 * **Affected Files:**
-  * [`ddos_samurai/l7_emu_native/io_uring_compat.hpp`](file://ddos_samurai/l7_emu_native/io_uring_compat.hpp)
-  * [`ddos_samurai/l7_emu_native/engine_h1_parser.cpp`](file://ddos_samurai/l7_emu_native/engine_h1_parser.cpp)
-  * [`ddos_samurai/l7_emu_native/engine_h1_transport.cpp`](file://ddos_samurai/l7_emu_native/engine_h1_transport.cpp)
-  * [`ddos_samurai/l7_emu_native/engine_h1_request.cpp`](file://ddos_samurai/l7_emu_native/engine_h1_request.cpp)
-  * [`ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp`](file://ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
+  * [`samurai/l7_emu_native/io_uring_compat.hpp`](file://samurai/l7_emu_native/io_uring_compat.hpp)
+  * [`samurai/l7_emu_native/engine_h1_parser.cpp`](file://samurai/l7_emu_native/engine_h1_parser.cpp)
+  * [`samurai/l7_emu_native/engine_h1_transport.cpp`](file://samurai/l7_emu_native/engine_h1_transport.cpp)
+  * [`samurai/l7_emu_native/engine_h1_request.cpp`](file://samurai/l7_emu_native/engine_h1_request.cpp)
+  * [`samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp`](file://samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
   * [`tests/bench_iouring_vs_epoll_syscalls.sh`](file://tests/bench_iouring_vs_epoll_syscalls.sh)
   * [`tests/test_iouring_vs_epoll_syscalls.py`](file://tests/test_iouring_vs_epoll_syscalls.py)
   * [`test_task.md`](file://test_task.md)
@@ -47,26 +47,26 @@ In high-throughput L7 HTTP/1.1 traffic generation and protocol emulation, the tr
 ## 2. Engineering Changes & Implementation Details
 
 ### A. Unified Batch Submission & CQ Reaping in `io_uring_compat.hpp`
-* Implemented [`wait_cqes(min_complete, timeout_ms)`](file://ddos_samurai/l7_emu_native/io_uring_compat.hpp) utilizing kernel `IORING_FEAT_EXT_ARG` with `__kernel_timespec`.
-* Implemented [`submit_and_wait_cqes(min_complete, timeout_ms)`](file://ddos_samurai/l7_emu_native/io_uring_compat.hpp), combining submission queue flushing and completion queue waiting into a single, atomic `io_uring_enter` system call.
+* Implemented [`wait_cqes(min_complete, timeout_ms)`](file://samurai/l7_emu_native/io_uring_compat.hpp) utilizing kernel `IORING_FEAT_EXT_ARG` with `__kernel_timespec`.
+* Implemented [`submit_and_wait_cqes(min_complete, timeout_ms)`](file://samurai/l7_emu_native/io_uring_compat.hpp), combining submission queue flushing and completion queue waiting into a single, atomic `io_uring_enter` system call.
 * Fixed ring queue accounting: `sq_last_submitted` is strictly updated only when `ret > 0`, properly handling partial submissions, errors (`EINTR`), and timeout waiting.
 * Added `prep_uring_nop` for zero-overhead unit introspection.
 
 ### B. High-Efficiency Engine Reactor Pipeline in `engine_h1_parser.cpp`
-* Overhauled [`service_ready_lanes_io_uring`](file://ddos_samurai/l7_emu_native/engine_h1_parser.cpp) to execute ring-level flushing and completion reaping via `submit_and_wait_cqes`.
+* Overhauled [`service_ready_lanes_io_uring`](file://samurai/l7_emu_native/engine_h1_parser.cpp) to execute ring-level flushing and completion reaping via `submit_and_wait_cqes`.
 * Sockets registered with io_uring process full HTTP/1.1 response pipelines without ever invoking `recv()` or `poll()`.
 
 ### C. Socket-Level Latency Optimization in `engine_h1_transport.cpp`
-* Configured `TCP_NODELAY` via `setsockopt` in [`kernel_socket_connect_bridge`](file://ddos_samurai/l7_emu_native/engine_h1_transport.cpp).
+* Configured `TCP_NODELAY` via `setsockopt` in [`kernel_socket_connect_bridge`](file://samurai/l7_emu_native/engine_h1_transport.cpp).
 * Prevents TCP delayed ACK / Nagle interactions on persistent streams, ensuring microsecond response times.
 
 ### D. Zero-Allocation Vector Pre-Sizing in `engine_h1_request.cpp`
-* Pre-allocated vector storage using `.reserve()` across [`build_h1_requests`](file://ddos_samurai/l7_emu_native/engine_h1_request.cpp) and [`bucket_h1_requests_by_shard`](file://ddos_samurai/l7_emu_native/engine_h1_request.cpp).
+* Pre-allocated vector storage using `.reserve()` across [`build_h1_requests`](file://samurai/l7_emu_native/engine_h1_request.cpp) and [`bucket_h1_requests_by_shard`](file://samurai/l7_emu_native/engine_h1_request.cpp).
 * Prevents heap fragmentation and vector reallocations during 100K request burst initialization.
 
 ### E. Multi-Reactor Benchmark & Server Harness in `test_kernel_threaded_io_uring.cpp`
 * Added dedicated unit test `TestIoUringQueueAccounting()` verifying SQ saturation (`get_sqe() == nullptr` when full), submission accounting, NOP completions, zero-submission call, and timeout behavior.
-* Upgraded [`TinyHttpServer`](file://ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp) with persistent HTTP/1.1 keep-alive streaming, `SO_REUSEADDR`, `SO_REUSEPORT`, `TCP_NODELAY`, and coordinated `::shutdown(cfd, SHUT_RDWR)` upon server shutdown.
+* Upgraded [`TinyHttpServer`](file://samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp) with persistent HTTP/1.1 keep-alive streaming, `SO_REUSEADDR`, `SO_REUSEPORT`, `TCP_NODELAY`, and coordinated `::shutdown(cfd, SHUT_RDWR)` upon server shutdown.
 * Added full CLI argument parsing: `--benchmark`, `--requests`, `--concurrency`, `--reactor`, `--server-only`, `--json`.
 
 ### F. Automated Syscall Tracing & Multi-Run Verification Harness

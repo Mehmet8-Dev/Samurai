@@ -1,4 +1,4 @@
-# DDoSamurai Terms of Authorized Use
+# Samurai Terms of Authorized Use
 
 1. This software is permitted only for systems where the operator has explicit written authorization.
 2. Unauthorized traffic generation against public or private infrastructure is prohibited.

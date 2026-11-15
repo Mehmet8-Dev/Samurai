@@ -2,7 +2,7 @@
 
 ![Samurai CLI Execution & Worker Lifecycle](assets/diagrams/samurai_cli_lifecycle.svg)
 
-This document provides a consolidated reference for all CLI command-line flags and all `SAMURAI_*` environment variables used in the Samurai Network Resilience Platform (`./build/ddos_samurai/cli/samurai`).
+This document provides a consolidated reference for all CLI command-line flags and all `SAMURAI_*` environment variables used in the Samurai Network Resilience Platform (`./build/samurai/cli/samurai`).
 
 Scope:
 - Total CLI options: `394`
@@ -13,69 +13,69 @@ Scope:
 Primary entrypoint:
 
 ```bash
-./build/ddos_samurai/cli/samurai [FLAGS]
+./build/samurai/cli/samurai [FLAGS]
 ```
 
 Common command examples:
 
 ```bash
 # Display profiles
-./build/ddos_samurai/cli/samurai --list-profiles
+./build/samurai/cli/samurai --list-profiles
 
 # Dry-run / safe parser and configuration check
-./build/ddos_samurai/cli/samurai --dry-run -t 10.0.0.10 -p 443 --attack-vector http
+./build/samurai/cli/samurai --dry-run -t 10.0.0.10 -p 443 --attack-vector http
 
 # Self-test suite execution
-./build/ddos_samurai/cli/samurai --self-test
+./build/samurai/cli/samurai --self-test
 
 # Standalone live benchmark execution
-./build/ddos_samurai/cli/samurai --role standalone -t 10.0.0.10 -p 443 --attack-vector http --workers 4
+./build/samurai/cli/samurai --role standalone -t 10.0.0.10 -p 443 --attack-vector http --workers 4
 
 # Master node initialization
-./build/ddos_samurai/cli/samurai --role master --control-listen 0.0.0.0:5099 --management-api-enable
+./build/samurai/cli/samurai --role master --control-listen 0.0.0.0:5099 --management-api-enable
 
 # Slave / Worker node connection
-./build/ddos_samurai/cli/samurai --role slave --control-endpoints 10.0.0.5:5099 --cluster-secret xxxx
+./build/samurai/cli/samurai --role slave --control-endpoints 10.0.0.5:5099 --cluster-secret xxxx
 ```
 
 Command catalog by workload profile:
 
 ```bash
 # Layer 4 basic stateful/stateless stream
-./build/ddos_samurai/cli/samurai --attack-vector basic -t 10.0.0.10 -p 443 --protocol tcp --count 100000
+./build/samurai/cli/samurai --attack-vector basic -t 10.0.0.10 -p 443 --protocol tcp --count 100000
 
 # HTTP/1.1 workload
-./build/ddos_samurai/cli/samurai --attack-vector http -t 10.0.0.10 -p 443 --http-scheme https --http-concurrency 200
+./build/samurai/cli/samurai --attack-vector http -t 10.0.0.10 -p 443 --http-scheme https --http-concurrency 200
 
 # HTTP/2 multiplexed stream
-./build/ddos_samurai/cli/samurai --attack-vector http2 -t 10.0.0.10 -p 443 --http2-concurrency 200
+./build/samurai/cli/samurai --attack-vector http2 -t 10.0.0.10 -p 443 --http2-concurrency 200
 
 # WebSocket persistent connection
-./build/ddos_samurai/cli/samurai --attack-vector websocket -t 10.0.0.10 -p 443 --ws-concurrency 100
+./build/samurai/cli/samurai --attack-vector websocket -t 10.0.0.10 -p 443 --ws-concurrency 100
 
 # QUIC / HTTP/3 native session
-./build/ddos_samurai/cli/samurai --attack-vector quic -t 10.0.0.10 -p 443 --quic-concurrency 100
+./build/samurai/cli/samurai --attack-vector quic -t 10.0.0.10 -p 443 --quic-concurrency 100
 
 # DNS query storm
-./build/ddos_samurai/cli/samurai --attack-vector dns -t 10.0.0.53 -p 53 --dns-name example.com --dns-qtype A AAAA
+./build/samurai/cli/samurai --attack-vector dns -t 10.0.0.53 -p 53 --dns-name example.com --dns-qtype A AAAA
 
 # Amplification resilience evaluation
-./build/ddos_samurai/cli/samurai --attack-vector dns-amp -t 10.0.0.53 -p 53 --reflector-file reflectors.txt
+./build/samurai/cli/samurai --attack-vector dns-amp -t 10.0.0.53 -p 53 --reflector-file reflectors.txt
 
 # Anomaly inspection suite
-./build/ddos_samurai/cli/samurai --attack-vector anomaly -t 10.0.0.10 -p 443 --anomaly-suite
+./build/samurai/cli/samurai --attack-vector anomaly -t 10.0.0.10 -p 443 --anomaly-suite
 
 # PCAP replay engine
-./build/ddos_samurai/cli/samurai --attack-vector pcap-replay --pcap-file sample.pcap --pcap-timing topspeed
+./build/samurai/cli/samurai --attack-vector pcap-replay --pcap-file sample.pcap --pcap-timing topspeed
 
 # Run report generation
-./build/ddos_samurai/cli/samurai -t 10.0.0.10 -p 443 --run-report --run-report-format both --run-report-dir reports
+./build/samurai/cli/samurai -t 10.0.0.10 -p 443 --run-report --run-report-format both --run-report-dir reports
 
 # License information
-./build/ddos_samurai/cli/samurai --license-info
+./build/samurai/cli/samurai --license-info
 
 # License activation
-./build/ddos_samurai/cli/samurai --license-activate --license-key SAM-XXXX-XXXX-XXXX-XXXX
+./build/samurai/cli/samurai --license-activate --license-key SAM-XXXX-XXXX-XXXX-XXXX
 ```
 
 ## 2) All CLI Flags
@@ -545,121 +545,121 @@ Notes:
 
 ## 3) All CLI Environment Variables (`SAMURAI_*`)
 
-This table catalogs all environment variables recognized by the runtime architecture across `ddos_samurai/cli/*.py` and native components:
+This table catalogs all environment variables recognized by the runtime architecture across `samurai/cli/*.py` and native components:
 
 | Environment Variable | Associated CLI Flag(s) | Code Reference |
 |---|---|---|
-| `SAMURAI_AF_PACKET_BLOCK_SIZE_KB` | `--afpacket-block-size-kb` | `ddos_samurai/cli/args.py:876`<br>`ddos_samurai/cli/env.py:103` |
-| `SAMURAI_AF_PACKET_BUSY_POLL_US` | `--afpacket-busy-poll-us` | `ddos_samurai/cli/args.py:906`<br>`ddos_samurai/cli/env.py:108` |
-| `SAMURAI_AF_PACKET_FRAMES_PER_BLOCK` | `--afpacket-frames-per-block` | `ddos_samurai/cli/args.py:888`<br>`ddos_samurai/cli/env.py:105` |
-| `SAMURAI_AF_PACKET_FRAME_SIZE` | `--afpacket-frame-size` | `ddos_samurai/cli/args.py:882`<br>`ddos_samurai/cli/env.py:104` |
-| `SAMURAI_AF_PACKET_HUGEPAGE_MODE` | - | `ddos_samurai/cli/args.py:853`<br>`ddos_samurai/cli/env.py:100` |
-| `SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB` | `--afpacket-hugepage-size-kb` | `ddos_samurai/cli/args.py:864`<br>`ddos_samurai/cli/env.py:101` |
-| `SAMURAI_AF_PACKET_MLOCK_RING` | - | `ddos_samurai/cli/args.py:937`<br>`ddos_samurai/cli/env.py:110` |
-| `SAMURAI_AF_PACKET_POLL_TIMEOUT_MS` | `--afpacket-poll-timeout-ms` | `ddos_samurai/cli/args.py:894`<br>`ddos_samurai/cli/env.py:106` |
-| `SAMURAI_AF_PACKET_PREFAULT_RING` | - | `ddos_samurai/cli/args.py:952`<br>`ddos_samurai/cli/env.py:111` |
-| `SAMURAI_AF_PACKET_QDISC_BYPASS` | - | `ddos_samurai/cli/args.py:922`<br>`ddos_samurai/cli/env.py:109` |
-| `SAMURAI_AF_PACKET_RING_TARGET_MB` | `--afpacket-ring-target-mb` | `ddos_samurai/cli/args.py:870`<br>`ddos_samurai/cli/env.py:102` |
-| `SAMURAI_AF_PACKET_SPIN_LIMIT` | `--afpacket-spin-limit` | `ddos_samurai/cli/args.py:900`<br>`ddos_samurai/cli/env.py:107` |
-| `SAMURAI_CLUSTER_SECRET` | `--cluster-secret` | `ddos_samurai/cli/args.py:121` |
-| `SAMURAI_CONTROL_JWT_SECRET` | `--control-jwt-secret` | `ddos_samurai/cli/args.py:405` |
-| `SAMURAI_CONTROL_RBAC_ADMIN_SECRET` | `--control-rbac-admin-secret` | `ddos_samurai/cli/args.py:381` |
-| `SAMURAI_CONTROL_RBAC_AUDIT_LOG_PATH` | `--control-rbac-audit-log-path` | `ddos_samurai/cli/args.py:591` |
-| `SAMURAI_CONTROL_RBAC_OPERATOR_SECRET` | `--control-rbac-operator-secret` | `ddos_samurai/cli/args.py:387` |
-| `SAMURAI_CONTROL_RBAC_VIEWER_SECRET` | `--control-rbac-viewer-secret` | `ddos_samurai/cli/args.py:393` |
-| `SAMURAI_CONTROL_RBAC_WORKER_SECRET` | `--control-rbac-worker-secret` | `ddos_samurai/cli/args.py:399` |
-| `SAMURAI_CONTROL_TLS_RELOAD_INTERVAL_S` | `--control-tls-reload-interval-s` | `ddos_samurai/cli/args.py:610` |
-| `SAMURAI_CUSTOM_TCP_BACKEND` | `--custom-tcp-backend` | `ddos_samurai/cli/args.py:1080`<br>`ddos_samurai/cli/env.py:141` |
-| `SAMURAI_CUSTOM_TCP_CONNECT_TIMEOUT_MS` | `--custom-tcp-connect-timeout-ms` | `ddos_samurai/cli/args.py:1098` |
-| `SAMURAI_CUSTOM_TCP_IDLE_TIMEOUT_MS` | `--custom-tcp-idle-timeout-ms` | `ddos_samurai/cli/args.py:1104` |
-| `SAMURAI_CUSTOM_TCP_INITIAL_RTO_MS` | `--custom-tcp-initial-rto-ms` | `ddos_samurai/cli/args.py:1086` |
-| `SAMURAI_CUSTOM_TCP_MAX_RETRANSMITS` | `--custom-tcp-max-retransmits` | `ddos_samurai/cli/args.py:1092` |
-| `SAMURAI_CUSTOM_TCP_MODE` | `--custom-tcp-mode` | `ddos_samurai/cli/args.py:1056`<br>`ddos_samurai/cli/env.py:140` |
-| `SAMURAI_DATAPLANE_CORE_ENABLE` | - | `ddos_samurai/cli/env.py:97` |
-| `SAMURAI_DATAPLANE_CORE_MODE` | - | `ddos_samurai/cli/args.py:842`<br>`ddos_samurai/cli/env.py:96` |
-| `SAMURAI_DP_QUEUES` | `--dp-queues` | `ddos_samurai/cli/args.py:969`<br>`ddos_samurai/cli/env.py:115` |
-| `SAMURAI_DP_QUEUE_MAP` | `--dp-queue-map` | `ddos_samurai/cli/args.py:975`<br>`ddos_samurai/cli/env.py:116` |
-| `SAMURAI_DP_QUEUE_STRATEGY` | `--dp-queue-strategy` | `ddos_samurai/cli/args.py:963`<br>`ddos_samurai/cli/env.py:114` |
-| `SAMURAI_GPU_BATCH` | `--gpu-batch-size` | `ddos_samurai/cli/args.py:1258`<br>`ddos_samurai/cli/args.py:1259`<br>`ddos_samurai/cli/env.py:39` |
-| `SAMURAI_GPU_BATCH_FLUSH_TIMEOUT_MS` | `--gpu-batch-flush-timeout-ms` | `ddos_samurai/cli/args.py:1378`<br>`ddos_samurai/cli/env.py:78` |
-| `SAMURAI_GPU_BATCH_MAX` | `--gpu-batch-max` | `ddos_samurai/cli/args.py:1372`<br>`ddos_samurai/cli/env.py:77` |
-| `SAMURAI_GPU_CLASSIFIER_ENGINE_PATH` | `--gpu-classifier-engine-path` | `ddos_samurai/cli/args.py:1354`<br>`ddos_samurai/cli/env.py:71` |
-| `SAMURAI_GPU_CLASSIFIER_RUNTIME` | `--gpu-classifier-runtime` | `ddos_samurai/cli/args.py:1348`<br>`ddos_samurai/cli/env.py:70` |
-| `SAMURAI_GPU_DEFENSE_MODE` | `--gpu-defense-mode` | `ddos_samurai/cli/args.py:1342`<br>`ddos_samurai/cli/env.py:69` |
-| `SAMURAI_GPU_EPOCH_MS` | `--gpu-epoch-ms` | `ddos_samurai/cli/args.py:1312`<br>`ddos_samurai/cli/env.py:61` |
-| `SAMURAI_GPU_FULL_VARIATION` | `--gpu-full-variation, --no-gpu-full-variation` | `ddos_samurai/cli/args.py:1276`<br>`ddos_samurai/cli/env.py:42` |
-| `SAMURAI_GPU_HEARTBEAT_MS` | `--gpu-heartbeat-ms` | `ddos_samurai/cli/args.py:1324`<br>`ddos_samurai/cli/env.py:63` |
-| `SAMURAI_GPU_KERNEL_MODE` | `--gpu-kernel-mode` | `ddos_samurai/cli/args.py:1291`<br>`ddos_samurai/cli/args.py:1298`<br>`ddos_samurai/cli/env.py:51` |
-| `SAMURAI_GPU_NO_PROGRESS_MS` | `--gpu-no-progress-ms` | `ddos_samurai/cli/args.py:1330`<br>`ddos_samurai/cli/env.py:64` |
-| `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT` | `--gpu-packet-zerocopy-output, --no-gpu-packet-zerocopy-output` | `ddos_samurai/cli/args.py:1288`<br>`ddos_samurai/cli/args.py:1289`<br>`ddos_samurai/cli/env.py:44` |
-| `SAMURAI_GPU_PINNED_MAX_MB` | `--gpu-pinned-max-mb` | `ddos_samurai/cli/args.py:1282`<br>`ddos_samurai/cli/args.py:1283`<br>`ddos_samurai/cli/env.py:43` |
-| `SAMURAI_GPU_PIPELINE_DEPTH` | `--gpu-pipeline-depth` | `ddos_samurai/cli/args.py:1270`<br>`ddos_samurai/cli/env.py:41` |
-| `SAMURAI_GPU_QUEUE_COUNT` | `--gpu-queue-count` | `ddos_samurai/cli/args.py:1318`<br>`ddos_samurai/cli/env.py:62` |
-| `SAMURAI_GPU_RDMA_MODE` | `--gpu-rdma-mode` | `ddos_samurai/cli/args.py:1360`<br>`ddos_samurai/cli/env.py:75` |
-| `SAMURAI_GPU_RDMA_STRICT` | `--gpu-rdma-strict, --no-gpu-rdma-strict` | `ddos_samurai/cli/args.py:1366`<br>`ddos_samurai/cli/env.py:76` |
-| `SAMURAI_GPU_RING_CAPACITY` | `--gpu-ring-capacity` | `ddos_samurai/cli/args.py:1252`<br>`ddos_samurai/cli/args.py:1253`<br>`ddos_samurai/cli/env.py:38` |
-| `SAMURAI_GPU_RNG_SEED` | `--gpu-rng-seed` | `ddos_samurai/cli/args.py:1336`<br>`ddos_samurai/cli/args.py:1337`<br>`ddos_samurai/cli/env.py:65` |
-| `SAMURAI_GPU_RX_BATCH_SIZE` | `--gpu-rx-batch-size` | `ddos_samurai/cli/args.py:1402`<br>`ddos_samurai/cli/env.py:85` |
-| `SAMURAI_GPU_RX_DURATION_S` | `--gpu-rx-duration-s` | `ddos_samurai/cli/args.py:1396`<br>`ddos_samurai/cli/env.py:84` |
-| `SAMURAI_GPU_RX_IFACE` | `--gpu-rx-iface` | `ddos_samurai/cli/args.py:1390`<br>`ddos_samurai/cli/env.py:83` |
-| `SAMURAI_GPU_RX_MAX_PACKETS` | `--gpu-rx-max-packets` | `ddos_samurai/cli/args.py:1408`<br>`ddos_samurai/cli/env.py:86` |
-| `SAMURAI_GPU_RX_PIPELINE` | `--gpu-rx-pipeline` | `ddos_samurai/cli/args.py:1384`<br>`ddos_samurai/cli/env.py:82` |
-| `SAMURAI_GPU_RX_SNAPLEN` | `--gpu-rx-snaplen` | `ddos_samurai/cli/args.py:1414`<br>`ddos_samurai/cli/env.py:87` |
-| `SAMURAI_GPU_STREAMS` | `--gpu-stream-count` | `ddos_samurai/cli/args.py:1264`<br>`ddos_samurai/cli/env.py:40` |
-| `SAMURAI_GPU_STREAM_API` | `--gpu-stream-api` | `ddos_samurai/cli/args.py:1300`<br>`ddos_samurai/cli/args.py:1307`<br>`ddos_samurai/cli/env.py:52` |
-| `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4` | `--gpu-template-pool-size-l4` | `ddos_samurai/cli/args.py:1240`<br>`ddos_samurai/cli/args.py:1241`<br>`ddos_samurai/cli/env.py:36` |
-| `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7` | `--gpu-template-pool-size-l7` | `ddos_samurai/cli/args.py:1246`<br>`ddos_samurai/cli/args.py:1247`<br>`ddos_samurai/cli/env.py:37` |
-| `SAMURAI_GPU_TX_BACKEND` | - | `ddos_samurai/cli/env.py:53`<br>`ddos_samurai/cli/env.py:59`<br>`ddos_samurai/cli/validation.py:704`<br>`ddos_samurai/cli/validation.py:712` |
-| `SAMURAI_GPU_TX_BACKEND_STRICT` | - | `ddos_samurai/cli/env.py:54`<br>`ddos_samurai/cli/env.py:60`<br>`ddos_samurai/cli/validation.py:706`<br>`ddos_samurai/cli/validation.py:723` |
-| `SAMURAI_GPU_VECTOR_ENGINE` | - | `ddos_samurai/cli/args.py:1417` |
-| `SAMURAI_KPI_GATE_PROFILE` | `--kpi-gate-profile` | `ddos_samurai/cli/args.py:1110`<br>`ddos_samurai/cli/env.py:126` |
-| `SAMURAI_KPI_HARD_FAIL` | - | `ddos_samurai/cli/env.py:127` |
-| `SAMURAI_L7_CAPABILITY_STRICT` | `--l7-capability-strict` | `ddos_samurai/cli/args.py:1163`<br>`ddos_samurai/cli/env.py:135` |
-| `SAMURAI_L7_ENGINE` | `--l7-engine` | `ddos_samurai/cli/args.py:1121`<br>`ddos_samurai/cli/env.py:128` |
-| `SAMURAI_L7_FALLBACK_POLICY` | `--l7-fallback-policy` | `ddos_samurai/cli/args.py:1157`<br>`ddos_samurai/cli/env.py:134` |
-| `SAMURAI_L7_HTTP2_ENGINE` | `--l7-http2-engine` | `ddos_samurai/cli/args.py:1127`<br>`ddos_samurai/cli/env.py:129` |
-| `SAMURAI_L7_QUIC_AUTO_BRIDGE` | `--l7-quic-auto-bridge` | `ddos_samurai/cli/args.py:1145`<br>`ddos_samurai/cli/env.py:132` |
-| `SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE` | `--l7-quic-bridge-autopromote` | `ddos_samurai/cli/args.py:1151`<br>`ddos_samurai/cli/env.py:133` |
-| `SAMURAI_L7_QUIC_ENGINE` | `--l7-quic-engine` | `ddos_samurai/cli/args.py:1133`<br>`ddos_samurai/cli/env.py:130` |
-| `SAMURAI_L7_QUIC_REQUIRE_NATIVE` | `--l7-quic-require-native` | `ddos_samurai/cli/args.py:1139`<br>`ddos_samurai/cli/env.py:131` |
-| `SAMURAI_LAB_PROFILE` | `--lab-profile` | `ddos_samurai/cli/args.py:957`<br>`ddos_samurai/cli/env.py:113` |
-| `SAMURAI_LICENSE_KEY` | `--license-key` | `ddos_samurai/cli/app.py:32`<br>`ddos_samurai/cli/app.py:165`<br>`ddos_samurai/cli/app.py:182`<br>`ddos_samurai/cli/args.py:1813` |
-| `SAMURAI_LOSS_FAIL_PCT` | - | `ddos_samurai/cli/env.py:24` |
-| `SAMURAI_LOSS_IFACE` | - | `ddos_samurai/cli/env.py:27`<br>`ddos_samurai/cli/env.py:29` |
-| `SAMURAI_LOSS_REPORT_OUT` | - | `ddos_samurai/cli/env.py:32`<br>`ddos_samurai/cli/env.py:34` |
-| `SAMURAI_LOSS_TELEMETRY` | - | `ddos_samurai/cli/env.py:23` |
-| `SAMURAI_MANAGEMENT_API_ADMIN_TOKEN` | `--management-api-admin-token` | `ddos_samurai/cli/args.py:298` |
-| `SAMURAI_MANAGEMENT_API_AUTH_TOKEN` | `--management-api-auth-token` | `ddos_samurai/cli/args.py:292` |
-| `SAMURAI_MANAGEMENT_API_JWT_SECRET` | `--management-api-jwt-secret` | `ddos_samurai/cli/args.py:316` |
-| `SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN` | `--management-api-operator-token` | `ddos_samurai/cli/args.py:304` |
-| `SAMURAI_MANAGEMENT_API_TRUSTED_IDENTITY_SECRET` | `--management-api-trusted-identity-secret` | `ddos_samurai/cli/args.py:334` |
-| `SAMURAI_MANAGEMENT_API_VIEWER_TOKEN` | `--management-api-viewer-token` | `ddos_samurai/cli/args.py:310` |
-| `SAMURAI_MULTI_MASTER_DEQUEUE_MAX` | `--multi-master-dequeue-max` | `ddos_samurai/cli/args.py:585` |
-| `SAMURAI_MULTI_MASTER_HEARTBEAT_TTL_S` | `--multi-master-heartbeat-ttl-s` | `ddos_samurai/cli/args.py:579` |
-| `SAMURAI_MULTI_MASTER_NAMESPACE` | `--multi-master-namespace` | `ddos_samurai/cli/args.py:573` |
-| `SAMURAI_MULTI_MASTER_REDIS_URL` | `--multi-master-redis-url` | `ddos_samurai/cli/args.py:567` |
-| `SAMURAI_MULTI_MASTER_REGION_ID` | `--multi-master-region-id` | `ddos_samurai/cli/args.py:561` |
-| `SAMURAI_PROM_TEXTFILE_RESULTS` | - | `ddos_samurai/cli/reporting.py:20` |
-| `SAMURAI_QUIC_BUILD_MODE` | - | `ddos_samurai/cli/validation.py:657`<br>`ddos_samurai/cli/validation.py:659`<br>`ddos_samurai/cli/validation.py:660` |
-| `SAMURAI_SENDER_BACKEND` | - | `ddos_samurai/cli/env.py:92` |
-| `SAMURAI_SENDER_FALLBACK_POLICY` | - | `ddos_samurai/cli/env.py:93` |
-| `SAMURAI_STATEFUL_RUNTIME_BACKEND` | - | `ddos_samurai/cli/args.py:830`<br>`ddos_samurai/cli/env.py:139` |
-| `SAMURAI_STATE_ENGINE_MODE` | `--state-engine-mode, --engine-mode` | `ddos_samurai/cli/args.py:1026` |
-| `SAMURAI_STATE_LOCK_COUNT` | `--state-lock-count` | `ddos_samurai/cli/args.py:1038`<br>`ddos_samurai/cli/env.py:89` |
-| `SAMURAI_STATE_SWEEP_INTERVAL_MS` | `--state-sweep-interval-ms` | `ddos_samurai/cli/args.py:1050`<br>`ddos_samurai/cli/env.py:91` |
-| `SAMURAI_STATE_TABLE_SIZE` | `--state-table-size` | `ddos_samurai/cli/args.py:1032`<br>`ddos_samurai/cli/env.py:88` |
-| `SAMURAI_STATE_TIMEOUT_SEC` | `--state-timeout-sec` | `ddos_samurai/cli/args.py:1044`<br>`ddos_samurai/cli/env.py:90` |
-| `SAMURAI_TARGET_REGION` | `--target-region` | `ddos_samurai/cli/args.py:655` |
-| `SAMURAI_TENANT_NAMESPACE` | `--tenant-namespace` | `ddos_samurai/cli/args.py:696` |
-| `SAMURAI_WORKER_REGION` | `--worker-region` | `ddos_samurai/cli/args.py:649` |
-| `SAMURAI_XDP_ATTACH_BPF` | - | `ddos_samurai/cli/args.py:1001`<br>`ddos_samurai/cli/env.py:121` |
-| `SAMURAI_XDP_BPF_OBJ` | `--xdp-bpf-obj` | `ddos_samurai/cli/args.py:1012`<br>`ddos_samurai/cli/env.py:123` |
-| `SAMURAI_XDP_BPF_SECTION` | `--xdp-bpf-section` | `ddos_samurai/cli/args.py:1006`<br>`ddos_samurai/cli/env.py:122` |
-| `SAMURAI_XDP_ENABLE` | - | `ddos_samurai/cli/env.py:117` |
-| `SAMURAI_XDP_INTERFACE` | - | `ddos_samurai/cli/env.py:118` |
-| `SAMURAI_XDP_MODE` | `--xdp-mode` | `ddos_samurai/cli/args.py:985`<br>`ddos_samurai/cli/env.py:120` |
-| `SAMURAI_XDP_QUEUE_ID` | - | `ddos_samurai/cli/env.py:119` |
-| `SAMURAI_XDP_XSKMAP_PIN` | `--xdp-xskmap-pin` | `ddos_samurai/cli/args.py:1018`<br>`ddos_samurai/cli/env.py:124` |
+| `SAMURAI_AF_PACKET_BLOCK_SIZE_KB` | `--afpacket-block-size-kb` | `samurai/cli/args.py:876`<br>`samurai/cli/env.py:103` |
+| `SAMURAI_AF_PACKET_BUSY_POLL_US` | `--afpacket-busy-poll-us` | `samurai/cli/args.py:906`<br>`samurai/cli/env.py:108` |
+| `SAMURAI_AF_PACKET_FRAMES_PER_BLOCK` | `--afpacket-frames-per-block` | `samurai/cli/args.py:888`<br>`samurai/cli/env.py:105` |
+| `SAMURAI_AF_PACKET_FRAME_SIZE` | `--afpacket-frame-size` | `samurai/cli/args.py:882`<br>`samurai/cli/env.py:104` |
+| `SAMURAI_AF_PACKET_HUGEPAGE_MODE` | - | `samurai/cli/args.py:853`<br>`samurai/cli/env.py:100` |
+| `SAMURAI_AF_PACKET_HUGEPAGE_SIZE_KB` | `--afpacket-hugepage-size-kb` | `samurai/cli/args.py:864`<br>`samurai/cli/env.py:101` |
+| `SAMURAI_AF_PACKET_MLOCK_RING` | - | `samurai/cli/args.py:937`<br>`samurai/cli/env.py:110` |
+| `SAMURAI_AF_PACKET_POLL_TIMEOUT_MS` | `--afpacket-poll-timeout-ms` | `samurai/cli/args.py:894`<br>`samurai/cli/env.py:106` |
+| `SAMURAI_AF_PACKET_PREFAULT_RING` | - | `samurai/cli/args.py:952`<br>`samurai/cli/env.py:111` |
+| `SAMURAI_AF_PACKET_QDISC_BYPASS` | - | `samurai/cli/args.py:922`<br>`samurai/cli/env.py:109` |
+| `SAMURAI_AF_PACKET_RING_TARGET_MB` | `--afpacket-ring-target-mb` | `samurai/cli/args.py:870`<br>`samurai/cli/env.py:102` |
+| `SAMURAI_AF_PACKET_SPIN_LIMIT` | `--afpacket-spin-limit` | `samurai/cli/args.py:900`<br>`samurai/cli/env.py:107` |
+| `SAMURAI_CLUSTER_SECRET` | `--cluster-secret` | `samurai/cli/args.py:121` |
+| `SAMURAI_CONTROL_JWT_SECRET` | `--control-jwt-secret` | `samurai/cli/args.py:405` |
+| `SAMURAI_CONTROL_RBAC_ADMIN_SECRET` | `--control-rbac-admin-secret` | `samurai/cli/args.py:381` |
+| `SAMURAI_CONTROL_RBAC_AUDIT_LOG_PATH` | `--control-rbac-audit-log-path` | `samurai/cli/args.py:591` |
+| `SAMURAI_CONTROL_RBAC_OPERATOR_SECRET` | `--control-rbac-operator-secret` | `samurai/cli/args.py:387` |
+| `SAMURAI_CONTROL_RBAC_VIEWER_SECRET` | `--control-rbac-viewer-secret` | `samurai/cli/args.py:393` |
+| `SAMURAI_CONTROL_RBAC_WORKER_SECRET` | `--control-rbac-worker-secret` | `samurai/cli/args.py:399` |
+| `SAMURAI_CONTROL_TLS_RELOAD_INTERVAL_S` | `--control-tls-reload-interval-s` | `samurai/cli/args.py:610` |
+| `SAMURAI_CUSTOM_TCP_BACKEND` | `--custom-tcp-backend` | `samurai/cli/args.py:1080`<br>`samurai/cli/env.py:141` |
+| `SAMURAI_CUSTOM_TCP_CONNECT_TIMEOUT_MS` | `--custom-tcp-connect-timeout-ms` | `samurai/cli/args.py:1098` |
+| `SAMURAI_CUSTOM_TCP_IDLE_TIMEOUT_MS` | `--custom-tcp-idle-timeout-ms` | `samurai/cli/args.py:1104` |
+| `SAMURAI_CUSTOM_TCP_INITIAL_RTO_MS` | `--custom-tcp-initial-rto-ms` | `samurai/cli/args.py:1086` |
+| `SAMURAI_CUSTOM_TCP_MAX_RETRANSMITS` | `--custom-tcp-max-retransmits` | `samurai/cli/args.py:1092` |
+| `SAMURAI_CUSTOM_TCP_MODE` | `--custom-tcp-mode` | `samurai/cli/args.py:1056`<br>`samurai/cli/env.py:140` |
+| `SAMURAI_DATAPLANE_CORE_ENABLE` | - | `samurai/cli/env.py:97` |
+| `SAMURAI_DATAPLANE_CORE_MODE` | - | `samurai/cli/args.py:842`<br>`samurai/cli/env.py:96` |
+| `SAMURAI_DP_QUEUES` | `--dp-queues` | `samurai/cli/args.py:969`<br>`samurai/cli/env.py:115` |
+| `SAMURAI_DP_QUEUE_MAP` | `--dp-queue-map` | `samurai/cli/args.py:975`<br>`samurai/cli/env.py:116` |
+| `SAMURAI_DP_QUEUE_STRATEGY` | `--dp-queue-strategy` | `samurai/cli/args.py:963`<br>`samurai/cli/env.py:114` |
+| `SAMURAI_GPU_BATCH` | `--gpu-batch-size` | `samurai/cli/args.py:1258`<br>`samurai/cli/args.py:1259`<br>`samurai/cli/env.py:39` |
+| `SAMURAI_GPU_BATCH_FLUSH_TIMEOUT_MS` | `--gpu-batch-flush-timeout-ms` | `samurai/cli/args.py:1378`<br>`samurai/cli/env.py:78` |
+| `SAMURAI_GPU_BATCH_MAX` | `--gpu-batch-max` | `samurai/cli/args.py:1372`<br>`samurai/cli/env.py:77` |
+| `SAMURAI_GPU_CLASSIFIER_ENGINE_PATH` | `--gpu-classifier-engine-path` | `samurai/cli/args.py:1354`<br>`samurai/cli/env.py:71` |
+| `SAMURAI_GPU_CLASSIFIER_RUNTIME` | `--gpu-classifier-runtime` | `samurai/cli/args.py:1348`<br>`samurai/cli/env.py:70` |
+| `SAMURAI_GPU_DEFENSE_MODE` | `--gpu-defense-mode` | `samurai/cli/args.py:1342`<br>`samurai/cli/env.py:69` |
+| `SAMURAI_GPU_EPOCH_MS` | `--gpu-epoch-ms` | `samurai/cli/args.py:1312`<br>`samurai/cli/env.py:61` |
+| `SAMURAI_GPU_FULL_VARIATION` | `--gpu-full-variation, --no-gpu-full-variation` | `samurai/cli/args.py:1276`<br>`samurai/cli/env.py:42` |
+| `SAMURAI_GPU_HEARTBEAT_MS` | `--gpu-heartbeat-ms` | `samurai/cli/args.py:1324`<br>`samurai/cli/env.py:63` |
+| `SAMURAI_GPU_KERNEL_MODE` | `--gpu-kernel-mode` | `samurai/cli/args.py:1291`<br>`samurai/cli/args.py:1298`<br>`samurai/cli/env.py:51` |
+| `SAMURAI_GPU_NO_PROGRESS_MS` | `--gpu-no-progress-ms` | `samurai/cli/args.py:1330`<br>`samurai/cli/env.py:64` |
+| `SAMURAI_GPU_PACKET_ZEROCOPY_OUTPUT` | `--gpu-packet-zerocopy-output, --no-gpu-packet-zerocopy-output` | `samurai/cli/args.py:1288`<br>`samurai/cli/args.py:1289`<br>`samurai/cli/env.py:44` |
+| `SAMURAI_GPU_PINNED_MAX_MB` | `--gpu-pinned-max-mb` | `samurai/cli/args.py:1282`<br>`samurai/cli/args.py:1283`<br>`samurai/cli/env.py:43` |
+| `SAMURAI_GPU_PIPELINE_DEPTH` | `--gpu-pipeline-depth` | `samurai/cli/args.py:1270`<br>`samurai/cli/env.py:41` |
+| `SAMURAI_GPU_QUEUE_COUNT` | `--gpu-queue-count` | `samurai/cli/args.py:1318`<br>`samurai/cli/env.py:62` |
+| `SAMURAI_GPU_RDMA_MODE` | `--gpu-rdma-mode` | `samurai/cli/args.py:1360`<br>`samurai/cli/env.py:75` |
+| `SAMURAI_GPU_RDMA_STRICT` | `--gpu-rdma-strict, --no-gpu-rdma-strict` | `samurai/cli/args.py:1366`<br>`samurai/cli/env.py:76` |
+| `SAMURAI_GPU_RING_CAPACITY` | `--gpu-ring-capacity` | `samurai/cli/args.py:1252`<br>`samurai/cli/args.py:1253`<br>`samurai/cli/env.py:38` |
+| `SAMURAI_GPU_RNG_SEED` | `--gpu-rng-seed` | `samurai/cli/args.py:1336`<br>`samurai/cli/args.py:1337`<br>`samurai/cli/env.py:65` |
+| `SAMURAI_GPU_RX_BATCH_SIZE` | `--gpu-rx-batch-size` | `samurai/cli/args.py:1402`<br>`samurai/cli/env.py:85` |
+| `SAMURAI_GPU_RX_DURATION_S` | `--gpu-rx-duration-s` | `samurai/cli/args.py:1396`<br>`samurai/cli/env.py:84` |
+| `SAMURAI_GPU_RX_IFACE` | `--gpu-rx-iface` | `samurai/cli/args.py:1390`<br>`samurai/cli/env.py:83` |
+| `SAMURAI_GPU_RX_MAX_PACKETS` | `--gpu-rx-max-packets` | `samurai/cli/args.py:1408`<br>`samurai/cli/env.py:86` |
+| `SAMURAI_GPU_RX_PIPELINE` | `--gpu-rx-pipeline` | `samurai/cli/args.py:1384`<br>`samurai/cli/env.py:82` |
+| `SAMURAI_GPU_RX_SNAPLEN` | `--gpu-rx-snaplen` | `samurai/cli/args.py:1414`<br>`samurai/cli/env.py:87` |
+| `SAMURAI_GPU_STREAMS` | `--gpu-stream-count` | `samurai/cli/args.py:1264`<br>`samurai/cli/env.py:40` |
+| `SAMURAI_GPU_STREAM_API` | `--gpu-stream-api` | `samurai/cli/args.py:1300`<br>`samurai/cli/args.py:1307`<br>`samurai/cli/env.py:52` |
+| `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L4` | `--gpu-template-pool-size-l4` | `samurai/cli/args.py:1240`<br>`samurai/cli/args.py:1241`<br>`samurai/cli/env.py:36` |
+| `SAMURAI_GPU_TEMPLATE_POOL_SIZE_L7` | `--gpu-template-pool-size-l7` | `samurai/cli/args.py:1246`<br>`samurai/cli/args.py:1247`<br>`samurai/cli/env.py:37` |
+| `SAMURAI_GPU_TX_BACKEND` | - | `samurai/cli/env.py:53`<br>`samurai/cli/env.py:59`<br>`samurai/cli/validation.py:704`<br>`samurai/cli/validation.py:712` |
+| `SAMURAI_GPU_TX_BACKEND_STRICT` | - | `samurai/cli/env.py:54`<br>`samurai/cli/env.py:60`<br>`samurai/cli/validation.py:706`<br>`samurai/cli/validation.py:723` |
+| `SAMURAI_GPU_VECTOR_ENGINE` | - | `samurai/cli/args.py:1417` |
+| `SAMURAI_KPI_GATE_PROFILE` | `--kpi-gate-profile` | `samurai/cli/args.py:1110`<br>`samurai/cli/env.py:126` |
+| `SAMURAI_KPI_HARD_FAIL` | - | `samurai/cli/env.py:127` |
+| `SAMURAI_L7_CAPABILITY_STRICT` | `--l7-capability-strict` | `samurai/cli/args.py:1163`<br>`samurai/cli/env.py:135` |
+| `SAMURAI_L7_ENGINE` | `--l7-engine` | `samurai/cli/args.py:1121`<br>`samurai/cli/env.py:128` |
+| `SAMURAI_L7_FALLBACK_POLICY` | `--l7-fallback-policy` | `samurai/cli/args.py:1157`<br>`samurai/cli/env.py:134` |
+| `SAMURAI_L7_HTTP2_ENGINE` | `--l7-http2-engine` | `samurai/cli/args.py:1127`<br>`samurai/cli/env.py:129` |
+| `SAMURAI_L7_QUIC_AUTO_BRIDGE` | `--l7-quic-auto-bridge` | `samurai/cli/args.py:1145`<br>`samurai/cli/env.py:132` |
+| `SAMURAI_L7_QUIC_BRIDGE_AUTOPROMOTE` | `--l7-quic-bridge-autopromote` | `samurai/cli/args.py:1151`<br>`samurai/cli/env.py:133` |
+| `SAMURAI_L7_QUIC_ENGINE` | `--l7-quic-engine` | `samurai/cli/args.py:1133`<br>`samurai/cli/env.py:130` |
+| `SAMURAI_L7_QUIC_REQUIRE_NATIVE` | `--l7-quic-require-native` | `samurai/cli/args.py:1139`<br>`samurai/cli/env.py:131` |
+| `SAMURAI_LAB_PROFILE` | `--lab-profile` | `samurai/cli/args.py:957`<br>`samurai/cli/env.py:113` |
+| `SAMURAI_LICENSE_KEY` | `--license-key` | `samurai/cli/app.py:32`<br>`samurai/cli/app.py:165`<br>`samurai/cli/app.py:182`<br>`samurai/cli/args.py:1813` |
+| `SAMURAI_LOSS_FAIL_PCT` | - | `samurai/cli/env.py:24` |
+| `SAMURAI_LOSS_IFACE` | - | `samurai/cli/env.py:27`<br>`samurai/cli/env.py:29` |
+| `SAMURAI_LOSS_REPORT_OUT` | - | `samurai/cli/env.py:32`<br>`samurai/cli/env.py:34` |
+| `SAMURAI_LOSS_TELEMETRY` | - | `samurai/cli/env.py:23` |
+| `SAMURAI_MANAGEMENT_API_ADMIN_TOKEN` | `--management-api-admin-token` | `samurai/cli/args.py:298` |
+| `SAMURAI_MANAGEMENT_API_AUTH_TOKEN` | `--management-api-auth-token` | `samurai/cli/args.py:292` |
+| `SAMURAI_MANAGEMENT_API_JWT_SECRET` | `--management-api-jwt-secret` | `samurai/cli/args.py:316` |
+| `SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN` | `--management-api-operator-token` | `samurai/cli/args.py:304` |
+| `SAMURAI_MANAGEMENT_API_TRUSTED_IDENTITY_SECRET` | `--management-api-trusted-identity-secret` | `samurai/cli/args.py:334` |
+| `SAMURAI_MANAGEMENT_API_VIEWER_TOKEN` | `--management-api-viewer-token` | `samurai/cli/args.py:310` |
+| `SAMURAI_MULTI_MASTER_DEQUEUE_MAX` | `--multi-master-dequeue-max` | `samurai/cli/args.py:585` |
+| `SAMURAI_MULTI_MASTER_HEARTBEAT_TTL_S` | `--multi-master-heartbeat-ttl-s` | `samurai/cli/args.py:579` |
+| `SAMURAI_MULTI_MASTER_NAMESPACE` | `--multi-master-namespace` | `samurai/cli/args.py:573` |
+| `SAMURAI_MULTI_MASTER_REDIS_URL` | `--multi-master-redis-url` | `samurai/cli/args.py:567` |
+| `SAMURAI_MULTI_MASTER_REGION_ID` | `--multi-master-region-id` | `samurai/cli/args.py:561` |
+| `SAMURAI_PROM_TEXTFILE_RESULTS` | - | `samurai/cli/reporting.py:20` |
+| `SAMURAI_QUIC_BUILD_MODE` | - | `samurai/cli/validation.py:657`<br>`samurai/cli/validation.py:659`<br>`samurai/cli/validation.py:660` |
+| `SAMURAI_SENDER_BACKEND` | - | `samurai/cli/env.py:92` |
+| `SAMURAI_SENDER_FALLBACK_POLICY` | - | `samurai/cli/env.py:93` |
+| `SAMURAI_STATEFUL_RUNTIME_BACKEND` | - | `samurai/cli/args.py:830`<br>`samurai/cli/env.py:139` |
+| `SAMURAI_STATE_ENGINE_MODE` | `--state-engine-mode, --engine-mode` | `samurai/cli/args.py:1026` |
+| `SAMURAI_STATE_LOCK_COUNT` | `--state-lock-count` | `samurai/cli/args.py:1038`<br>`samurai/cli/env.py:89` |
+| `SAMURAI_STATE_SWEEP_INTERVAL_MS` | `--state-sweep-interval-ms` | `samurai/cli/args.py:1050`<br>`samurai/cli/env.py:91` |
+| `SAMURAI_STATE_TABLE_SIZE` | `--state-table-size` | `samurai/cli/args.py:1032`<br>`samurai/cli/env.py:88` |
+| `SAMURAI_STATE_TIMEOUT_SEC` | `--state-timeout-sec` | `samurai/cli/args.py:1044`<br>`samurai/cli/env.py:90` |
+| `SAMURAI_TARGET_REGION` | `--target-region` | `samurai/cli/args.py:655` |
+| `SAMURAI_TENANT_NAMESPACE` | `--tenant-namespace` | `samurai/cli/args.py:696` |
+| `SAMURAI_WORKER_REGION` | `--worker-region` | `samurai/cli/args.py:649` |
+| `SAMURAI_XDP_ATTACH_BPF` | - | `samurai/cli/args.py:1001`<br>`samurai/cli/env.py:121` |
+| `SAMURAI_XDP_BPF_OBJ` | `--xdp-bpf-obj` | `samurai/cli/args.py:1012`<br>`samurai/cli/env.py:123` |
+| `SAMURAI_XDP_BPF_SECTION` | `--xdp-bpf-section` | `samurai/cli/args.py:1006`<br>`samurai/cli/env.py:122` |
+| `SAMURAI_XDP_ENABLE` | - | `samurai/cli/env.py:117` |
+| `SAMURAI_XDP_INTERFACE` | - | `samurai/cli/env.py:118` |
+| `SAMURAI_XDP_MODE` | `--xdp-mode` | `samurai/cli/args.py:985`<br>`samurai/cli/env.py:120` |
+| `SAMURAI_XDP_QUEUE_ID` | - | `samurai/cli/env.py:119` |
+| `SAMURAI_XDP_XSKMAP_PIN` | `--xdp-xskmap-pin` | `samurai/cli/args.py:1018`<br>`samurai/cli/env.py:124` |
 
 ## 4) Precedence and Value Resolution Rules
 
@@ -686,7 +686,7 @@ The following environment variables govern internal IPC communications across na
 - `SAMURAI_XDP_NATIVE_LIB`
   - Explicit path override for the AF_XDP native sender shared library.
 
-Default IPC endpoints declared in `ddos_samurai/zmq/wire.py`:
+Default IPC endpoints declared in `samurai/zmq/wire.py`:
 
 - `ipc:///tmp/samurai_jobs_<kind>`
 - `ipc:///tmp/samurai_events_<kind>`
@@ -750,4 +750,4 @@ Architecture reference: `docs/37-dpu-gpu-dataplane-architecture.md`
 
 ## 6) Maintenance Guidelines
 
-This reference document is maintained via parser introspection in `ddos_samurai.cli.args.build_parser()` and environment variable scans across the codebase. When adding new command-line flags or environment bindings, update this document accordingly.
+This reference document is maintained via parser introspection in `samurai.cli.args.build_parser()` and environment variable scans across the codebase. When adding new command-line flags or environment bindings, update this document accordingly.

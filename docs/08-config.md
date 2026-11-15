@@ -10,10 +10,10 @@ Common test configurations and benchmarks can be executed via pre-compiled profi
 
 ```bash
 # List all built-in and discovered profiles
-./build/ddos_samurai/cli/samurai --list-profiles
+./build/samurai/cli/samurai --list-profiles
 
 # Run a specific benchmark profile
-./build/ddos_samurai/cli/samurai --profile dedicated_lab --confirm
+./build/samurai/cli/samurai --profile dedicated_lab --confirm
 ```
 
 ---

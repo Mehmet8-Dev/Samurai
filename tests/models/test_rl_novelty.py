@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import json
 
-from ddos_samurai.models.rl import scan_corpus, unexplained_loss
-from ddos_samurai.models.rl.novelty import scan, signature
-from ddos_samurai.models.rl.schemas import DefenseSignals, Transition
+from samurai.models.rl import scan_corpus, unexplained_loss
+from samurai.models.rl.novelty import scan, signature
+from samurai.models.rl.schemas import DefenseSignals, Transition
 
 
 def _defense(**counts) -> DefenseSignals:

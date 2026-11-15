@@ -27,14 +27,14 @@ class TestH2KtlsVsMemoryBio(unittest.TestCase):
         cls.build_dir = cls.repo_root / "build"
         cls.binary_path = cls.build_dir / "l7_emu_native" / "test_kernel_threaded_h2"
         cls.bench_script = cls.repo_root / "tests" / "bench_h2_ktls_vs_memory_bio.sh"
-        cls.e2e_script = cls.repo_root / "ddos_samurai" / "l7_emu_native" / "run_kernel_threaded_h2_e2e.sh"
+        cls.e2e_script = cls.repo_root / "samurai" / "l7_emu_native" / "run_kernel_threaded_h2_e2e.sh"
 
         cmake_bin = shutil.which("cmake")
         if not cmake_bin:
             raise unittest.SkipTest("cmake not found on system")
 
         cls.build_dir.mkdir(parents=True, exist_ok=True)
-        cmake_src = cls.repo_root / "ddos_samurai"
+        cmake_src = cls.repo_root / "samurai"
         subprocess.run([cmake_bin, "-B", str(cls.build_dir), "-S", str(cmake_src)], check=True, capture_output=True, text=True)
         res = subprocess.run([cmake_bin, "--build", str(cls.build_dir), "--target", "test_kernel_threaded_h2", "-j4"], capture_output=True, text=True)
         if res.returncode != 0:

@@ -15,9 +15,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from ddos_samurai.models.rl import ActionSpec, build_dataset, load_policy, save_policy
-from ddos_samurai.models.rl.ope import FQEConfig, behavior_return, evaluate_policy
-from ddos_samurai.models.rl.train import IQLConfig, train_iql
+from samurai.models.rl import ActionSpec, build_dataset, load_policy, save_policy
+from samurai.models.rl.ope import FQEConfig, behavior_return, evaluate_policy
+from samurai.models.rl.train import IQLConfig, train_iql
 
 
 def _corpus(path, *, episodes: int = 8, windows: int = 10, max_rps: float = 2000.0):
@@ -115,7 +115,7 @@ def test_train_export_reload_evaluate(tmp_path):
 
 
 def test_multidim_mahoraga_action_end_to_end(tmp_path):
-    from ddos_samurai.models.rl import ActionSpec, load_policy, save_policy
+    from samurai.models.rl import ActionSpec, load_policy, save_policy
 
     # Corpus where BOTH rps and concurrency vary, so a 2-D policy is learnable.
     rng = np.random.default_rng(0)
@@ -165,7 +165,7 @@ def test_multidim_mahoraga_action_end_to_end(tmp_path):
 
 
 def test_mahoraga_7d_auth_and_evasion_end_to_end(tmp_path):
-    from ddos_samurai.models.rl import MAHORAGA, load_policy, save_policy
+    from samurai.models.rl import MAHORAGA, load_policy, save_policy
 
     rng = np.random.default_rng(42)
     p = tmp_path / "m7.ndjson"
@@ -262,8 +262,8 @@ def _categorical_corpus(path, *, episodes: int = 12, windows: int = 8):
 
 
 def test_categorical_head_can_avoid_blocked_variant(tmp_path):
-    from ddos_samurai.models.rl import EffectiveThroughputReward, MAHORAGA
-    from ddos_samurai.models.rl.config import RLConfig
+    from samurai.models.rl import EffectiveThroughputReward, MAHORAGA
+    from samurai.models.rl.config import RLConfig
 
     spec = ActionSpec(("rps", "request_mix"), categorical_names=("request_mix",))
     cfg = RLConfig(rps_scale=1000.0)
@@ -295,9 +295,9 @@ def test_categorical_head_can_avoid_blocked_variant(tmp_path):
 def test_ope_scores_shielded_policy(tmp_path):
     """The OPE gate scores the SHIELDED policy: the request_mix veto that runs at
     serving is applied to the evaluated action (with block features present)."""
-    from ddos_samurai.models.rl import EffectiveThroughputReward
-    from ddos_samurai.models.rl.config import RLConfig
-    from ddos_samurai.models.rl.shield import best_success_from_states, govern_batch
+    from samurai.models.rl import EffectiveThroughputReward
+    from samurai.models.rl.config import RLConfig
+    from samurai.models.rl.shield import best_success_from_states, govern_batch
 
     spec = ActionSpec(("rps", "request_mix"), categorical_names=("request_mix",))
     cfg = RLConfig(rps_scale=1000.0, variant_block_features=True)
@@ -337,8 +337,8 @@ def test_ope_scores_shielded_policy(tmp_path):
 def test_ope_shield_inert_without_block_features(tmp_path):
     """No variant-block features -> the shield has no memory to read, so it stays off
     (shielded=False) even with a request_mix dim; the score is the bare policy's."""
-    from ddos_samurai.models.rl import EffectiveThroughputReward
-    from ddos_samurai.models.rl.config import RLConfig
+    from samurai.models.rl import EffectiveThroughputReward
+    from samurai.models.rl.config import RLConfig
 
     spec = ActionSpec(("rps", "request_mix"), categorical_names=("request_mix",))
     cfg = RLConfig(rps_scale=1000.0)  # variant_block_features=False (default)
@@ -362,7 +362,7 @@ def test_training_is_deterministic(tmp_path):
 def test_returns_to_go_matches_manual(tmp_path):
     """behavior_returns_to_go computes, per transition, the discounted return from that
     step to the episode's end — the pairing target for the trajectory-wide value."""
-    from ddos_samurai.models.rl.ope import _episode_slices, behavior_returns_to_go
+    from samurai.models.rl.ope import _episode_slices, behavior_returns_to_go
 
     ds = build_dataset(_corpus(tmp_path / "c.ndjson", episodes=2, windows=4))
     gamma = 0.9
@@ -376,7 +376,7 @@ def test_returns_to_go_matches_manual(tmp_path):
             acc = float(ds.rewards[i]) + gamma * acc
             assert abs(g[i] - acc) < 1e-6
     # And the first index of each episode equals the full discounted episode return.
-    from ddos_samurai.models.rl.ope import behavior_returns_per_episode
+    from samurai.models.rl.ope import behavior_returns_per_episode
     per_ep = behavior_returns_per_episode(ds, gamma)
     for (b0, _e0), ret in zip(slices, per_ep):
         assert abs(g[b0] - ret) < 1e-6
@@ -389,8 +389,8 @@ def test_trajectory_value_credits_recurrent_memory(tmp_path):
     anchor set spans all transitions and both modes stay finite — the s0 anchor sees
     only the cold first window."""
     pytest.importorskip("torch")
-    from ddos_samurai.models.rl.rl2 import RL2Config, train_rl2
-    from ddos_samurai.models.rl.ope import FQEConfig, evaluate_policy
+    from samurai.models.rl.rl2 import RL2Config, train_rl2
+    from samurai.models.rl.ope import FQEConfig, evaluate_policy
 
     # Mid-episode shift: the sustainable ceiling drops halfway, so late windows carry
     # information the cold start cannot — exactly what recurrent context exploits.

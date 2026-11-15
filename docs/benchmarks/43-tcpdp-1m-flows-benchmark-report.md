@@ -3,10 +3,10 @@
 * **Date:** October 17, 2026
 * **Architectural Subsystem:** Layer 4 Stateful Transport & TCP Engine (`samurai::tcpdp::TcpDataplaneCore`)
 * **Source & Test Artifacts:**
-  * [`ddos_samurai/l4/tcp_dataplane_core.hpp`](../../ddos_samurai/l4/tcp_dataplane_core.hpp)
-  * [`ddos_samurai/l4/tcp_dataplane_core.cpp`](../../ddos_samurai/l4/tcp_dataplane_core.cpp)
-  * [`ddos_samurai/l4/test_1m_tcp_flows.cpp`](../../ddos_samurai/l4/test_1m_tcp_flows.cpp)
-  * [`ddos_samurai/l4/test_tcpdp_veth_wire.cpp`](../../ddos_samurai/l4/test_tcpdp_veth_wire.cpp)
+  * [`samurai/l4/tcp_dataplane_core.hpp`](../../samurai/l4/tcp_dataplane_core.hpp)
+  * [`samurai/l4/tcp_dataplane_core.cpp`](../../samurai/l4/tcp_dataplane_core.cpp)
+  * [`samurai/l4/test_1m_tcp_flows.cpp`](../../samurai/l4/test_1m_tcp_flows.cpp)
+  * [`samurai/l4/test_tcpdp_veth_wire.cpp`](../../samurai/l4/test_tcpdp_veth_wire.cpp)
   * [`reports/benchmarks/tcpdp_1m_flows/benchmark_1m_metrics.json`](../../reports/benchmarks/tcpdp_1m_flows/benchmark_1m_metrics.json)
   * [`reports/benchmarks/tcpdp_1m_flows/veth_wire_metrics.json`](../../reports/benchmarks/tcpdp_1m_flows/veth_wire_metrics.json)
 
@@ -16,7 +16,7 @@
 
 ![Samurai NUMA Topology & Kernel-Bypass Memory Architecture](../assets/diagrams/samurai_numa_afxdp_dpdk.svg)
 
-This report documents the verification and empirical profiling of the Samurai userspace stateful TCP dataplane engine, [`TcpDataplaneCore`](../../ddos_samurai/l4/tcp_dataplane_core.hpp):
+This report documents the verification and empirical profiling of the Samurai userspace stateful TCP dataplane engine, [`TcpDataplaneCore`](../../samurai/l4/tcp_dataplane_core.hpp):
 1. **1,000,000 (1M) Concurrent Active TCP Flows:** Compile-time struct sizing (`sizeof`), process-level resident set memory footprint (`VmRSS`), 64-shard lock-striped distribution, RFC 1071 IPv4/TCP checksum calculation, and multi-core **Shared-Nothing** scaling.
 2. **Per-Flow RAM Optimization:** Reduction from `1,648.43 B/flow` to `605.31 B/flow` (**63.3% RAM savings**), comparing pre- and post-optimization footprints.
 3. **Isolated Linux Network Namespace (`netns + veth + AF_PACKET`) Wire Interoperability:** End-to-end handshake validation against the live Linux kernel TCP stack (`accept4()`).

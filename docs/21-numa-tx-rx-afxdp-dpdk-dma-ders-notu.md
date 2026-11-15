@@ -155,9 +155,9 @@ sudo ./build/samurai/cli/samurai \
 
 ## 8. Related Architecture Documents
 
-- [00-overview.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/00-overview.md) — Master System Overview & Subsystem Map
-- [01-cli.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/01-cli.md) — Native C++ CLI Reference
-- [06-af_xdp-fast_sender.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/06-af_xdp-fast_sender.md) — AF_XDP Zero-Copy Implementation
-- [34-dpdk-kurulum-ve-hazirlik-rehberi.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/34-dpdk-kurulum-ve-hazirlik-rehberi.md) — DPDK Environment Setup & PMD Configuration
-- [40-distributed-control-plane-handbook.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/40-distributed-control-plane-handbook.md) — Multi-Node Distributed Cluster Architecture
-- [45-commodity-gpu-nic-p2p-packet-engine-report.md](file:///home/mehmet/Masa%C3%BCst%C3%BC/Python/v11/Samurai/docs/45-commodity-gpu-nic-p2p-packet-engine-report.md) — GPU-NIC P2P Zero-Copy Dataplane Report
+- [00-overview.md](00-overview.md) — Master System Overview & Subsystem Map
+- [01-cli.md](01-cli.md) — Native C++ CLI Reference
+- [06-af_xdp-fast_sender.md](06-af_xdp-fast_sender.md) — AF_XDP Zero-Copy Implementation
+- [34-dpdk-kurulum-ve-hazirlik-rehberi.md](34-dpdk-kurulum-ve-hazirlik-rehberi.md) — DPDK Environment Setup & PMD Configuration
+- [40-distributed-control-plane-handbook.md](40-distributed-control-plane-handbook.md) — Multi-Node Distributed Cluster Architecture
+- [45-commodity-gpu-nic-p2p-packet-engine-report.md](45-commodity-gpu-nic-p2p-packet-engine-report.md) — GPU-NIC P2P Zero-Copy Dataplane Report

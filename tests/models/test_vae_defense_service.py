@@ -8,9 +8,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from ddos_samurai.models.vae.config import VAEConfig
-from ddos_samurai.models.vae.model import DenseVAE
-from ddos_samurai.models.vae.service import VAEDefenseService
+from samurai.models.vae.config import VAEConfig
+from samurai.models.vae.model import DenseVAE
+from samurai.models.vae.service import VAEDefenseService
 
 
 def _write_artifacts(tmp_path: Path, *, threshold: float) -> tuple[Path, Path, Path]:

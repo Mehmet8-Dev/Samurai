@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 
-from ddos_samurai.models.rl import fingerprint_corpus
-from ddos_samurai.models.rl.schemas import UNKNOWN
+from samurai.models.rl import fingerprint_corpus
+from samurai.models.rl.schemas import UNKNOWN
 
 WINDOW_S = 1
 THRESHOLD = 200  # the synthetic target honors ~200 req/s, rejects the surplus

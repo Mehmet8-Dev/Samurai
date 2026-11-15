@@ -25,13 +25,13 @@ In an unprivileged development environment, none of these acceleration paths can
 ## 1. Native Compilation
 
 ```bash
-cmake -S ddos_samurai -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 # Expected targets: samurai (CLI), samurai_*_worker (8 native daemon workers)
 # AF_XDP requires libbpf; DPDK requires SAMURAI_WITH_DPDK=1 and libdpdk headers.
 ```
 
-Optional hardware acceleration backends compile conditionally according to toolchain availability ([`ddos_samurai/optional/CMakeLists.txt`](../ddos_samurai/optional/CMakeLists.txt)): `libgpu_packet_cuda.so` (via nvcc), `dpdk_pmd_core.so` (via DPDK). If dependencies are missing, they are cleanly skipped.
+Optional hardware acceleration backends compile conditionally according to toolchain availability ([`samurai/optional/CMakeLists.txt`](../samurai/optional/CMakeLists.txt)): `libgpu_packet_cuda.so` (via nvcc), `dpdk_pmd_core.so` (via DPDK). If dependencies are missing, they are cleanly skipped.
 
 ---
 
@@ -42,8 +42,8 @@ Optional hardware acceleration backends compile conditionally according to toolc
 The lightest operational configuration; allows non-root execution by granting specific capabilities to compiled worker binaries:
 
 ```bash
-sudo setcap cap_net_raw,cap_net_admin,cap_sys_nice+ep ./build/ddos_samurai/cli/samurai_afxdp_worker
-sudo setcap cap_net_raw,cap_net_admin+ep            ./build/ddos_samurai/cli/samurai_cpu_worker
+sudo setcap cap_net_raw,cap_net_admin,cap_sys_nice+ep ./build/samurai/cli/samurai_afxdp_worker
+sudo setcap cap_net_raw,cap_net_admin+ep            ./build/samurai/cli/samurai_cpu_worker
 
 # AF_XDP interface and hardware queue configuration:
 export SAMURAI_XDP_INTERFACE=enp2s0     # Dedicated test NIC (see docs/08-config.md)
@@ -66,7 +66,7 @@ sudo dpdk-devbind.py --status
 sudo dpdk-devbind.py --bind=vfio-pci 0000:3b:00.0
 
 # 4) Compile with DPDK support enabled
-SAMURAI_WITH_DPDK=1 cmake -S ddos_samurai -B build -DCMAKE_BUILD_TYPE=Release && \
+SAMURAI_WITH_DPDK=1 cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release && \
   cmake --build build -j
 ```
 
@@ -102,7 +102,7 @@ mkdir -p reports/runs/$(date +%Y-%m)/baseline
 OUT=reports/runs/$(date +%Y-%m)/baseline
 
 # Execute full RFC benchmark suite (RFC 2544 throughput/latency/loss, RFC 3511 firewall, RFC 8219 IPv6)
-sudo -E ./build/ddos_samurai/cli/samurai \
+sudo -E ./build/samurai/cli/samurai \
   --run-rfc-suite all \
   --rfc-report-out $OUT/rfc_all.html \
   --target 10.0.0.5 --port 80 \
@@ -117,7 +117,7 @@ To run individual RFC test suites:
 - `--run-rfc-suite rfc8219` (IPv6 transition benchmarking)
 
 Architecture references:
-[`cli/args.cpp`](../ddos_samurai/cli/args.cpp) · [`cli/rfc_suite.cpp`](../ddos_samurai/cli/rfc_suite.cpp).
+[`cli/args.cpp`](../samurai/cli/args.cpp) · [`cli/rfc_suite.cpp`](../samurai/cli/rfc_suite.cpp).
 
 ### Execution Validation Checklist
 

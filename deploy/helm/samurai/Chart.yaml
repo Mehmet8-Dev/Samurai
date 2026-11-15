@@ -1,0 +1,6 @@
+apiVersion: v2
+name: samurai
+description: Samurai distributed control plane (master/slave)
+type: application
+version: 0.3.0
+appVersion: "3.0.0"

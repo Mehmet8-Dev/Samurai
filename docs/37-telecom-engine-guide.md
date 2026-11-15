@@ -47,7 +47,7 @@ The Samurai Carrier-Grade Telecom Engine (`samurai_telecom`) is a high-density, 
 
 ### 2.1 128-Byte Dual-Cacheline Session Context (`TelcoSessionContext`)
 
-The `TelcoSessionContext` structure is defined in `ddos_samurai/telecom/core/session_context.hpp` and guaranteed to occupy exactly 128 bytes:
+The `TelcoSessionContext` structure is defined in `samurai/telecom/core/session_context.hpp` and guaranteed to occupy exactly 128 bytes:
 
 ```cpp
 struct alignas(128) TelcoSessionContext {
@@ -89,14 +89,14 @@ This structure prevents false sharing across CPU cores because fastpath thread p
 
 ### 2.2 SessionManager ($O(1)$ Hash & Direct Index Lookup)
 
-The `SessionManager` (`ddos_samurai/telecom/core/session_manager.hpp`) provides two high-speed lookup paths:
+The `SessionManager` (`samurai/telecom/core/session_manager.hpp`) provides two high-speed lookup paths:
 - **Direct Index Fastpath**: Lookups by `subscriber_id` run via array indexing in $O(1)$ time ($< 15$ nanoseconds per lookup).
 - **5-Tuple & Protocol Key Fastpath**: Employs open-addressing quadratic probing with SSE4.2 CRC32 acceleration (`_mm_crc32_u64`), sustaining over **23 Million lookups per second** on standard x86-64 hardware.
 - **Pre-allocation Pool**: All session slots are pre-allocated in a contiguous buffer at startup (`AcquireSession()` and `ReleaseSession()`), guaranteeing zero heap fragmentation during long-running stress tests.
 
 ### 2.3 Hierarchical Timing Wheel (`HierarchicalTimingWheel`)
 
-Session timeouts, retransmissions, and BFD/PPP keepalives are managed by a 3-tier hierarchical timing wheel (`ddos_samurai/telecom/core/hierarchical_timing_wheel.hpp`):
+Session timeouts, retransmissions, and BFD/PPP keepalives are managed by a 3-tier hierarchical timing wheel (`samurai/telecom/core/hierarchical_timing_wheel.hpp`):
 - **Tier 0 (Ticks 0..255)**: 1ms granularity (covers 0 to 255ms). Handles high-frequency sub-50ms BFD heartbeats and rapid retransmissions.
 - **Tier 1 (Slots 0..63)**: 256ms granularity (covers 256ms to 16.384s). Handles standard DHCP lease checks and PPP LCP Echo requests.
 - **Tier 2 (Slots 0..63)**: 16.384s granularity (covers 16.384s to ~17.4 minutes). Handles subscriber session lifetimes and long leases.
@@ -105,7 +105,7 @@ Session timeouts, retransmissions, and BFD/PPP keepalives are managed by a 3-tie
 
 ### 2.4 RingBufferShuttle (SPSC Lock-Free Shuttle)
 
-Inter-thread communication uses a power-of-two circular ring buffer (`ddos_samurai/telecom/core/ring_buffer_shuttle.hpp`) leveraging acquire-release memory barriers (`std::memory_order_acquire` / `std::memory_order_release`):
+Inter-thread communication uses a power-of-two circular ring buffer (`samurai/telecom/core/ring_buffer_shuttle.hpp`) leveraging acquire-release memory barriers (`std::memory_order_acquire` / `std::memory_order_release`):
 - Producer only touches the write pointer (`head_`).
 - Consumer only touches the read pointer (`tail_`).
 - No mutexes, no spinlocks, no kernel syscalls.
@@ -191,7 +191,7 @@ Inter-thread communication uses a power-of-two circular ring buffer (`ddos_samur
 ## 4. Distributed Cluster Sharding & Master Orchestration
 
 ### 4.1 MasterCoordinator & Port 5099
-The master controller (`ddos_samurai/control/master_coordinator.cpp`) coordinates distributed slave nodes using a high-performance ZeroMQ control channel on TCP port `5099`.
+The master controller (`samurai/control/master_coordinator.cpp`) coordinates distributed slave nodes using a high-performance ZeroMQ control channel on TCP port `5099`.
 
 ```bash
 # Start the Master Coordinator on port 5099
@@ -218,7 +218,7 @@ Each slave node receives its shard specification via a `TelcoJobPayload` ZeroMQ 
 
 ### 4.3 Worker Daemon Execution (`samurai_telco_worker`)
 
-The telecom worker daemon (`ddos_samurai/zmq/daemon/telco_worker.cpp`) runs on each physical host or cluster node, executing high-throughput subscriber loops across fixed-line, mobile, signaling, billing, and real-time media protocols.
+The telecom worker daemon (`samurai/zmq/daemon/telco_worker.cpp`) runs on each physical host or cluster node, executing high-throughput subscriber loops across fixed-line, mobile, signaling, billing, and real-time media protocols.
 
 ```bash
 # Launch worker daemon connected to Master Coordinator on port 5099
@@ -230,7 +230,7 @@ The telecom worker daemon (`ddos_samurai/zmq/daemon/telco_worker.cpp`) runs on e
   --duration 60 \
   --core-rx 2 \
   --core-fsm 3 \
-  --export-audit /var/log/ddos_samurai/audit_node01.csv
+  --export-audit /var/log/samurai/audit_node01.csv
 ```
 
 #### Protocol Engine Execution Options
@@ -253,7 +253,7 @@ The daemon supports dedicated and compound protocol modes:
 
 ### 4.4 CLI Workload Profiles
 
-Samurai CLI (`ddos_samurai/cli/options.hpp`, `args.cpp`, `profiles.cpp`) incorporates preconfigured carrier workload profiles:
+Samurai CLI (`samurai/cli/options.hpp`, `args.cpp`, `profiles.cpp`) incorporates preconfigured carrier workload profiles:
 
 | Workload Profile | Target Architecture | Rate & Engine Defaults |
 | :--- | :--- | :--- |
@@ -264,14 +264,14 @@ Samurai CLI (`ddos_samurai/cli/options.hpp`, `args.cpp`, `profiles.cpp`) incorpo
 
 ```bash
 # Executing preconfigured carrier profile via Samurai CLI
-./build/ddos_samurai/cli/samurai --profile telco-full-carrier --duration 120 --interface eth1 --confirm
+./build/samurai/cli/samurai --profile telco-full-carrier --duration 120 --interface eth1 --confirm
 ```
 
 ---
 
 ### 4.5 Fastpath Multi-Engine Integration (`L2L3FastpathWiring`)
 
-The `L2L3FastpathWiring` pipeline (`ddos_samurai/telecom/l2l3_fastpath_wiring.hpp`) integrates the protocol engines into a unified zero-allocation packet demultiplexing and dispatch layer:
+The `L2L3FastpathWiring` pipeline (`samurai/telecom/l2l3_fastpath_wiring.hpp`) integrates the protocol engines into a unified zero-allocation packet demultiplexing and dispatch layer:
 
 ```
                       +-----------------------------+
@@ -355,7 +355,7 @@ The telecom engine includes comprehensive defenses against abnormal network stor
 
 ## 7. Carrier-Grade Telemetry Audit Exporter (RFC 2544 / RFC 2889)
 
-The `TelecomAuditLogger` (`ddos_samurai/telecom/core/telecom_audit_logger.hpp`) automatically computes and exports standardized verification metrics in both CSV and JSON format.
+The `TelecomAuditLogger` (`samurai/telecom/core/telecom_audit_logger.hpp`) automatically computes and exports standardized verification metrics in both CSV and JSON format.
 
 ### 7.1 CSV Export Format
 ```csv

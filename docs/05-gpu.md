@@ -8,11 +8,11 @@ The GPU and DPU hardware acceleration subsystem leverages massive parallel compu
 
 ## 1. Architectural Components
 
-1. **`samurai_gpu_worker` (`ddos_samurai/zmq/daemon/gpu_worker.cpp`):**
-   - Utilizes CUDA streaming multiprocessors (`ddos_samurai/gpu_packet_cuda/kernels_l4.cuh`) to synthesize packets across thousands of parallel threads.
+1. **`samurai_gpu_worker` (`samurai/zmq/daemon/gpu_worker.cpp`):**
+   - Utilizes CUDA streaming multiprocessors (`samurai/gpu_packet_cuda/kernels_l4.cuh`) to synthesize packets across thousands of parallel threads.
    - Packet buffers generated directly within Vulkan host-visible GDDR6 VRAM are transferred to the NIC via PCIe peer-to-peer (P2P) memory routing.
 
-2. **`samurai_doca_worker` (`ddos_samurai/zmq/daemon/doca_gpunetio_worker.cpp`):**
+2. **`samurai_doca_worker` (`samurai/zmq/daemon/doca_gpunetio_worker.cpp`):**
    - Combines NVIDIA BlueField DPU and DOCA GPUNetIO technologies to bypass the host operating system completely.
    - Enables zero-copy direct memory access (DMA) between DPU NIC RX/TX rings and GPU VRAM.
 
@@ -28,7 +28,7 @@ CUDA and DOCA acceleration flags are automatically discovered during CMake confi
 
 ```bash
 # Execute native GPU CUDA worker
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker gpu \
   --target 10.0.0.50 \
   --port 80 \
@@ -37,7 +37,7 @@ CUDA and DOCA acceleration flags are automatically discovered during CMake confi
   --confirm
 
 # Execute DOCA GPUNetIO hardware pipeline
-sudo ./build/ddos_samurai/cli/samurai \
+sudo ./build/samurai/cli/samurai \
   --worker doca \
   --target 10.0.0.50 \
   --port 80 \

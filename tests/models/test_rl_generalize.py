@@ -1,4 +1,4 @@
-"""Leave-one-profile-out generalization eval (ddos_samurai/models/rl/generalize.py).
+"""Leave-one-profile-out generalization eval (samurai/models/rl/generalize.py).
 
 The filename-grouping helpers are torch-free; the LOPO driver needs torch and is
 gated. Quality of transfer on toy data is not asserted — the plumbing (profile split,
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from ddos_samurai.models.rl import group_by_profile, profile_of
+from samurai.models.rl import group_by_profile, profile_of
 
 
 def test_profile_of_parses_capture_filenames():
@@ -41,10 +41,10 @@ import pytest  # noqa: E402
 
 torch = pytest.importorskip("torch")
 
-from ddos_samurai.models.rl import leave_one_profile_out  # noqa: E402
-from ddos_samurai.models.rl.config import RLConfig  # noqa: E402
-from ddos_samurai.models.rl.ope import FQEConfig  # noqa: E402
-from ddos_samurai.models.rl.train import IQLConfig  # noqa: E402
+from samurai.models.rl import leave_one_profile_out  # noqa: E402
+from samurai.models.rl.config import RLConfig  # noqa: E402
+from samurai.models.rl.ope import FQEConfig  # noqa: E402
+from samurai.models.rl.train import IQLConfig  # noqa: E402
 
 
 def _profile_corpus(path, blocked_variant, *, episodes=8, windows=6):

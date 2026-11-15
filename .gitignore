@@ -70,7 +70,7 @@ dist/
 # Virtual environments
 ven/
 ven311/
-ddos_samurai/venv/
+samurai/venv/
 .venv/
 env/
 /license_server/

@@ -1,6 +1,6 @@
 # Tüketici Sınıfı GPU (GeForce GTX/RTX) & DPDK NIC P2P DMA Paket Motoru Mimari Raporu
 
-**Proje:** DDoSamurai Yüksek Başarımlı Paket Motoru (Zero-Copy P2P Packet Engine)  
+**Proje:** Samurai Yüksek Başarımlı Paket Motoru (Zero-Copy P2P Packet Engine)  
 **Yazar:** Antigravity Sistem Araştırma ve Çekirdek Mühendisliği  
 **Tarih:** 19 Ekim 2026  
 **Hedef Donanım:** Tüketici Sınıfı NVIDIA GPU (GeForce GTX/RTX) + DPDK Uyumlu NIC (Intel/Mellanox/Realtek)  
@@ -13,7 +13,7 @@
 
 Kullanıcının nihai hedefi; pahalı kurumsal veri merkezi donanımlarına (NVIDIA A100/H100 + ConnectX DPU / DOCA GPUNetIO lisansları) mahkûm kalmadan, **tüketici sınıfı (GeForce GTX 1650, RTX 30/40 serisi) GPU'ların binlerce CUDA çekirdeğini kullanarak tel hızında (wire-rate) paket üretmek ve bu paketleri CPU ana belleğine (RAM) hiç uğratmadan doğrudan ağ kartına (NIC) basan sıfır kopyalı (Zero-Copy P2P DMA) bir paket motoru mimarisi kurmaktır.**
 
-Bu raporda; bu mimarinin **fiziksel ve donanımsal olarak mümkün olup olmadığı**, `DDoSamurai/ddos_samurai/gpu_packet_cuda` kod tabanının mevcut durumu, kurumsal kilitlerin (GPUDirect RDMA) nasıl aşıldığı, hem **RX (Alım)** hem de **TX (İletim)** yönündeki PCIe TLP akışları, mikro-mimari düzeydeki donanım yazmaçları, zamanlama diyagramları, matematiksel verim limitleri ve Linux VFIO/DPDK entegrasyon yol haritası sunulmaktadır.
+Bu raporda; bu mimarinin **fiziksel ve donanımsal olarak mümkün olup olmadığı**, `Samurai/samurai/gpu_packet_cuda` kod tabanının mevcut durumu, kurumsal kilitlerin (GPUDirect RDMA) nasıl aşıldığı, hem **RX (Alım)** hem de **TX (İletim)** yönündeki PCIe TLP akışları, mikro-mimari düzeydeki donanım yazmaçları, zamanlama diyagramları, matematiksel verim limitleri ve Linux VFIO/DPDK entegrasyon yol haritası sunulmaktadır.
 
 ---
 
@@ -36,9 +36,9 @@ Canlı donanım üzerinde kanıtladığımız testler bu sorunun teorik değil, 
 
 ---
 
-## 3. DDoSamurai Kod Tabanı İncelemesi
+## 3. Samurai Kod Tabanı İncelemesi
 
-`/home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/gpu_packet_cuda` dizinindeki mevcut mimari incelenmiştir:
+`samurai/gpu_packet_cuda` dizinindeki mevcut mimari incelenmiştir:
 
 1. **Paket Üretim Yeteneği (`kernels_l4.cuh`, `kernels_template_pool.cuh`):**
    - Kod tabanı L4 (TCP/UDP/ICMP) başlıklarını, sahte IP'leri, TCP bayraklarını ve dinamik yükleri GPU'nun binlerce thread'inde paralel üretme kabiliyetine zaten sahiptir.
@@ -211,12 +211,12 @@ sequenceDiagram
 
 ## 6. TX (İletim: GPU VRAM $\rightarrow$ NIC $\rightarrow$ Tel) Derinlemesine Mikro-Akışı
 
-TX yönü, DDoSamurai'ın tel hızında paket fırlatan kalbidir. CPU müdahalesi olmadan paketlerin GDDR6'dan tele akış sürecidir:
+TX yönü, Samurai'ın tel hızında paket fırlatan kalbidir. CPU müdahalesi olmadan paketlerin GDDR6'dan tele akış sürecidir:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │ 1. CUDA SM PARALEL PAKET SENTEZİ                                       │
-│    - DDoSamurai kernels_l4.cuh binlerce thread ile paketleri üretir.   │
+│    - Samurai kernels_l4.cuh binlerce thread ile paketleri üretir.   │
 │    - Paketler doğrudan Vulkan Host-Visible GDDR6 VRAM halkasına yazılır│
 │    - __threadfence_system() ile önbellekler GDDR6'ya boşaltılır.       │
 │    - DescriptorOwnershipState = kReadyForNic yapılır.                 │
@@ -301,7 +301,7 @@ DOCA lisansına ve kurumsal kartlara ihtiyaç duymadan, tüketici sınıfı dona
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │ 1. GPU COMPUTE PLANE (CUDA SMs - GeForce GTX/RTX)                      │
-│    - DDoSamurai kernels_l4.cuh paketleri üretir.                       │
+│    - Samurai kernels_l4.cuh paketleri üretir.                       │
 │    - Paketler Vulkan Host-Visible GDDR6 VRAM ring tamponuna yazılır.   │
 │    - DescriptorOwnershipState = kReadyForNic yapılır.                 │
 └───────────────────────────────────┬────────────────────────────────────┘
@@ -378,8 +378,8 @@ $$\text{Gereken Bant Genişliği} = 148.8 \text{ Mpps} \times 84 \text{ bayt} \a
 
 ## 10. Sonuç ve Eylem Planı
 
-DDoSamurai için hedeflediğiniz **"GeForce GPU $\rightarrow$ DPDK NIC P2P Zero-Copy Packet Engine"** mimarisi yalnızca mümkün olmakla kalmayıp; sektörde TRex, MoonGen veya DPDK tabanlı standart CPU jeneratörlerine karşı **10 kat daha az CPU çekirdeği ile 40G/100G hat doyurma potansiyeli** taşıyan çığır açıcı bir araştırma konusudur.
+Samurai için hedeflediğiniz **"GeForce GPU $\rightarrow$ DPDK NIC P2P Zero-Copy Packet Engine"** mimarisi yalnızca mümkün olmakla kalmayıp; sektörde TRex, MoonGen veya DPDK tabanlı standart CPU jeneratörlerine karşı **10 kat daha az CPU çekirdeği ile 40G/100G hat doyurma potansiyeli** taşıyan çığır açıcı bir araştırma konusudur.
 
 **Önerilen Sonraki Adım:**
-1. `DDoSamurai/ddos_samurai/gpu_packet_cuda` içindeki DOCA bağımlı shim kodunu (`tx_backend_doca_gpunetio.cuh`), geliştirdiğimiz **Vulkan-CUDA P2P BAR1 API** ile uyumlu soyutlama katmanına (`tx_backend_geforce_p2p.cuh`) tam bağlamak.
+1. `Samurai/samurai/gpu_packet_cuda` içindeki DOCA bağımlı shim kodunu (`tx_backend_doca_gpunetio.cuh`), geliştirdiğimiz **Vulkan-CUDA P2P BAR1 API** ile uyumlu soyutlama katmanına (`tx_backend_geforce_p2p.cuh`) tam bağlamak.
 2. DPDK test ortamında GPU'da üretilen paketlerin PCIe üzerinden doğrudan tel üzerine basıldığı tam ölçekli bir TX PoC'si koşturmak.

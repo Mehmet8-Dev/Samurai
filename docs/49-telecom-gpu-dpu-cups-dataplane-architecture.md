@@ -1,6 +1,6 @@
 # 49 - DPU ARM & GPU Tabanlı Telekom Veri Düzlemi (CUPS) Mimarisi ve Entegrasyon Rehberi
 
-**Proje:** DDoSamurai Taşıyıcı Sınıfı Telekom Motoru (Samurai Telecom CUPS Dataplane)  
+**Proje:** Samurai Taşıyıcı Sınıfı Telekom Motoru (Samurai Telecom CUPS Dataplane)  
 **Yazar:** Antigravity Sistem Araştırma ve Çekirdek Mühendisliği  
 **Tarih:** 8 Kasım 2026  
 **Hedef Donanım:** DPU ARMv8-A / ARMv9 (aarch64) + NVIDIA GPU (GeForce BAR1 P2P / BlueField DOCA)  
@@ -14,7 +14,7 @@
 
 Mobil şebekelerde (4G LTE EPC ve 5G NR Standalone) kontrol düzlemi ile veri düzleminin birbirinden ayrılması, **3GPP CUPS (Control and User Plane Separation - 3GPP TS 23.501 / TS 29.244)** standartlarının temel taşıdır. Geleneksel x86 CPU sunucularında, milyonlarca abonenin N4 PFCP durum makinelerini yönetmek ile yüzlerce gigabitlik GTP-U tünel kapsülleme ve paket iletimini aynı işlemci çekirdeklerinde yürütmek; ciddi önbellek kirlenmesine (L1/L2/L3 thrashing), çekirdekler arası kilit çekişmesine (lock contention) ve kabul edilemez paket gecikme dalgalanmalarına (jitter) yol açar.
 
-DDoSamurai, bu sorunu çözmek için **Donanım Tabanlı CUPS Ayrımı** yaklaşımını hayata geçirmiştir:
+Samurai, bu sorunu çözmek için **Donanım Tabanlı CUPS Ayrımı** yaklaşımını hayata geçirmiştir:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -85,13 +85,13 @@ DPU ARM denetleyicisi ile GPU veri düzlemi arasındaki haberleşme iki paralel 
 
 ## 3. DPU ARM Abone Oturum Yönetimi & N4 PFCP Durum Makinesi
 
-DPU ARM çekirdekleri üzerinde çalışan [`DpuArmCupsSessionController`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/cups/dpu_arm_cups_bridge.hpp#L35-L95), 3GPP TS 29.244 spesifikasyonuna uygun PFCP mesajlaşmasını yürütür.
+DPU ARM çekirdekleri üzerinde çalışan [`DpuArmCupsSessionController`](../samurai/telecom/cups/dpu_arm_cups_bridge.hpp#L35-L95), 3GPP TS 29.244 spesifikasyonuna uygun PFCP mesajlaşmasını yürütür.
 
 ### 3.1 Oturum Yaşam Döngüsü
 
 1. **Oturum Kurulumu (`EstablishSubscriberSession`):**
    - SMF'den gelen `Session Establishment Request` paketi ayrıştırılır.
-   - DPU ARM üzerindeki [`SessionManager`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/core/session_manager.hpp#L150) havuzundan $O(1)$ sürede `TelcoSessionContext` tahsis edilir.
+   - DPU ARM üzerindeki [`SessionManager`](../samurai/telecom/core/session_manager.hpp#L150) havuzundan $O(1)$ sürede `TelcoSessionContext` tahsis edilir.
    - Uplink/Downlink TEID, UE IPv4 ve QFI değerleri tünel yuvasına yazılır.
    - Seqlock korumalı paylaşımlı bellek bölgesindeki ilgili `DpuCupsSharedTunnelV1` yuvası güncellenir.
    - GPU'nun anında haberdar olması için ZMQ üzerinden `TELCO_TUNNEL_UPSERT` paketi gönderilir.
@@ -107,7 +107,7 @@ DPU ARM çekirdekleri üzerinde çalışan [`DpuArmCupsSessionController`](file:
 
 ## 4. Seqlock Korumalı Sıfır Kopyalı Paylaşımlı Bellek Sözleşmesi
 
-DPU ile GPU arasında kilitsiz (lock-free) ve sıfır kopyalı senkronizasyon sağlamak için [`DpuCupsSharedRegionHeaderV1`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/gpu_packet_cuda/zero_copy_dataplane_contract.cuh#L160-L210) veri yapısı kullanılır.
+DPU ile GPU arasında kilitsiz (lock-free) ve sıfır kopyalı senkronizasyon sağlamak için [`DpuCupsSharedRegionHeaderV1`](../samurai/gpu_packet_cuda/zero_copy_dataplane_contract.cuh#L160-L210) veri yapısı kullanılır.
 
 ### 4.1 Bellek Yapısı ve Hizalama
 
@@ -224,18 +224,18 @@ Telekom kontrol düzleminin NVIDIA BlueField-2/BlueField-3 veya Marvell OCTEON D
 
 | İşlev | x86-64 Karşılığı | DPU ARMv8-A (aarch64) Karşılığı | Dosya |
 |:---|:---|:---|:---|
-| **Zaman Sayacı (TSC)** | `__builtin_ia32_rdtsc()` | `asm volatile("mrs %0, cntvct_el0" : "=r"(val))` | [`samurai_tsc.h`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/samurai_tsc.h) |
-| **Sistem Frekansı** | `/proc/cpuinfo` / TSC calib | `asm volatile("mrs %0, cntfrq_el0" : "=r"(freq))` | [`hierarchical_timing_wheel.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/core/hierarchical_timing_wheel.cpp) |
-| **Donanım CRC32** | `_mm_crc32_u64()` | `__crc32cd()` (`<arm_acle.h>`) | [`session_context.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/core/session_context.hpp) |
-| **Spinlock Beklemesi** | `__builtin_ia32_pause()` | `asm volatile("yield" ::: "memory")` | [`session_manager.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/core/session_manager.hpp) |
-| **Derleme Bayrağı** | `-msse4.2` | `-march=armv8-a+crc` | [`ddos_samurai/telecom/CMakeLists.txt`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/telecom/CMakeLists.txt) |
+| **Zaman Sayacı (TSC)** | `__builtin_ia32_rdtsc()` | `asm volatile("mrs %0, cntvct_el0" : "=r"(val))` | [`samurai_tsc.h`](../samurai/samurai_tsc.h) |
+| **Sistem Frekansı** | `/proc/cpuinfo` / TSC calib | `asm volatile("mrs %0, cntfrq_el0" : "=r"(freq))` | [`hierarchical_timing_wheel.cpp`](../samurai/telecom/core/hierarchical_timing_wheel.cpp) |
+| **Donanım CRC32** | `_mm_crc32_u64()` | `__crc32cd()` (`<arm_acle.h>`) | [`session_context.hpp`](../samurai/telecom/core/session_context.hpp) |
+| **Spinlock Beklemesi** | `__builtin_ia32_pause()` | `asm volatile("yield" ::: "memory")` | [`session_manager.hpp`](../samurai/telecom/core/session_manager.hpp) |
+| **Derleme Bayrağı** | `-msse4.2` | `-march=armv8-a+crc` | [`samurai/telecom/CMakeLists.txt`](../samurai/telecom/CMakeLists.txt) |
 
 ---
 
 ## 7. Kod Tabanı Dizin Haritası ve Görev Dağılımı
 
 ```
-ddos_samurai/
+samurai/
 ├── gpu_packet_cuda/
 │   ├── kernels_telecom.cuh                 # 4G/5G QFI, QinQ, dual-checksum CUDA çekirdekleri
 │   ├── zero_copy_dataplane_contract.cuh   # CUPS SHM ve BAR1 P2P bellek düzeni
@@ -296,7 +296,7 @@ GPU işçisi başlatıldığında aynı `/dev/shm` bölgesine bağlanır ve BAR1
 Orkestratör üzerinden 5G QFI tünel trafiği başlatmak için:
 
 ```bash
-./build/ddos_samurai_cli \
+./build/samurai_cli \
   --protocol gtpu \
   --target-ip 10.200.1.1 \
   --teid 0x12345678 \

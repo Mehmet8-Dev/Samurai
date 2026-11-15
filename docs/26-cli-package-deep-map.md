@@ -1,4 +1,4 @@
-# 26 - Native CLI Architecture Deep Map (`ddos_samurai/cli/`)
+# 26 - Native CLI Architecture Deep Map (`samurai/cli/`)
 
 This document describes the internal architecture, module breakdown, and execution sequence of the native C++ `samurai` command-line front-end.
 

@@ -82,7 +82,7 @@ cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
 Execute line-rate stress benchmarks via the native CLI:
 ```bash
 # Run samurai with the hardware DPDK PMD worker
-sudo ./build/ddos_samurai/cli/samurai \
+sudo ./build/samurai/cli/samurai \
   --worker dpdk \
   --target 10.0.0.50 \
   --port 443 \

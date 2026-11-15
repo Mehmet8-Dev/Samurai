@@ -14,7 +14,7 @@ from pathlib import Path
 TEST_SUITES = [
     {
         "name": "Packet Generation Tests (Suite 1-9)",
-        "file": "test_ddosamurai_comprehensive.py",
+        "file": "test_samurai_comprehensive.py",
         "description": "IPv4/TCP/UDP paket oluşturma, header validation, checksum"
     },
     {
@@ -73,7 +73,7 @@ def run_test_suite(test_file, test_name):
 def main():
     """Ana test çalıştırıcı"""
     print("\n" + "="*100)
-    print("🧪 DDOSAMURAI COMPREHENSIVE TEST SUITE - MASTER RUNNER")
+    print("🧪 SAMURAI COMPREHENSIVE TEST SUITE - MASTER RUNNER")
     print("="*100)
     print(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Total test suites: {len(TEST_SUITES)}")

@@ -26,10 +26,10 @@ class TestL7Dispatch(unittest.TestCase):
             "-std=c++17",
             "-O2",
             "-I",
-            str(repo / "ddos_samurai" / "zmq" / "daemon"),
+            str(repo / "samurai" / "zmq" / "daemon"),
             "-I",
-            str(repo / "ddos_samurai" / "orchestrator"),
-            str(repo / "ddos_samurai" / "zmq" / "daemon" / "l7_dispatch_selftest.cpp"),
+            str(repo / "samurai" / "orchestrator"),
+            str(repo / "samurai" / "zmq" / "daemon" / "l7_dispatch_selftest.cpp"),
             "-o",
             str(binary),
         ]

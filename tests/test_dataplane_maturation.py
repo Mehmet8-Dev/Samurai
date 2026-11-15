@@ -2,7 +2,7 @@ import unittest
 import os
 import sys
 
-# Ensure ddos_samurai package path is available
+# Ensure samurai package path is available
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 

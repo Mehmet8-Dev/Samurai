@@ -11,7 +11,7 @@ __pycache__/
 ven/
 ven311/
 .venv/
-ddos_samurai/venv/
+samurai/venv/
 
 # Local-only heavy trees (not needed to build the native image)
 artifacts/

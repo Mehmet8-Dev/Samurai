@@ -1,6 +1,6 @@
 # External Monitoring (Prometheus + Grafana + Alertmanager)
 
-Bu klasor, DDoSamurai icin uygulama-disindan calisan operasyonel gozlemlenebilirlik stack'ini saglar.
+Bu klasor, Samurai icin uygulama-disindan calisan operasyonel gozlemlenebilirlik stack'ini saglar.
 
 ## Kapsam (Gelistirilmis)
 

@@ -8,7 +8,7 @@
 # This brings up one L7 worker + the master with --closed-loop --rl-corpus pointed
 # at the lab ingress, so every measured window is logged as an (s,a,s') transition
 # carrying the lab's defense reactions (429 / 403 / 503 / connection drops). Feed
-# the resulting NDJSON to ddos_samurai/models/rl (build_dataset).
+# the resulting NDJSON to samurai/models/rl (build_dataset).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,7 +77,7 @@ if [[ -n "$RL_POLICY" ]]; then
 	# With a block-aware policy (in_dim 30) this also feeds the block state feature.
 	# Seed it from a fingerprint prior before serving so episode 1 already knows the
 	# target's path-blocked variants (no rediscovery window):
-	#   python -m ddos_samurai.models.rl.variant_prior \
+	#   python -m samurai.models.rl.variant_prior \
 	#       --corpus data/rl-corpus/<profile>.ndjson --target "$TARGET_HOST:$WAF_LAB_PORT" \
 	#       --variants 5 --out "$VARIANT_MEMORY"
 	if [[ -n "${VARIANT_MEMORY:-}" ]]; then
@@ -162,4 +162,4 @@ wait "$MASTER_PID"
 echo ">> done. transitions:"
 wc -l "$CORPUS" || true
 echo ">> build a dataset:"
-echo "   python -c \"from ddos_samurai.models.rl import build_dataset; d=build_dataset('$CORPUS'); print(len(d), d.feature_names)\""
+echo "   python -c \"from samurai.models.rl import build_dataset; d=build_dataset('$CORPUS'); print(len(d), d.feature_names)\""

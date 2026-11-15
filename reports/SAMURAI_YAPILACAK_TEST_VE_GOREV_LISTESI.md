@@ -1,15 +1,15 @@
-# DDoSamurai (Shogun) — Yapılacak Testler ve Görev Planı (Actionable Task Backlog)
+# Samurai (Shogun) — Yapılacak Testler ve Görev Planı (Actionable Task Backlog)
 
 **Tarih:** 1 Ekim 2026  
 **Durum:** Henüz Koşturulmamış / İcra Edilmeyi Bekleyen İş Paketleri (**TO-DO BACKLOG**)  
 **Proje:** Samurai Native C++ Testing & Resilience Platform  
-**Konum:** [`/home/mehmet/Masaüstü/Python/v11/DDoSamurai/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/)
+**Konum:** [`./`](../README.md)
 
 ---
 
 ## 1. Görev Planı Açıklaması
 
-Bu doküman, DDoSamurai kod tabanı üzerinde yapılan katmanlı mimari ve eşzamanlılık denetimi sonucunda tespit edilen; **henüz koşturulmamış, gelecekte icra edilmesi gereken tüm test, optimizasyon ve doğrulama iş paketlerini (Task'ları)** içermektedir.
+Bu doküman, Samurai kod tabanı üzerinde yapılan katmanlı mimari ve eşzamanlılık denetimi sonucunda tespit edilen; **henüz koşturulmamış, gelecekte icra edilmesi gereken tüm test, optimizasyon ve doğrulama iş paketlerini (Task'ları)** içermektedir.
 
 Her görev kartı; amacını, ilgili kod dosyalarını, geliştirilmesi gereken test scriptini/düzeneğini, donanım gereksinimini ve tamamlanma kriterini (**Definition of Done - DoD**) tanımlar.
 
@@ -20,24 +20,24 @@ Her görev kartı; amacını, ilgili kod dosyalarını, geliştirilmesi gereken 
 Dataplane ve worker katmanlarında tespit edilen yarış durumlarının ve kilit çekişmelerinin testler öncesinde giderilmesi veya stres altında patlatılarak doğrulanması için açılan görevler:
 
 ### `TASK-CORE-01`: L4 Dataplane 64-Shard False Sharing Önleme
-*   **İlgili Kod:** [`ddos_samurai/l4/tcp_dataplane_core.hpp#L477-L479`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.hpp#L477-L479)
+*   **İlgili Kod:** [`samurai/l4/tcp_dataplane_core.hpp#L477-L479`](../samurai/l4/tcp_dataplane_core.hpp#L477-L479)
 *   **Görev Tanımı:** `std::array<SpinLock, 64>` dizilerindeki spinlock'ların aynı 64-baytlık cache line üzerinde çakışmasını engellemek için `alignas(64)` hizalamasının uygulanması.
 *   **Geliştirilecek Test / Doğrulama:** `perf c2c record -- ./build/l4/test_tcp_sliding_window` çalıştırılarak HITM (önbellek çekişmesi) oranının sıfırlandığı doğrulanmalıdır.
 *   **Definition of Done (DoD):** Çekirdekler arası bitişik shard kilit erişiminde L1 invalidation yaşanmaması.
 
 ### `TASK-CORE-02`: L4 Küresel `tx_mu_` Spinlock Çekişmesinin Giderilmesi
-*   **İlgili Kod:** [`ddos_samurai/l4/tcp_dataplane_core.hpp#L476`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.hpp#L476)
+*   **İlgili Kod:** [`samurai/l4/tcp_dataplane_core.hpp#L476`](../samurai/l4/tcp_dataplane_core.hpp#L476)
 *   **Görev Tanımı:** 64 shard'ın tek bir `mutable SpinLock tx_mu_;` kilidine hücum etmesini önlemek amacıyla paket iletim kuyruğunun Shard başına ayrıştırılması (`PerShardTxRing`) veya lock-free SPSC ring'e dönüştürülmesi.
 *   **Geliştirilecek Test / Doğrulama:** 16 thread ile aynı anda `EnqueueSend` çalıştıran bir stres benchmark'ı yazılacak; kilit bekleme süresi ölçülecektir.
 *   **Definition of Done (DoD):** 16 thread altında paket iletim hızının tek thread hızına kıyasla en az 10x ölçeklenmesi.
 
 ### `TASK-CORE-03`: SpinLock TTAS ve Exponential Backoff Uygulaması
-*   **İlgili Kod:** [`ddos_samurai/l4/spinlock.hpp#L8-L21`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/spinlock.hpp#L8-L21)
+*   **İlgili Kod:** [`samurai/l4/spinlock.hpp#L8-L21`](../samurai/l4/spinlock.hpp#L8-L21)
 *   **Görev Tanımı:** Kilit alma döngüsünün saf TAS'tan (Test-and-Set) TTAS (Test and Test-and-Set) ve üstel geri çekilmeye (`_mm_pause` döngüsü) yükseltilmesi.
 *   **Definition of Done (DoD):** Yoğun kilit çekişmesinde bus lock trafiğinin en az %40 azalması.
 
 ### `TASK-WORKER-01`: ZMQ CPU Worker Asenkron Komut Kanalı Ayrımı
-*   **İlgili Kod:** [`ddos_samurai/zmq/daemon/cpu_worker.cpp#L163-L203`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/cpu_worker.cpp#L163-L203)
+*   **İlgili Kod:** [`samurai/zmq/daemon/cpu_worker.cpp#L163-L203`](../samurai/zmq/daemon/cpu_worker.cpp#L163-L203)
 *   **Görev Tanımı:** Bloklayıcı `for` döngüsünün ayrı bir üretici thread'e taşınması; ana thread'in ZMQ `pull` soketinden gelen `ABORT`, `PAUSE` ve `RESUME` mesajlarını dinlemeye devam etmesi.
 *   **Geliştirilecek Test:** `test_zmq_worker_abort_latency.py`: 10 saniyelik bir iş ortasında aniden `ABORT` gönderilerek durma gecikmesi nanosaniye/milisaniye düzeyinde ölçülecektir.
 *   **Definition of Done (DoD):** Gönderilen `ABORT` komutunun $\le 5\text{ ms}$ içinde işi durdurması ve socket deadlock oluşmaması.
@@ -48,23 +48,23 @@ Dataplane ve worker katmanlarında tespit edilen yarış durumlarının ve kilit
 
 ### `TASK-TEST-L1-01`: AF_XDP Zero-Copy UMEM Doyum ve Sızıntı Stresi
 *   **Katman:** Katman 1 (Kernel-Bypass & Hardware)
-*   **İlgili Kod:** [`ddos_samurai/xdp/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/xdp/) ve [`samurai_afxdp_worker.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/afxdp_worker.cpp)
+*   **İlgili Kod:** [`samurai/xdp/`](../samurai/xdp) ve [`samurai_afxdp_worker.cpp`](../samurai/zmq/daemon/afxdp_worker.cpp)
 *   **Görev:** AF_XDP Fill/Tx ring'leri hat hızında zorlanacak, chunk havuzunun tükendiği sınırlarda double-free veya sızıntı olup olmadığı AddressSanitizer (ASan) ile test edilecektir.
 *   **Script / Komut:** `tests/bench_afxdp_umem_saturation.sh`
 *   **DoD:** 10.000.000 paketlik akış sonrasında UMEM chunk kaybı $= 0$, ASan hatası $= 0$.
 
 ### `TASK-TEST-L2-01`: L4 Stateful TCP 100K Eşzamanlı Akış Kurulumu (CPS Testi)
 *   **Katman:** Katman 2 (L4 Stateful Transport)
-*   **İlgili Kod:** [`ddos_samurai/l4/test_sharded_fastpath.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/test_sharded_fastpath.cpp)
+*   **İlgili Kod:** [`samurai/l4/test_sharded_fastpath.cpp`](../samurai/l4/test_sharded_fastpath.cpp)
 *   **Görev:** 12 çekirdek üzerinde aynı anda 100.000 TCP akışı oluşturulacak; 64 shard arasındaki akış dağılımının varyansı ve hash çakışmaları incelenecektir.
 *   **Script / Komut:** `./build/zmq/test_sharded_fastpath --flows 100000 --threads 12`
 *   **DoD:** 100.000 akışın tamamının ESTABLISHED durumuna geçmesi, shard başına yük sapmasının $\le \%5$ olması.
 
 ### `TASK-TEST-L2-02`: RFC 6675 SACK Kayıp Kurtarma ve Boru (Pipe) Doğrulama
 *   **Katman:** Katman 2 (L4 Stateful Transport)
-*   **İlgili Kod:** [`tcp_dataplane_core.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.cpp) ve [`tcp_dataplane_core.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.hpp)
+*   **İlgili Kod:** [`tcp_dataplane_core.cpp`](../samurai/l4/tcp_dataplane_core.cpp) ve [`tcp_dataplane_core.hpp`](../samurai/l4/tcp_dataplane_core.hpp)
 *   **Görev:** %10 suni paket kaybı olan bir sanal arayüzde (veth + netem) sliding window retransmission davranışı test edilecek; SACK bloklarının doğruluğu kontrol edilecektir.
-*   **Script / Komut:** [`tests/test_tcp_sliding_window_loss_recovery.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_tcp_sliding_window_loss_recovery.py)
+*   **Script / Komut:** [`tests/test_tcp_sliding_window_loss_recovery.py`](../tests/test_tcp_sliding_window_loss_recovery.py)
 *   **DoD:** Kayıp paketlerin eksiksiz yeniden iletilmesi, gereksiz çift iletim (spurious retransmission) oranının `<= %2` olması.
 *   **Durum:** **TAMAMLANDI & DOĞRULANDI (BAŞARILI)**
 *   **Ölçülen Doğrulama Metrikleri:**
@@ -80,9 +80,9 @@ Dataplane ve worker katmanlarında tespit edilen yarış durumlarının ve kilit
 
 ### `TASK-TEST-L3-01`: Multi-Reactor io_uring vs epoll Yük ve Sistem Çağrısı Kıyaslaması
 *   **Katman:** Katman 3 (L7 Uygulama & Protokol Emülasyonu)
-*   **İlgili Kod:** [`ddos_samurai/l7_emu_native/io_uring_compat.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/io_uring_compat.hpp) ve [`test_kernel_threaded_io_uring.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
+*   **İlgili Kod:** [`samurai/l7_emu_native/io_uring_compat.hpp`](../samurai/l7_emu_native/io_uring_compat.hpp) ve [`test_kernel_threaded_io_uring.cpp`](../samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
 *   **Görev:** Yerel HTTP sunucusu üzerinde 32 eşzamanlı hatta 100.000 HTTP/1.1 isteği gönderilecek; `strace -c` ile çekirdek sistem çağrıları (read/write/epoll_wait) sayılacaktır.
-*   **Script / Komut:** [`tests/bench_iouring_vs_epoll_syscalls.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_iouring_vs_epoll_syscalls.sh)
+*   **Script / Komut:** [`tests/bench_iouring_vs_epoll_syscalls.sh`](../tests/bench_iouring_vs_epoll_syscalls.sh)
 *   **DoD:** io_uring altında `rx_syscalls=0` ve `tx_syscalls=0` doğrulanması; bağlam değişiminde en az %50 azalma.
 *   **Durum:** **TAMAMLANDI & DOĞRULANDI (BAŞARILI)**
 *   **Doğrulama Benchmark Sonuçları:**
@@ -98,9 +98,9 @@ Dataplane ve worker katmanlarında tespit edilen yarış durumlarının ve kilit
 
 ### `TASK-TEST-L3-02`: HTTP/2 kTLS Socket-BIO vs OpenSSL Memory-BIO Stresi
 *   **Katman:** Katman 3 (L7 Uygulama & Protokol Emülasyonu)
-*   **İlgili Kod:** [`run_kernel_threaded_h2_e2e.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh), [`test_kernel_threaded_h2.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/test_kernel_threaded_h2.cpp)
-*   **Otomasyon Scriptleri:** [`tests/bench_h2_ktls_vs_memory_bio.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_h2_ktls_vs_memory_bio.sh), [`tests/test_h2_ktls_vs_memory_bio.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_h2_ktls_vs_memory_bio.py)
-*   **Detaylı PR Raporu:** [`docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md)
+*   **İlgili Kod:** [`run_kernel_threaded_h2_e2e.sh`](../samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh), [`test_kernel_threaded_h2.cpp`](../samurai/l7_emu_native/test_kernel_threaded_h2.cpp)
+*   **Otomasyon Scriptleri:** [`tests/bench_h2_ktls_vs_memory_bio.sh`](../tests/bench_h2_ktls_vs_memory_bio.sh), [`tests/test_h2_ktls_vs_memory_bio.py`](../tests/test_h2_ktls_vs_memory_bio.py)
+*   **Detaylı PR Raporu:** [`docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md`](../docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md)
 *   **Görev:** Tek bir TCP bağlantısı üzerinde 100 eşzamanlı H2 stream açılarak kTLS ile standart TLS arasındaki CPU döngüsü farkı `perf stat` ile ölçülecektir.
 *   **DoD:** kTLS modunda CPU tüketiminin en az %20 daha düşük çıkması, HTTP/2 GOAWAY hatası alınmaması.
 *   **Doğrulama Benchmark Sonuçları (5 İterasyon / 100.000 İstek İstatistiği):**
@@ -121,7 +121,7 @@ Dataplane ve worker katmanlarında tespit edilen yarış durumlarının ve kilit
 
 ### `TASK-TEST-L5-01`: Dağıtık Master/Slave Failover ve Dinamik Yeniden Dengeleme
 *   **Katman:** Katman 5 (Dağıtık Kontrol Katmanı & HA)
-*   **İlgili Kod:** [`master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp)
+*   **İlgili Kod:** [`master_coordinator.cpp`](../samurai/control/master_coordinator.cpp)
 *   **Görev:** 1 Master ve 4 Slave çalışırken, 10.000.000 paketlik testin ortasında bir slave `kill -9` ile öldürülecek; Master'ın heartbeat zaman aşımı (2000ms) sonrası o shard'ı kalan 3 slave'e hatasız aktarıp aktarmadığı izlenecektir.
 *   **Script / Komut:** `tests/test_distributed_failover_chaos.py`, `tests/bench_distributed_failover_chaos.sh`
 *   **DoD:** Toplam gönderilen paket sayısının hedefle birebir uyuşması ($N_{\text{actual}} = N_{\text{target}}$), master sürecinin kilitlenmemesi.
@@ -141,7 +141,7 @@ Dataplane ve worker katmanlarında tespit edilen yarış durumlarının ve kilit
     *   **Master Kilitlenme Oranı:** **%0** (Tüm koşularda temiz rc=0 çıkışı, kuyruklar sıfırlandı)
     *   **Belirlenimcilik (Determinism):** Değişim katsayısı kesin olarak sınırlandı ($CV = \%0,02 < \%5,0$).
     *   **Regresyon Değişmezleri:** C++ kontrol selftest matrisi %100 geçti, Pytest entegrasyon paketi (`tests/test_distributed_failover_chaos.py`) 3/3 (%100) geçti.
-    *   **Rapor:** [`reports/benchmarks/task_l5_01/report.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/report.md) ve [`summary.json`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/summary.json).
+    *   **Rapor:** [`reports/benchmarks/task_l5_01/report.md`](benchmarks/task_l5_01/report.md) ve [`summary.json`](benchmarks/task_l5_01/summary.json).
 
 ---
 
@@ -149,7 +149,7 @@ Dataplane ve worker katmanlarında tespit edilen yarış durumlarının ve kilit
 
 ### `TASK-LIVE-01`: Saldırı Altında Meşru Trafik Yaşatabilirlik Ölçümü
 *   **Hedef Katman:** Katman 3 & Katman 6
-*   **İlgili Kod:** [`closed_loop.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/closed_loop.cpp), [`cli/main.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/cli/main.cpp)
+*   **İlgili Kod:** [`closed_loop.cpp`](../samurai/control/closed_loop.cpp), [`cli/main.cpp`](../samurai/cli/main.cpp)
 *   **Görev Tanımı:**
     Gerçek veya yerel bir hedef servis (API Gateway / WAF) üzerinde:
     1. Sakin dönemde (Quiet) 50 Hz frekansla meşru probe istekleri gönderilerek temel gecikme ($L_{\text{baseline}}$) ve %100 erişilebilirlik kaydedilecektir.

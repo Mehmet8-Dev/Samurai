@@ -61,9 +61,9 @@ echo ""
 echo "========== TRAIN =========="
 CORPUS="$CORPUS" RL2_POLICY="$RL2_POLICY" FF_POLICY="$FF_POLICY" AB="$AB" "$PY" - <<'PYEOF'
 import os
-from ddos_samurai.models.rl import build_dataset, save_policy
-from ddos_samurai.models.rl.rl2 import train_rl2, RL2Config
-from ddos_samurai.models.rl.train import train_iql, IQLConfig
+from samurai.models.rl import build_dataset, save_policy
+from samurai.models.rl.rl2 import train_rl2, RL2Config
+from samurai.models.rl.train import train_iql, IQLConfig
 
 corpus, rl2_out, ff_out, ab = (os.environ["CORPUS"], os.environ["RL2_POLICY"],
                                os.environ["FF_POLICY"], os.environ["AB"] == "1")

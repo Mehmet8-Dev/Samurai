@@ -1,12 +1,12 @@
-# Native (ZMQ) control-plane image for DDoSamurai.
+# Native (ZMQ) control-plane image for Samurai.
 #
-# The project migrated off the Python entrypoint (`python -m ddos_samurai.cli`)
+# The project migrated off the Python entrypoint (`python -m samurai.cli`)
 # to a native C++ control plane. This builds the native daemons + commodity
 # workers and ships them on a slim runtime. The master and slave are separate
 # binaries; the Kubernetes workloads select one via `command:` (no --role).
 #
-#   docker build -f Dockerfile.prod -t ddos-samurai:native .
-#   docker run --rm ddos-samurai:native samurai_master --help
+#   docker build -f Dockerfile.prod -t samurai:native .
+#   docker run --rm samurai:native samurai_master --help
 
 # ---- builder ---------------------------------------------------------------
 FROM debian:bookworm-slim AS build
@@ -35,7 +35,7 @@ COPY . .
 # Configure once, then build the deployable targets (CLI + daemons + commodity
 # and telco workers). GPU/DPDK/DOCA backends are gated on their toolchains and
 # skip cleanly when absent, so they are omitted from the default image.
-RUN cmake -S ddos_samurai -B build -DCMAKE_BUILD_TYPE=Release \
+RUN cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release \
  && cmake --build build -j "$(nproc)" --target \
       samurai \
       samurai_master \

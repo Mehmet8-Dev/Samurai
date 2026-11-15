@@ -12,16 +12,16 @@
 The NVIDIA DOCA GPUNetIO integration enables line-rate packet streaming directly from GPU GDDR6 VRAM to the network interface, completely bypassing Host-CPU memory traversal.
 
 ### Core Components:
-1. **ZMQ DOCA Worker Daemon (`ddos_samurai/zmq/daemon/doca_gpunetio_worker.cpp`):**
+1. **ZMQ DOCA Worker Daemon (`samurai/zmq/daemon/doca_gpunetio_worker.cpp`):**
    - Independent native daemon managed by `supervisor.cpp`.
    - Listens on `ipc:///tmp/samurai_jobs_*` for job execution envelopes (`JobEnvelopeV1`).
    - Dynamically binds and loads the DOCA GPUNetIO backend via `dlopen(libdoca_gpunetio.so)`.
-2. **DPU Authoritative State Runtime (`ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp`):**
+2. **DPU Authoritative State Runtime (`samurai/gpu_packet_cuda/dpu_state_runtime.hpp`):**
    - Implements hardware-offloaded TCP state machine (CLOSED, SYN-SENT, ESTABLISHED, FIN-WAIT).
    - Manages passive open backlogs, TCB state (`snd_una`, `snd_nxt`, `rcv_nxt`, `cwnd`, `ssthresh`), SACK parsing, and RTO calculations.
-3. **DOCA GPUNetIO ABI (`ddos_samurai/gpu_packet_cuda/tx_backend_doca_gpunetio.cuh`):**
+3. **DOCA GPUNetIO ABI (`samurai/gpu_packet_cuda/tx_backend_doca_gpunetio.cuh`):**
    - Direct kernel interface mapping DPU NIC TX/RX queues to GPU GDDR6 memory addresses.
-4. **GPU Hot-Flow Policy Receiver (`ddos_samurai/zmq/daemon/gpu_worker.cpp`):**
+4. **GPU Hot-Flow Policy Receiver (`samurai/zmq/daemon/gpu_worker.cpp`):**
    - Streams packet generation bursts according to dynamic flow policies (`FlowStreamUpsertV1` and `FlowUpdateEventV1`).
 
 ---
@@ -88,7 +88,7 @@ Run on a bare-metal server equipped with an NVIDIA GPU and BlueField DPU:
 
 ```bash
 # Run samurai native DOCA GPUNetIO worker
-sudo ./build/ddos_samurai/cli/samurai \
+sudo ./build/samurai/cli/samurai \
   --worker doca \
   --target 10.0.0.50 \
   --port 80 \

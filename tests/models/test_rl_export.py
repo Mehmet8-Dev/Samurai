@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ddos_samurai.models.rl import PolicyArtifact, load_policy, save_policy
+from samurai.models.rl import PolicyArtifact, load_policy, save_policy
 
 
 def _artifact() -> PolicyArtifact:

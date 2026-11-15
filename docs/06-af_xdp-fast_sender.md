@@ -20,7 +20,7 @@ AF_XDP (XSK - eXpress Data Path Sockets) is Linux's high-performance kernel-bypa
 
 ## 2. Samurai AF_XDP Worker (`samurai_afxdp_worker`)
 
-[`afxdp_worker.cpp`](file://ddos_samurai/zmq/daemon/afxdp_worker.cpp) operates as an autonomous native C++ daemon:
+[`afxdp_worker.cpp`](file://samurai/zmq/daemon/afxdp_worker.cpp) operates as an autonomous native C++ daemon:
 
 - **ZMQ RPC Management:** Receives binary execution parameters (`JobEnvelopeV1`) via local IPC.
 - **Strict Zero-Copy Mode:** Configures sockets in `XDP_ZEROCOPY` mode using `libbpf` and `libxdp`.
@@ -32,7 +32,7 @@ AF_XDP (XSK - eXpress Data Path Sockets) is Linux's high-performance kernel-bypa
 
 ```bash
 # Run with root privileges for raw network namespace access
-sudo ./build/ddos_samurai/cli/samurai \
+sudo ./build/samurai/cli/samurai \
   --worker afxdp \
   --target 10.0.0.50 \
   --port 80 \

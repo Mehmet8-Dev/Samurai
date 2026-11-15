@@ -82,7 +82,7 @@ The performance report and Prometheus exporter publish the following metrics:
 
 ### Standard Verification Run
 ```bash
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker cpu \
   --target 127.0.0.1 \
   --port 80 \
@@ -94,7 +94,7 @@ The performance report and Prometheus exporter publish the following metrics:
 
 ### Dedicated Lab Strict Production Run
 ```bash
-./build/ddos_samurai/cli/samurai \
+./build/samurai/cli/samurai \
   --worker cpu \
   --target 192.168.1.50 \
   --port 443 \

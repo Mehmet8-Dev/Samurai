@@ -1,4 +1,4 @@
-# DDoSamurai defense ZOO — multiple *distinct* WAF/defense engines, so the RL corpus
+# Samurai defense ZOO — multiple *distinct* WAF/defense engines, so the RL corpus
 # spans genuinely different reaction personalities instead of one engine's rule tweaks.
 #
 # The existing lab (docker-compose.yml) is Caddy+Coraza (OWASP CRS family). This adds

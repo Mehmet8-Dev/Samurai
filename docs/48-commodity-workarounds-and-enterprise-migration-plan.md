@@ -1,6 +1,6 @@
 # Tüketici Donanımı (Commodity) Zorunlu Geçici Çözümleri (Workarounds) ve Kurumsal Donanım Geçiş/Refactor Planı
 
-**Proje:** DDoSamurai Yüksek Başarımlı Paket Motoru  
+**Proje:** Samurai Yüksek Başarımlı Paket Motoru  
 **Yazar:** Antigravity Sistem Araştırma ve Çekirdek Mühendisliği  
 **Tarih:** 31 Ekim 2026  
 **Doküman Kodu:** `DOC-SAMURAI-COMMODITY-WORKAROUNDS-48`  
@@ -11,7 +11,7 @@
 
 ## 1. Giriş ve Belgenin Amacı
 
-DDoSamurai, düşük maliyetli ve her geliştiricide bulunan son kullanıcı donanımlarında (Commodity Hardware) bare-metal GPU P2P paket çıkışını ve sıfır-CPU bağımlı persistent kernel mimarisini kanıtlamak üzere tasarlanmıştır.
+Samurai, düşük maliyetli ve her geliştiricide bulunan son kullanıcı donanımlarında (Commodity Hardware) bare-metal GPU P2P paket çıkışını ve sıfır-CPU bağımlı persistent kernel mimarisini kanıtlamak üzere tasarlanmıştır.
 
 Ancak kurumsal sunucu donanımlarının (Mellanox CX serisi, Intel kurumsal NIC'ler, Tesla/A100/H100 GPU'lar) yerel olarak sunduğu donanımsal yeteneklerin tüketici sınıfı donanımlarda bulunmaması nedeniyle, kod tabanına birtakım **zorunlu ara çözümler (workarounds / hardware shims)** eklenmiştir.
 
@@ -37,7 +37,7 @@ Bu dokümanın amacı:
 
 ### 3.1. Katman 1: Tek Kuyruğu Paylaşma Kısıtı (DRR Deficit & Atomic CAS)
 
-* **Etkilenen Dosya:** `ddos_samurai/gpu_packet_cuda/host_api.cuh`
+* **Etkilenen Dosya:** `samurai/gpu_packet_cuda/host_api.cuh`
 * **İlgili Fonksiyon:** `reserve_stream_tokens(...)` (Satır 4270-4320)
 * **Yazılmak Zorunda Kalınan Kod:**
   ```cuda
@@ -64,7 +64,7 @@ Bu dokümanın amacı:
 
 ### 3.2. Katman 2: AMD Cezanne PCIe 3.0 Uyumsuzluğu & Non-Blocking Asenkron Durdurma
 
-* **Etkilenen Dosya:** `ddos_samurai/gpu_packet_cuda/host_api.cuh`
+* **Etkilenen Dosya:** `samurai/gpu_packet_cuda/host_api.cuh`
 * **İlgili Yapılar:** `PersistentRuntime::control_stream`, `PersistentRuntime::run_flag_dev`, `persistent_launch_kernel()`, `persistent_stop_kernel()`
 * **Yazılmak Zorunda Kalınan Kod:**
   1. `run_flag_dev` göstergesinin `cudaHostAlloc` ile CPU RAM'inde tutulması yerine GDDR6 VRAM'de (`cudaMalloc`) ayrılması.
@@ -90,8 +90,8 @@ Bu dokümanın amacı:
 ### 3.3. Katman 3: Realtek RTL8168 Sürücü Çatışması & Gizli MMIO Ele Geçirme
 
 * **Etkilenen Dosyalar:**
-  * `ddos_samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh`
-  * `ddos_samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh`
+  * `samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh`
+  * `samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh`
 * **İlgili Fonksiyonlar:** `host_init_nic_pmd_tx_ring_mmio()`, `device_ring_nic_doorbell()`, `device_p2p_txq_try_commit_push()`
 * **Yazılmak Zorunda Kalınan Kod:**
   Realtek kartı `r8169.ko` sürücüsünden unbind edemediğimiz için (kart uykuya geçmesin diye), BAR2 MMIO yazmaçları zorla GPU BAR1 adresine ayarlandı:
@@ -121,9 +121,9 @@ Bu dokümanın amacı:
 ### 3.4. Katman 4: Vulkan BAR1 Export & `/dev/nv_p2p` Çekirdek Modülü
 
 * **Etkilenen Dosyalar:**
-  * `ddos_samurai/gpu_packet_cuda/vulkan_bar1_allocator.cpp`
-  * `ddos_samurai/kernel_modules/nv_p2p/nv_p2p.c`
-  * `ddos_samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh:resolve_bar1_allocation_phys_addr()`
+  * `samurai/gpu_packet_cuda/vulkan_bar1_allocator.cpp`
+  * `samurai/kernel_modules/nv_p2p/nv_p2p.c`
+  * `samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh:resolve_bar1_allocation_phys_addr()`
 * **Yazılmak Zorunda Kalınan Kod:**
   GeForce sürücüsü resmi GPUDirect RDMA API'sini (`nvidia_p2p_get_pages`) kilitlediği için:
   1. Vulkan ile GDDR6 bellekte `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT` bayraklarıyla bellek ayrıldı.
@@ -139,7 +139,7 @@ Bu dokümanın amacı:
 
 ### 3.5. Katman 5: 1 Gbps Tel Sınırı (1.488 Mpps) ve Backpressure Savunması
 
-* **Etkilenen Dosya:** `ddos_samurai/gpu_packet_cuda/host_api.cuh`
+* **Etkilenen Dosya:** `samurai/gpu_packet_cuda/host_api.cuh`
 * **İlgili Bölüm:** Satır 4905-4921 (Hardware PMD Backpressure Handling)
 * **Yazılmak Zorunda Kalınan Kod:**
   1000BASE-T hattının 1.488 Mpps tavanı nedeniyle GPU'nun 28.93 Mpps'lik üretim patlaması 1024 slotluk Realtek TX FIFO'sunu anında doldurur. Eski kodda bu durum sistemi panikle düşürdüğü için, slotu geri dönüştüren ve tele inemeyen paketleri kontrollü şekilde düşüren mantık yazıldı:
@@ -168,11 +168,11 @@ Aşağıdaki tablo, kurumsal donanım (örneğin Mellanox ConnectX-6 Dx + NVIDIA
 
 | Dosya Yolu | Şu Anki Kod / Workaround | Kurumsal Donanım Geldiğinde Yapılacak İşlem | Hedef Yeni Kod / Kütüphane |
 | :--- | :--- | :--- | :--- |
-| `ddos_samurai/gpu_packet_cuda/vulkan_bar1_allocator.cpp` | Vulkan API üzerinden BAR1 256MB VRAM ayrımı | **Dosya tamamen silinecek veya devredışı bırakılacak.** | `doca_gpu_mem_alloc()` veya `cudaMalloc()` |
-| `ddos_samurai/kernel_modules/nv_p2p/` | Özel `/dev/nv_p2p` Linux kernel modülü | **Dizin ve modül tamamen silinecek.** | Resmi `nvidia-peermem.ko` (NVIDIA OFED) |
-| `ddos_samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh` | `resolve_bar1_allocation_phys_addr()`, `host_init_nic_pmd_tx_ring_mmio()`, Realtek BAR2 TNPDS hack'i | Bu fonksiyonlar `#if SAMURAI_LEGACY_GEFORCE` bloğuna alınacak; varsayılanda devre dışı kalacak. | DPDK `rte_eth_tx_burst` veya DOCA GPUNetIO `doca_gpu_eth_txq` API |
-| `ddos_samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh` | Realtek `TPPoll (0x38)` ve tek kuyruklu `device_ring_nic_doorbell` | Mellanox DevX UAR BlueFlame veya Intel `IXGBE_TDT` register yazımı aktif edilecek. | `doca_gpu_dev_eth_txq_commit_strong()` & `doca_gpu_dev_eth_txq_push()` |
-| `ddos_samurai/gpu_packet_cuda/host_api.cuh` | `PersistentRuntime::control_stream`, `run_flag_dev`, Cezanne uyumlu tek kuyruklu `reserve_stream_tokens()` | Multi-Queue (RSS) desteği açılacak; her warp'a ayrı TX queue atanacak. Kilit ve atomikler kalkacak. | `warp_id`-indexed lock-free ring enqueue |
+| `samurai/gpu_packet_cuda/vulkan_bar1_allocator.cpp` | Vulkan API üzerinden BAR1 256MB VRAM ayrımı | **Dosya tamamen silinecek veya devredışı bırakılacak.** | `doca_gpu_mem_alloc()` veya `cudaMalloc()` |
+| `samurai/kernel_modules/nv_p2p/` | Özel `/dev/nv_p2p` Linux kernel modülü | **Dizin ve modül tamamen silinecek.** | Resmi `nvidia-peermem.ko` (NVIDIA OFED) |
+| `samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh` | `resolve_bar1_allocation_phys_addr()`, `host_init_nic_pmd_tx_ring_mmio()`, Realtek BAR2 TNPDS hack'i | Bu fonksiyonlar `#if SAMURAI_LEGACY_GEFORCE` bloğuna alınacak; varsayılanda devre dışı kalacak. | DPDK `rte_eth_tx_burst` veya DOCA GPUNetIO `doca_gpu_eth_txq` API |
+| `samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh` | Realtek `TPPoll (0x38)` ve tek kuyruklu `device_ring_nic_doorbell` | Mellanox DevX UAR BlueFlame veya Intel `IXGBE_TDT` register yazımı aktif edilecek. | `doca_gpu_dev_eth_txq_commit_strong()` & `doca_gpu_dev_eth_txq_push()` |
+| `samurai/gpu_packet_cuda/host_api.cuh` | `PersistentRuntime::control_stream`, `run_flag_dev`, Cezanne uyumlu tek kuyruklu `reserve_stream_tokens()` | Multi-Queue (RSS) desteği açılacak; her warp'a ayrı TX queue atanacak. Kilit ve atomikler kalkacak. | `warp_id`-indexed lock-free ring enqueue |
 | `tests/native_gpu/test_gpu_architecture.cpp` | Realtek BDF (`0000:02:00.0`) ve GeForce BDF tespiti | Kurumsal PCIe BDF (örn: `0000:af:00.0` CX-6) tespiti ve 100G wire-rate doğrulama testleri. | `TEST_CHECK(throughput_mpps >= 100.0)` |
 
 ---

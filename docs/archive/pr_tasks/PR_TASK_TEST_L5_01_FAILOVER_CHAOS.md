@@ -4,14 +4,14 @@
 * **Task / Issue Tracking:** `TASK-TEST-L5-01` ([`test_task.md`](file://test_task.md#L206-L230), [`reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md`](file://reports/SAMURAI_YAPILACAK_TEST_VE_GOREV_LISTESI.md#L122-L145))
 * **Architectural Layer:** Layer 5 (Distributed Control Plane & High Availability)
 * **Affected Subsystems & Files:**
-  * [`ddos_samurai/control/master_coordinator.hpp`](file://ddos_samurai/control/master_coordinator.hpp)
-  * [`ddos_samurai/control/master_coordinator.cpp`](file://ddos_samurai/control/master_coordinator.cpp)
-  * [`ddos_samurai/control/master_adapters.hpp`](file://ddos_samurai/control/master_adapters.hpp)
-  * [`ddos_samurai/control/master_adapters.cpp`](file://ddos_samurai/control/master_adapters.cpp)
-  * [`ddos_samurai/control/telemetry.cpp`](file://ddos_samurai/control/telemetry.cpp)
-  * [`ddos_samurai/control/selftest.cpp`](file://ddos_samurai/control/selftest.cpp)
-  * [`ddos_samurai/control/daemon/master_main.cpp`](file://ddos_samurai/control/daemon/master_main.cpp)
-  * [`ddos_samurai/control/daemon/slave_main.cpp`](file://ddos_samurai/control/daemon/slave_main.cpp)
+  * [`samurai/control/master_coordinator.hpp`](file://samurai/control/master_coordinator.hpp)
+  * [`samurai/control/master_coordinator.cpp`](file://samurai/control/master_coordinator.cpp)
+  * [`samurai/control/master_adapters.hpp`](file://samurai/control/master_adapters.hpp)
+  * [`samurai/control/master_adapters.cpp`](file://samurai/control/master_adapters.cpp)
+  * [`samurai/control/telemetry.cpp`](file://samurai/control/telemetry.cpp)
+  * [`samurai/control/selftest.cpp`](file://samurai/control/selftest.cpp)
+  * [`samurai/control/daemon/master_main.cpp`](file://samurai/control/daemon/master_main.cpp)
+  * [`samurai/control/daemon/slave_main.cpp`](file://samurai/control/daemon/slave_main.cpp)
   * [`tests/bench_distributed_failover_chaos.sh`](file://tests/bench_distributed_failover_chaos.sh)
   * [`tests/test_distributed_failover_chaos.py`](file://tests/test_distributed_failover_chaos.py)
   * [`reports/benchmarks/task_l5_01/report.md`](file://reports/benchmarks/task_l5_01/report.md)
@@ -72,7 +72,7 @@ sequenceDiagram
 ```
 
 ### A. Dynamic Shard Reclamation & Configurable Attempt Bounds
-* In [`master_coordinator.hpp`](file://ddos_samurai/control/master_coordinator.hpp) and [`master_coordinator.cpp`](file://ddos_samurai/control/master_coordinator.cpp):
+* In [`master_coordinator.hpp`](file://samurai/control/master_coordinator.hpp) and [`master_coordinator.cpp`](file://samurai/control/master_coordinator.cpp):
   * Added `max_shard_retries` (default 3) to `JobConfig`, replacing hardcoded attempt ceilings.
   * During lost-worker detection:
     $$\Delta t = t_{\text{now}} - t_{\text{hb}} > T_{\text{timeout}}$$
@@ -86,20 +86,20 @@ sequenceDiagram
   * Dead workers in `lost_workers` are strictly excluded from subsequent dispatch iterations (`free_workers`).
 
 ### B. Bounded Probe Timeout to Prevent Dispatch Loop Stalls
-* In [`master_adapters.cpp`](file://ddos_samurai/control/master_adapters.cpp):
+* In [`master_adapters.cpp`](file://samurai/control/master_adapters.cpp):
   * Bounded status probe timeout in `ClientWorkerCommander::Probe` using `std::min(timeout_ms_, 1000)`.
   * If a worker is terminated via `kill -9`, synchronous probe attempts quickly abort within $\le 1,000$ ms rather than blocking the master thread for 5,000 ms, ensuring the heartbeat evaluation runs promptly at the 2,000 ms boundary.
 
 ### C. CLI Argument Wiring in Daemon Daemons
-* In [`master_main.cpp`](file://ddos_samurai/control/daemon/master_main.cpp):
+* In [`master_main.cpp`](file://samurai/control/daemon/master_main.cpp):
   * Added CLI flags `--heartbeat-timeout-ms`, `--max-shard-retries`, `--on-worker-loss`, `--worker-status-probe`, and `--rpc-timeout-ms`.
   * Updated `JobSpecFromArgs` and `BuildJobConfig` to propagate these parameters into the running coordinator instance.
-* In [`slave_main.cpp`](file://ddos_samurai/control/daemon/slave_main.cpp):
+* In [`slave_main.cpp`](file://samurai/control/daemon/slave_main.cpp):
   * Added `--mock` and `--mock-delay-ms` flags to instantiate `MockShardRunner`.
   * Enables reproducible control-plane chaos and failover benchmarking on commodity systems and CI environments without requiring kernel `CAP_NET_RAW` privileges.
 
 ### D. Mathematical Worker Rollup Conservation
-* In [`telemetry.cpp`](file://ddos_samurai/control/telemetry.cpp):
+* In [`telemetry.cpp`](file://samurai/control/telemetry.cpp):
   * Fixed `DistributedAggregator` worker and region rollup accounting from `std::max` to strict summation across reported shards (`w.sent += IntField(item, "sent")`).
   * Mathematically guarantees that the sum of surviving worker totals strictly equals the job's aggregate packet count:
     $$\sum_{w \in \text{survivors}} N_w = N_{\text{actual}} = 10,000,000$$

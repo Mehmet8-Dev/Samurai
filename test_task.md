@@ -1,9 +1,9 @@
-# DDoSamurai (Shogun) — Native C++ Layered Architecture Analysis, Concurrency Audit, and Test Task Backlog
+# Samurai (Shogun) — Native C++ Layered Architecture Analysis, Concurrency Audit, and Test Task Backlog
 
 **Project:** Samurai (Code Name: Shogun Native C++ / Distributed Resilience Engine)  
 **Date:** October 1, 2026  
 **Document Status:** Actionable Work Breakdown Structure & Pre-Execution Task Backlog (**TO-DO**)  
-**Location:** [`/home/mehmet/Masaüstü/Python/v11/DDoSamurai/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/)  
+**Location:** [`./`](README.md)  
 
 ---
 
@@ -51,19 +51,19 @@ graph TD
 ```
 
 *   **Layer 1: Kernel-Bypass & Hardware Dataplane:**  
-    [`ddos_samurai/xdp/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/xdp/) (Linux XSK / UMEM zero-copy ring buffers), [`af_packet/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/af_packet/) (`PACKET_TX_RING`), [`dpdk/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/dpdk/) (PMD ring drivers), [`gpu_packet_cuda/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/gpu_packet_cuda/) (CUDA packet synthesis) and [`doca_gpunetio_worker.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/doca_gpunetio_worker.cpp) (NVIDIA DPU GPUNetIO).
+    [`samurai/xdp/`](samurai/xdp) (Linux XSK / UMEM zero-copy ring buffers), [`af_packet/`](samurai/af_packet) (`PACKET_TX_RING`), [`dpdk/`](samurai/dpdk) (PMD ring drivers), [`gpu_packet_cuda/`](samurai/gpu_packet_cuda) (CUDA packet synthesis) and [`doca_gpunetio_worker.cpp`](samurai/zmq/daemon/doca_gpunetio_worker.cpp) (NVIDIA DPU GPUNetIO).
 *   **Layer 2: L4 Stateful Transport & TCP Engine:**  
-    [`tcp_dataplane_core.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.hpp), [`tcp_dataplane_core.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.cpp), [`spinlock.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/spinlock.hpp). 64-shard lock-striped flow table, RFC 6675 SACK loss recovery, sliding-window sender pipe (`PumpSend`), RFC 7323 timestamps (PAWS), and per-shard timer heap.
+    [`tcp_dataplane_core.hpp`](samurai/l4/tcp_dataplane_core.hpp), [`tcp_dataplane_core.cpp`](samurai/l4/tcp_dataplane_core.cpp), [`spinlock.hpp`](samurai/l4/spinlock.hpp). 64-shard lock-striped flow table, RFC 6675 SACK loss recovery, sliding-window sender pipe (`PumpSend`), RFC 7323 timestamps (PAWS), and per-shard timer heap.
 *   **Layer 3: L7 Application & Protocol Emulation:**  
-    [`engine.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/engine.cpp), [`io_uring_compat.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/io_uring_compat.hpp) (multi-reactor: epoll and zero-syscall io_uring), `nghttp2` (H2/kTLS), `ngtcp2` / `custom_quic_stack` (HTTP/3 and QUIC), `dns_client_engine` (EDNS0/ECS wire-format), and L2/L3 ASTF (ARP, DHCP, IGMP, ND).
+    [`engine.cpp`](samurai/l7_emu_native/engine.cpp), [`io_uring_compat.hpp`](samurai/l7_emu_native/io_uring_compat.hpp) (multi-reactor: epoll and zero-syscall io_uring), `nghttp2` (H2/kTLS), `ngtcp2` / `custom_quic_stack` (HTTP/3 and QUIC), `dns_client_engine` (EDNS0/ECS wire-format), and L2/L3 ASTF (ARP, DHCP, IGMP, ND).
 *   **Layer 4: ZMQ IPC & Worker Execution:**  
-    [`wire_protocol.h`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/wire_protocol.h) (Magic `0x53414D55`), [`pacing_engine.c`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/zmq/lib/pacing_engine.c) (monotonic hybrid pacer), and worker binaries (`samurai_cpu_worker`, `samurai_l7_worker`, `samurai_afxdp_worker`, `samurai_dpdk_worker`).
+    [`wire_protocol.h`](samurai/zmq/daemon/wire_protocol.h) (Magic `0x53414D55`), [`pacing_engine.c`](samurai/zmq/lib/pacing_engine.c) (monotonic hybrid pacer), and worker binaries (`samurai_cpu_worker`, `samurai_l7_worker`, `samurai_afxdp_worker`, `samurai_dpdk_worker`).
 *   **Layer 5: Distributed Control Plane & HA:**  
-    [`master_main.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/daemon/master_main.cpp) (ZMQ ROUTER `:5099`), [`slave_main.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/daemon/slave_main.cpp), [`master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp) (shard partitioning & dynamic rebalancing), [`ha.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/ha.cpp) (File/Redis lease leader election), and [`management_api.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/management_api.cpp) (POSIX REST API `:8089`, HS256 JWT RBAC).
+    [`master_main.cpp`](samurai/control/daemon/master_main.cpp) (ZMQ ROUTER `:5099`), [`slave_main.cpp`](samurai/control/daemon/slave_main.cpp), [`master_coordinator.cpp`](samurai/control/master_coordinator.cpp) (shard partitioning & dynamic rebalancing), [`ha.cpp`](samurai/control/ha.cpp) (File/Redis lease leader election), and [`management_api.cpp`](samurai/control/management_api.cpp) (POSIX REST API `:8089`, HS256 JWT RBAC).
 *   **Layer 6: Scenario Engine, Autopilot & RL:**  
-    [`scenario_engine_native/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/scenario_engine_native/) (persona state machine scheduler), [`closed_loop.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/closed_loop.cpp) (AIMD and RL load autopilot with Prometheus SUT p99 scrape), Mahoraga IQL policy engine (`.srlp` matrix evaluation), and Lever Shield.
+    [`scenario_engine_native/`](samurai/scenario_engine_native) (persona state machine scheduler), [`closed_loop.cpp`](samurai/control/closed_loop.cpp) (AIMD and RL load autopilot with Prometheus SUT p99 scrape), Mahoraga IQL policy engine (`.srlp` matrix evaluation), and Lever Shield.
 *   **Layer 7: CLI, Security Boundary & Licensing:**  
-    [`samurai` CLI](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/cli/main.cpp), [`validation.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/cli/validation.cpp) (CIDR allow/deny evaluation), [`kpi_gate.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/cli/kpi_gate.cpp), [`rfc_suite.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/cli/rfc_suite.cpp) (RFC 2544 suite), and RSA/Ed25519 machine-ID bound licensing.
+    [`samurai` CLI](samurai/cli/main.cpp), [`validation.cpp`](samurai/cli/validation.cpp) (CIDR allow/deny evaluation), [`kpi_gate.cpp`](samurai/cli/kpi_gate.cpp), [`rfc_suite.cpp`](samurai/cli/rfc_suite.cpp) (RFC 2544 suite), and RSA/Ed25519 machine-ID bound licensing.
 
 ---
 
@@ -77,7 +77,7 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-CORE-01`: L4 Dataplane 64-Shard Spinlock False-Sharing Prevention
 *   **Category:** Layer 2 (L4 Stateful Transport)
-*   **Target Code:** [`tcp_dataplane_core.hpp#L477-L479`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.hpp#L477-L479)
+*   **Target Code:** [`tcp_dataplane_core.hpp#L477-L479`](samurai/l4/tcp_dataplane_core.hpp#L477-L479)
 *   **Problem Statement:**  
     `std::array<SpinLock, 64> flow_shard_mu_` places 64 spinlocks consecutively in memory. Since `sizeof(SpinLock)` is 1 to 4 bytes, multiple spinlocks share a single 64-byte L1 cache line. When Core A accesses Shard 0 and Core B accesses Shard 1, hardware cache coherence triggers continuous cache-line invalidation (HITM false sharing).
 *   **Implementation Requirement:**  
@@ -93,7 +93,7 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-CORE-02`: L4 Global `tx_mu_` Spinlock Chokepoint Elimination
 *   **Category:** Layer 2 (L4 Stateful Transport)
-*   **Target Code:** [`tcp_dataplane_core.hpp#L476`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.hpp#L476) and [`tcp_dataplane_core.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.cpp)
+*   **Target Code:** [`tcp_dataplane_core.hpp#L476`](samurai/l4/tcp_dataplane_core.hpp#L476) and [`tcp_dataplane_core.cpp`](samurai/l4/tcp_dataplane_core.cpp)
 *   **Problem Statement:**  
     Although the flow table is divided into 64 shards, all packet transmissions (`EnqueueTxPacketBytes`) funnel into a single global `mutable SpinLock tx_mu_;` guarding `tx_ring_storage_`. Under 16-32 threads, this creates massive CPU lock contention and serializes the entire dataplane.
 *   **Implementation Requirement:**  
@@ -103,7 +103,7 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-CORE-03`: SpinLock TTAS & Exponential Backoff Implementation
 *   **Category:** Layer 2 (L4 Stateful Transport)
-*   **Target Code:** [`spinlock.hpp#L8-L21`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/spinlock.hpp#L8-L21)
+*   **Target Code:** [`spinlock.hpp#L8-L21`](samurai/l4/spinlock.hpp#L8-L21)
 *   **Problem Statement:**  
     The current spinlock uses a naive Test-and-Set loop (`flag.test_and_set()`), executing write transactions on the memory bus even when the lock is already held.
 *   **Implementation Requirement:**  
@@ -112,7 +112,7 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-WORKER-01`: ZMQ CPU Worker Asynchronous Control Channel Decoupling
 *   **Category:** Layer 4 (ZMQ IPC & Worker Execution)
-*   **Target Code:** [`cpu_worker.cpp#L163-L203`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/cpu_worker.cpp#L163-L203)
+*   **Target Code:** [`cpu_worker.cpp#L163-L203`](samurai/zmq/daemon/cpu_worker.cpp#L163-L203)
 *   **Problem Statement:**  
     The worker main thread executes the packet generation loop synchronously. During long-running runs, the ZMQ `pull` socket is completely starved, causing `ABORT`, `PAUSE`, or `SHUTDOWN` messages to queue up unprocessed until the test finishes.
 *   **Implementation Requirement:**  
@@ -126,7 +126,7 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-TEST-L1-01`: AF_XDP Zero-Copy UMEM Saturation & Double-Free Stress
 *   **Category:** Layer 1 (Kernel-Bypass Dataplane)
-*   **Target Code:** [`ddos_samurai/xdp/`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/xdp/) and [`afxdp_worker.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/zmq/daemon/afxdp_worker.cpp)
+*   **Target Code:** [`samurai/xdp/`](samurai/xdp) and [`afxdp_worker.cpp`](samurai/zmq/daemon/afxdp_worker.cpp)
 *   **Task Description:**  
     Drive AF_XDP Fill and Tx rings to capacity under maximum line-rate burst conditions. Test edge cases where the completion ring experiences artificial delays to verify chunk descriptor reclamation and ensure zero double-free or buffer leak defects.
 *   **Automation Script:** `tests/bench_afxdp_umem_saturation.sh`
@@ -134,7 +134,7 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-TEST-L2-01`: L4 Stateful TCP 100K Concurrent Flow Setup (CPS Benchmark)
 *   **Category:** Layer 2 (L4 Stateful Transport)
-*   **Target Code:** [`test_sharded_fastpath.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/test_sharded_fastpath.cpp)
+*   **Target Code:** [`test_sharded_fastpath.cpp`](samurai/l4/test_sharded_fastpath.cpp)
 *   **Task Description:**  
     Concurrently establish 100,000 TCP flows across 12 worker threads. Evaluate 4-tuple hash distribution across the 64 shards to detect imbalance or bucket chain collisions.
 *   **Automation Script:** `./build/zmq/test_sharded_fastpath --flows 100000 --threads 12`
@@ -142,10 +142,10 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-TEST-L2-02`: RFC 6675 SACK Loss Recovery Under 10% Synthetic Loss
 *   **Category:** Layer 2 (L4 Stateful Transport)
-*   **Target Code:** [`tcp_dataplane_core.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.cpp) and [`tcp_dataplane_core.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l4/tcp_dataplane_core.hpp)
+*   **Target Code:** [`tcp_dataplane_core.cpp`](samurai/l4/tcp_dataplane_core.cpp) and [`tcp_dataplane_core.hpp`](samurai/l4/tcp_dataplane_core.hpp)
 *   **Task Description:**  
     Transmit a 50 MB data stream over a virtual network link configured with `netem` 10% packet drop. Validate scoreboard loss identification (`IsLostSeg`), pipe calculation (`ComputePipe`), and selective retransmission without head-of-line collapse.
-*   **Automation Script:** [`tests/test_tcp_sliding_window_loss_recovery.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_tcp_sliding_window_loss_recovery.py)
+*   **Automation Script:** [`tests/test_tcp_sliding_window_loss_recovery.py`](tests/test_tcp_sliding_window_loss_recovery.py)
 *   **Definition of Done (DoD):** Complete stream delivered without corruption; spurious retransmission rate `<= 2%`.
 *   **Status:** **COMPLETED & VERIFIED (PASS)**
 *   **Verification Benchmark Results:**
@@ -161,10 +161,10 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-TEST-L3-01`: Multi-Reactor io_uring vs epoll Syscall & Latency Benchmark
 *   **Category:** Layer 3 (L7 Protocol Emulation)
-*   **Target Code:** [`io_uring_compat.hpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/io_uring_compat.hpp) and [`test_kernel_threaded_io_uring.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
+*   **Target Code:** [`io_uring_compat.hpp`](samurai/l7_emu_native/io_uring_compat.hpp) and [`test_kernel_threaded_io_uring.cpp`](samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
 *   **Task Description:**  
     Execute 100,000 HTTP/1.1 requests under concurrency=32 against both `io_uring` and `epoll` engines. Trace system calls (`strace -c`) and measure context switches.
-*   **Automation Script:** [`tests/bench_iouring_vs_epoll_syscalls.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_iouring_vs_epoll_syscalls.sh)
+*   **Automation Script:** [`tests/bench_iouring_vs_epoll_syscalls.sh`](tests/bench_iouring_vs_epoll_syscalls.sh)
 *   **Definition of Done (DoD):** `io_uring` demonstrates `rx_syscalls=0`, `tx_syscalls=0` and achieves $\ge 20\%$ throughput gain over `epoll`.
 *   **Status:** **COMPLETED & VERIFIED (PASS)**
 *   **Verification Benchmark Results:**
@@ -181,9 +181,9 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-TEST-L3-02`: HTTP/2 kTLS Socket-BIO vs OpenSSL Memory-BIO CPU Overhead
 *   **Category:** Layer 3 (L7 Protocol Emulation)
-*   **Target Code:** [`run_kernel_threaded_h2_e2e.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh), [`test_kernel_threaded_h2.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/l7_emu_native/test_kernel_threaded_h2.cpp)
-*   **Automation Scripts:** [`tests/bench_h2_ktls_vs_memory_bio.sh`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/bench_h2_ktls_vs_memory_bio.sh), [`tests/test_h2_ktls_vs_memory_bio.py`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/tests/test_h2_ktls_vs_memory_bio.py)
-*   **Detailed PR Report:** [`docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md)
+*   **Target Code:** [`run_kernel_threaded_h2_e2e.sh`](samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh), [`test_kernel_threaded_h2.cpp`](samurai/l7_emu_native/test_kernel_threaded_h2.cpp)
+*   **Automation Scripts:** [`tests/bench_h2_ktls_vs_memory_bio.sh`](tests/bench_h2_ktls_vs_memory_bio.sh), [`tests/test_h2_ktls_vs_memory_bio.py`](tests/test_h2_ktls_vs_memory_bio.py)
+*   **Detailed PR Report:** [`docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md`](docs/PR_TASK_TEST_L3_02_H2_KTLS_VS_OPENSSL.md)
 *   **Task Description:**  
     Open 100 concurrent streams over a single TLS connection. Measure CPU cycles and instructions per cycle (IPC) with `perf stat` comparing kernel TLS (kTLS) vs user-space memory BIOs.
 *   **Definition of Done (DoD):** kTLS yields $\ge 20\%$ CPU utilization reduction with zero HTTP/2 protocol errors.
@@ -205,7 +205,7 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-TEST-L5-01`: Distributed Master/Slave Dynamic Rebalancing Under Worker Chaos
 *   **Category:** Layer 5 (Distributed Control Plane & HA)
-*   **Target Code:** [`master_coordinator.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/master_coordinator.cpp)
+*   **Target Code:** [`master_coordinator.cpp`](samurai/control/master_coordinator.cpp)
 *   **Task Description:**  
     Launch 1 Master and 4 Slave worker processes for a 10,000,000 packet job. Mid-test, forcibly terminate one slave (`kill -9`). Verify that the Master detects heartbeat loss within 2,000 ms, reclaims unacknowledged shards, and redistributes them across the surviving 3 slaves.
 *   **Automation Script:** `tests/test_distributed_failover_chaos.py`, `tests/bench_distributed_failover_chaos.sh`
@@ -226,7 +226,7 @@ The following tasks represent the formal backlog of work items to be implemented
     *   **Master Process Deadlock Rate:** **0%** (Clean exitcode 0 across all runs, zero backlog/inflight remaining)
     *   **Determinism Verification:** Coefficient of Variation strictly bounded ($CV = 0.02\% < 5.0\%$) across 5 consecutive benchmark iterations.
     *   **Regression Invariants:** In-tree control selftest matrix passing 100%, Pytest suite (`tests/test_distributed_failover_chaos.py`) passing 3/3 (100%).
-    *   **Artifacts:** Generated report at [`reports/benchmarks/task_l5_01/report.md`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/report.md) and [`summary.json`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/reports/benchmarks/task_l5_01/summary.json).
+    *   **Artifacts:** Generated report at [`reports/benchmarks/task_l5_01/report.md`](reports/benchmarks/task_l5_01/report.md) and [`summary.json`](reports/benchmarks/task_l5_01/summary.json).
 
 ---
 
@@ -234,7 +234,7 @@ The following tasks represent the formal backlog of work items to be implemented
 
 #### `TASK-LIVE-01`: Legitimate Traffic Availability Under 10K RPS L7 Stress
 *   **Category:** Layer 3 & Layer 6 (End-to-End Resilience Evaluation)
-*   **Target Code:** [`closed_loop.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/control/closed_loop.cpp), [`cli/main.cpp`](file:///home/mehmet/Masaüstü/Python/v11/DDoSamurai/ddos_samurai/cli/main.cpp)
+*   **Target Code:** [`closed_loop.cpp`](samurai/control/closed_loop.cpp), [`cli/main.cpp`](samurai/cli/main.cpp)
 *   **Task Description:**  
     Deploy a real HTTP/API target (e.g., Caddy/Nginx reverse proxy with backend API). Simultaneously run:
     1. A constant 50 Hz independent legitimate probe stream measuring baseline latency ($L_{\text{baseline}}$).

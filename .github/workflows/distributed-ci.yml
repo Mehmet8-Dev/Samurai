@@ -4,8 +4,8 @@ on:
   push:
     branches: [ main, architecture/refactor, "claude/**" ]
     paths:
-      - 'ddos_samurai/control/**'
-      - 'ddos_samurai/zmq/**'
+      - 'samurai/control/**'
+      - 'samurai/zmq/**'
       - 'deploy/**'
       - 'tests/test_control*'
       - 'tests/test_audit*'
@@ -14,8 +14,8 @@ on:
   pull_request:
     branches: [ main ]
     paths:
-      - 'ddos_samurai/control/**'
-      - 'ddos_samurai/zmq/**'
+      - 'samurai/control/**'
+      - 'samurai/zmq/**'
       - 'deploy/**'
       - 'tests/test_control*'
       - 'tests/test_audit*'
@@ -48,7 +48,7 @@ jobs:
 
       - name: Build Native Daemons and Workers
         run: |
-          cmake -B build -S ddos_samurai -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)" --target \
             samurai_control_selftest \
             samurai_master \

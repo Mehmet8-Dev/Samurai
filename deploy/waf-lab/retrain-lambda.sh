@@ -24,13 +24,13 @@ echo ">> retrain on pool with lambda_defense=$LAMBDA_DEFENSE -> suffix '$SUFFIX'
 LAMBDA_DEFENSE="$LAMBDA_DEFENSE" SUFFIX="$SUFFIX" ART="$ART" "$PY" - <<'PYEOF'
 import os, glob
 import numpy as np
-from ddos_samurai.models.rl import build_dataset, save_policy
-from ddos_samurai.models.rl.action_spec import MAHORAGA
-from ddos_samurai.models.rl.reward import EffectiveThroughputReward
-from ddos_samurai.models.rl.config import RLConfig
-from ddos_samurai.models.rl.rl2 import train_rl2, RL2Config
-from ddos_samurai.models.rl.train import train_iql, IQLConfig
-from ddos_samurai.models.rl.ope import evaluate_policy
+from samurai.models.rl import build_dataset, save_policy
+from samurai.models.rl.action_spec import MAHORAGA
+from samurai.models.rl.reward import EffectiveThroughputReward
+from samurai.models.rl.config import RLConfig
+from samurai.models.rl.rl2 import train_rl2, RL2Config
+from samurai.models.rl.train import train_iql, IQLConfig
+from samurai.models.rl.ope import evaluate_policy
 
 art = os.environ["ART"]; suffix = os.environ["SUFFIX"]
 ld = float(os.environ["LAMBDA_DEFENSE"])

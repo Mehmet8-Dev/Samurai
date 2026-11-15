@@ -1,12 +1,12 @@
 # 29 - Distributed Control Plane & Shard Orchestration
 
-This document details the architecture, wire protocols, and operational workflows of the native C++ Master/Slave distributed control plane (`ddos_samurai/control/`).
+This document details the architecture, wire protocols, and operational workflows of the native C++ Master/Slave distributed control plane (`samurai/control/`).
 
 ![Samurai Distributed Security & Control Plane](assets/diagrams/samurai_distributed_security.svg)
 
 ---
 
-## 1. Subsystem Component Map (`ddos_samurai/control/`)
+## 1. Subsystem Component Map (`samurai/control/`)
 
 - **Master Daemon:** `daemon/master_main.cpp` (`samurai_master`)
 - **Slave Daemon:** `daemon/slave_main.cpp` (`samurai_slave`)
@@ -41,5 +41,5 @@ This document details the architecture, wire protocols, and operational workflow
 1. **RPC Client Connection:** Connects to the master's endpoint via a ZMQ DEALER socket (`tcp://<MASTER_IP>:5099`).
 2. **Capability Registration:** Announces local node resources (worker kinds, CPU topologies, acceleration hardware) to the cluster coordinator.
 3. **Heartbeat Loop:** Sends periodic 1-second heartbeat frames to maintain cluster membership.
-4. **Shard Execution:** Upon receiving `StartShard`, triggers [`SupervisorShardRunner`](file://ddos_samurai/control/daemon/supervisor_shard_runner.cpp) to spawn local native worker processes via ZMQ IPC.
+4. **Shard Execution:** Upon receiving `StartShard`, triggers [`SupervisorShardRunner`](file://samurai/control/daemon/supervisor_shard_runner.cpp) to spawn local native worker processes via ZMQ IPC.
 5. **Clean Teardown:** Finalizes local jobs upon `StopShard` or `AbortJob` RPC commands, returning serialized execution summaries.

@@ -2,10 +2,10 @@
 # ==============================================================================
 # TASK-TEST-L3-02: HTTP/2 kTLS Socket-BIO vs OpenSSL Memory-BIO CPU Overhead Stress Test
 #
-# Target Code: ddos_samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh
-#              ddos_samurai/l7_emu_native/test_kernel_threaded_h2.cpp
-#              ddos_samurai/l7_emu_native/engine_h2_session.cpp
-#              ddos_samurai/l7_emu_native/tls_session_engine.cpp
+# Target Code: samurai/l7_emu_native/run_kernel_threaded_h2_e2e.sh
+#              samurai/l7_emu_native/test_kernel_threaded_h2.cpp
+#              samurai/l7_emu_native/engine_h2_session.cpp
+#              samurai/l7_emu_native/tls_session_engine.cpp
 #
 # Task Description:
 #   Open 100 concurrent streams over a single TLS connection. Measure CPU cycles,
@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/build"
 BIN_PATH="${BUILD_DIR}/l7_emu_native/test_kernel_threaded_h2"
-SERVER_SCRIPT="${REPO_ROOT}/ddos_samurai/l7_emu_native/test_h2_tls_server.py"
+SERVER_SCRIPT="${REPO_ROOT}/samurai/l7_emu_native/test_h2_tls_server.py"
 
 REQUESTS="${REQUESTS:-10000}"
 CONCURRENCY="${CONCURRENCY:-1}"
@@ -57,7 +57,7 @@ echo "==========================================================================
 # 1. Build test_kernel_threaded_h2 binary if needed
 if [ ! -f "$BIN_PATH" ]; then
   echo "[+] Building test_kernel_threaded_h2 binary..."
-  cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/ddos_samurai"
+  cmake -B "$BUILD_DIR" -S "${REPO_ROOT}/samurai"
   cmake --build "$BUILD_DIR" --target test_kernel_threaded_h2 -j4
 fi
 

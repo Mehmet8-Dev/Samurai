@@ -1,6 +1,0 @@
-apiVersion: v2
-name: ddos-samurai
-description: DDoSamurai distributed control plane (master/slave)
-type: application
-version: 0.3.0
-appVersion: "3.0.0"

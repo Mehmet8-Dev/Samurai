@@ -10,10 +10,10 @@ This document specifies the technical contract between NVIDIA BlueField DPU / DO
 
 | Domain | Responsible Subsystem | Primary Code Artifacts |
 |:---|:---|:---|
-| **GPU CUDA Packet Runtime** | GPU Layer | `ddos_samurai/gpu_packet_cuda/*` |
-| **DPU Authoritative Flow State** | DPU/GPU Contract Layer | `ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp` |
-| **DOCA GPUNetIO Backend ABI** | GPU CUDA Backend | `ddos_samurai/gpu_packet_cuda/tx_backend_doca_gpunetio.cuh`, `doca_gpunetio_backend.cpp` |
-| **ZMQ Process Adapter** | Worker Transport | `ddos_samurai/zmq/daemon/doca_gpunetio_worker.cpp` |
+| **GPU CUDA Packet Runtime** | GPU Layer | `samurai/gpu_packet_cuda/*` |
+| **DPU Authoritative Flow State** | DPU/GPU Contract Layer | `samurai/gpu_packet_cuda/dpu_state_runtime.hpp` |
+| **DOCA GPUNetIO Backend ABI** | GPU CUDA Backend | `samurai/gpu_packet_cuda/tx_backend_doca_gpunetio.cuh`, `doca_gpunetio_backend.cpp` |
+| **ZMQ Process Adapter** | Worker Transport | `samurai/zmq/daemon/doca_gpunetio_worker.cpp` |
 
 `dpu_state_runtime.hpp` is intentionally maintained within `gpu_packet_cuda` rather than the ZMQ transport directory. It defines the mathematical and memory contracts for GPU hot-flow routing, DPU authoritative state tables, and dynamic congestion control feedback.
 
@@ -34,7 +34,7 @@ This document specifies the technical contract between NVIDIA BlueField DPU / DO
 
 ## 3. DPU State Runtime Offload
 
-[`dpu_state_runtime.hpp`](file://ddos_samurai/gpu_packet_cuda/dpu_state_runtime.hpp) executes the following hardware-accelerated tasks:
+[`dpu_state_runtime.hpp`](file://samurai/gpu_packet_cuda/dpu_state_runtime.hpp) executes the following hardware-accelerated tasks:
 - Manages authoritative `FlowState` entries across millions of concurrent connections.
 - Implements the complete RFC 793 / RFC 9293 TCP state machine (CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT, CLOSE-WAIT, LAST-ACK, TIME-WAIT).
 - Parses TCP segments with hardware checksum verification: IPv4/TCP headers, MSS, Window Scale, SACK options, and ECN flags.

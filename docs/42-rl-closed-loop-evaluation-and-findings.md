@@ -2,7 +2,7 @@
 
 This document records the evaluation methodology, experimental benchmarks, root-cause resolutions, and production shipping decisions for the learned policy layer (**Mahoraga RL**) of the closed-loop autopilot within the **Samurai Network Resilience Platform**. The primary objective is to maintain reproducible empirical results and provide a rigorous, quantitative answer to the operational question: *"Does reinforcement learning justify its deployment over heuristic control?"*
 
-Related codebase modules: `ddos_samurai/control/closed_loop.{hpp,cpp}` (native controller and SLO engine), `ddos_samurai/models/rl/` (IQL/RL²/reward/OPE pipelines), and `deploy/waf-lab/` (synthetic testing substrate and evaluation harnesses).
+Related codebase modules: `samurai/control/closed_loop.{hpp,cpp}` (native controller and SLO engine), `samurai/models/rl/` (IQL/RL²/reward/OPE pipelines), and `deploy/waf-lab/` (synthetic testing substrate and evaluation harnesses).
 
 ---
 
@@ -59,7 +59,7 @@ The laboratory substrate defined in `deploy/waf-lab/docker-compose.ratedrop.yml`
 
 The most significant architectural flaw identified was that **HTTP 429 rejections were not classified as SLO violations**. Because 429 responses were categorized separately from 5xx server errors, the controller ramped aggressively into defensive rate walls.
 
-**Resolution:** Implemented `slo_max_pushback_pct` across `ddos_samurai/control/closed_loop.{hpp,cpp}` and `daemon/master_main.cpp`. The master populates pushback metrics using $(4\text{xx} + 5\text{xx}) / \text{responses\_total}$, exposed via the `--cl-slo-max-pushback-pct` flag. This allows heuristic AIMD to identify ceilings and enables RL policies to execute proportional backoff upon encountering pushback.
+**Resolution:** Implemented `slo_max_pushback_pct` across `samurai/control/closed_loop.{hpp,cpp}` and `daemon/master_main.cpp`. The master populates pushback metrics using $(4\text{xx} + 5\text{xx}) / \text{responses\_total}$, exposed via the `--cl-slo-max-pushback-pct` flag. This allows heuristic AIMD to identify ceilings and enables RL policies to execute proportional backoff upon encountering pushback.
 
 ---
 

@@ -5,9 +5,9 @@
 * **Task / Issue Tracking:** `TASK-TEST-L2-02` ([test_task.md](file://test_task.md#L143-L161))
 * **Architectural Layer:** Layer 2 (L4 Stateful Transport & TCP Engine)
 * **Affected Files:**
-  * [`ddos_samurai/l4/tcp_dataplane_core.hpp`](file://ddos_samurai/l4/tcp_dataplane_core.hpp)
-  * [`ddos_samurai/l4/tcp_dataplane_core.cpp`](file://ddos_samurai/l4/tcp_dataplane_core.cpp)
-  * [`ddos_samurai/l4/test_tcp_sliding_window.cpp`](file://ddos_samurai/l4/test_tcp_sliding_window.cpp)
+  * [`samurai/l4/tcp_dataplane_core.hpp`](file://samurai/l4/tcp_dataplane_core.hpp)
+  * [`samurai/l4/tcp_dataplane_core.cpp`](file://samurai/l4/tcp_dataplane_core.cpp)
+  * [`samurai/l4/test_tcp_sliding_window.cpp`](file://samurai/l4/test_tcp_sliding_window.cpp)
   * [`tests/test_tcp_sliding_window_loss_recovery.py`](file://tests/test_tcp_sliding_window_loss_recovery.py)
   * [`test_task.md`](file://test_task.md)
 
@@ -15,7 +15,7 @@
 
 ## 1. Problem Statement & Root Cause Analysis
 
-While the stateful TCP engine in [`TcpDataplaneCore`](file://ddos_samurai/l4/tcp_dataplane_core.hpp) supported RFC 2018 SACK option parsing and out-of-order reassembly, its loss recovery algorithms exhibited standards discrepancies and excessive spurious retransmissions under synthetic packet loss conditions:
+While the stateful TCP engine in [`TcpDataplaneCore`](file://samurai/l4/tcp_dataplane_core.hpp) supported RFC 2018 SACK option parsing and out-of-order reassembly, its loss recovery algorithms exhibited standards discrepancies and excessive spurious retransmissions under synthetic packet loss conditions:
 
 1. **RFC 6675 Byte Threshold Violation (`IsLostSeg`):**
    * *Issue:* The previous implementation evaluated loss using `sacked_bytes_above >= kDupThresh * mss`.
@@ -42,26 +42,26 @@ While the stateful TCP engine in [`TcpDataplaneCore`](file://ddos_samurai/l4/tcp
 ## 2. Engineering Changes & Implementation Details
 
 ### A. Strict RFC 6675 Loss Detection (`IsLostSeg`)
-Updated [`IsLostSeg`](file://ddos_samurai/l4/tcp_dataplane_core.cpp#L1949-L1963) to conform to the formal RFC 6675 Section 4 specification:
+Updated [`IsLostSeg`](file://samurai/l4/tcp_dataplane_core.cpp#L1949-L1963) to conform to the formal RFC 6675 Section 4 specification:
 ```text
 IsLostSeg(S) := (sacked_segs_above >= DupThresh) || (sacked_bytes_above > (DupThresh - 1) * SMSS)
 ```
 
 ### B. Recovery Entry Fast-Retransmit (RFC 6675 Section 5, Step 4.3)
-Inside [`EnterSackRecovery`](file://ddos_samurai/l4/tcp_dataplane_core.cpp#L1980-L2025):
+Inside [`EnterSackRecovery`](file://samurai/l4/tcp_dataplane_core.cpp#L1980-L2025):
 * Retransmits the first unSACKed segment (`HighACK + 1`).
 * Sets both `flow.high_rxt` and `flow.rescue_rxt` to the segment end sequence (`seg_end`).
 * Gated by `!first_seg->retransmitted && SeqGt(seg_end, flow.high_rxt)` to eliminate duplicate retransmissions if the segment is already traversing the network.
 
 ### C. HighRxt Bounding in NextSeg Rule 1
-Enforced RFC 6675 NextSeg Rule 1.a inside [`SackRecoveryTransmit`](file://ddos_samurai/l4/tcp_dataplane_core.cpp#L2025-L2060):
+Enforced RFC 6675 NextSeg Rule 1.a inside [`SackRecoveryTransmit`](file://samurai/l4/tcp_dataplane_core.cpp#L2025-L2060):
 ```text
 S2 > HighRxt
 ```
 Segments below or equal to `HighRxt` are skipped, strictly preventing duplicate transmission across consecutive ACK steps.
 
 ### D. Rescue Retransmit Gating (RFC 6675 Rule 4)
-Added `high_sack` and `rescue_rxt` tracking to [`FlowEntry`](file://ddos_samurai/l4/tcp_dataplane_core.hpp#L250-L257). Rule 4 now only executes when:
+Added `high_sack` and `rescue_rxt` tracking to [`FlowEntry`](file://samurai/l4/tcp_dataplane_core.hpp#L250-L257). Rule 4 now only executes when:
 ```text
 can_rescue := (rescue_rxt != 0) && SeqGt(snd_una, rescue_rxt)
 ```
@@ -75,9 +75,9 @@ If `cwnd - pipe >= SMSS` and unsent data exists in `sndbuf`, up to 1 SMSS is tra
 Removed the destructive clearing of `s.retransmitted` on recovery exit. Segments are retired strictly when cumulatively acknowledged and trimmed/popped from `flow.unacked`.
 
 ### G. Test Introspection & Comprehensive Harness
-* Added [`TestInspectIsLost`](file://ddos_samurai/l4/tcp_dataplane_core.hpp#L178) and [`TestInspectComputePipe`](file://ddos_samurai/l4/tcp_dataplane_core.hpp#L179).
-* Added **Test P** in [`test_tcp_sliding_window.cpp`](file://ddos_samurai/l4/test_tcp_sliding_window.cpp#L935-L1000) for deterministic RFC 6675 byte threshold and pipe calculation verification.
-* Added **Test Q** in [`test_tcp_sliding_window.cpp`](file://ddos_samurai/l4/test_tcp_sliding_window.cpp#L1001-L1175) for 50 MB synthetic 10% packet drop stress testing.
+* Added [`TestInspectIsLost`](file://samurai/l4/tcp_dataplane_core.hpp#L178) and [`TestInspectComputePipe`](file://samurai/l4/tcp_dataplane_core.hpp#L179).
+* Added **Test P** in [`test_tcp_sliding_window.cpp`](file://samurai/l4/test_tcp_sliding_window.cpp#L935-L1000) for deterministic RFC 6675 byte threshold and pipe calculation verification.
+* Added **Test Q** in [`test_tcp_sliding_window.cpp`](file://samurai/l4/test_tcp_sliding_window.cpp#L1001-L1175) for 50 MB synthetic 10% packet drop stress testing.
 * Created Python automation runner [`tests/test_tcp_sliding_window_loss_recovery.py`](file://tests/test_tcp_sliding_window_loss_recovery.py).
 
 ---
