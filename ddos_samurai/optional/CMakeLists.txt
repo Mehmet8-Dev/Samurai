@@ -67,7 +67,7 @@ if(EXISTS ${_xdp_src})
   find_package(Python3 COMPONENTS Interpreter Development QUIET)
   if((LIBXDP_FOUND OR LIBBPF_FOUND) AND Python3_Development_FOUND)
     add_library(xdp_sender SHARED ${_xdp_src}
-      ${SAMURAI_PKG_DIR}/xdp/xdp_core.c ${SAMURAI_PKG_DIR}/pacing_engine.c)
+      ${SAMURAI_PKG_DIR}/xdp/xdp_core.c)
     set_target_properties(xdp_sender PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY ${SAMURAI_PKG_DIR}/xdp PREFIX "" OUTPUT_NAME "xdp_sender")
     target_include_directories(xdp_sender PRIVATE

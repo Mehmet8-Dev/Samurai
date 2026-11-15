@@ -1,6 +1,7 @@
 #ifndef SAMURAI_TSC_H
 #define SAMURAI_TSC_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(__x86_64__) || defined(__i386__)
