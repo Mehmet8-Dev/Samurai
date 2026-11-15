@@ -17,7 +17,7 @@ namespace samurai::telecom {
 /**
  * @brief Carrier-Grade RFC 2544 / RFC 2889 Telemetry Audit Record
  * 
- * Complies with the standard schema defined in plan/03_DIRECTORY_STRUCTURE_AND_CPP_SKELETONS.md:
+ * Complies with the canonical carrier-grade RFC 2544 / RFC 2889 schema:
  * test_id,protocol,subscriber_count,active_sessions,session_setup_rate_cps,
  * session_failure_rate_pct,packets_per_second,rx_drops,tx_errors,
  * cpu_utilization_pct,memory_usage_mb,test_duration_s,hardware_spec

@@ -2,14 +2,13 @@
 
 * **Source Branch:** `test/l2-rfc6675-sack-loss-recovery`
 * **Target Branch:** `main` (or `develop`)
-* **Task / Issue Tracking:** `TASK-TEST-L2-02` ([test_task.md](file://test_task.md#L143-L161))
+* **Task / Issue Tracking:** `TASK-TEST-L2-02`
 * **Architectural Layer:** Layer 2 (L4 Stateful Transport & TCP Engine)
 * **Affected Files:**
   * [`samurai/l4/tcp_dataplane_core.hpp`](file://samurai/l4/tcp_dataplane_core.hpp)
   * [`samurai/l4/tcp_dataplane_core.cpp`](file://samurai/l4/tcp_dataplane_core.cpp)
   * [`samurai/l4/test_tcp_sliding_window.cpp`](file://samurai/l4/test_tcp_sliding_window.cpp)
   * [`tests/test_tcp_sliding_window_loss_recovery.py`](file://tests/test_tcp_sliding_window_loss_recovery.py)
-  * [`test_task.md`](file://test_task.md)
 
 ---
 
@@ -159,4 +158,4 @@ Existing L4 test suites (`test_stateful_fastpath.py`, `test_dpdk_stateful_parity
 - [x] Spurious retransmission rate measured at **0.02%**, comfortably within the **`<= 2.0%`** threshold.
 - [x] Head-of-line collapse prevented via selective retransmission.
 - [x] Automated test script [`tests/test_tcp_sliding_window_loss_recovery.py`](file://tests/test_tcp_sliding_window_loss_recovery.py) verified with both `unittest` and `pytest`.
-- [x] Backlog documentation updated in [`test_task.md`](file://test_task.md).
+- [x] Archived task specification reconciled and closed out.

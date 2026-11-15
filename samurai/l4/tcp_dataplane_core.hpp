@@ -510,7 +510,7 @@ class TcpDataplaneCore {
   // adjacent shards. Each AlignedSpinLock occupies its own 64-byte L1 cache
   // line, eliminating cross-core cache invalidation when different threads
   // access different shards concurrently.
-  // See: TASK-CORE-01 in test_task.md — Relates to #4
+  // TASK-CORE-01: 64-shard flow table cache-line padding — Relates to #4
   struct alignas(64) AlignedSpinLock : public SpinLock {};
 
   // TASK-CORE-02: Per-shard TX ring buffer to eliminate single global tx_mu_ bottleneck.

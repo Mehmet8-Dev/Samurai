@@ -2,7 +2,7 @@
 
 * **Source Branch:** `test/task-test-l3-02-h2-ktls-vs-openssl`
 * **Target Branch:** `main`
-* **Task / Issue Tracking:** `TASK-TEST-L3-02` ([test_task.md](../../../test_task.md#L182-L188))
+* **Task / Issue Tracking:** `TASK-TEST-L3-02`
 * **Architectural Layer:** Layer 3 (L7 Protocol Emulation & Transport Cryptographic Offload Architecture)
 * **Affected Files:**
   * [`samurai/l7_emu_native/test_kernel_threaded_h2.cpp`](file://samurai/l7_emu_native/test_kernel_threaded_h2.cpp)
@@ -12,7 +12,6 @@
   * [`tests/test_h2_ktls_vs_memory_bio.py`](file://tests/test_h2_ktls_vs_memory_bio.py)
   * [`reports/benchmarks/task_l3_02/report.md`](file://reports/benchmarks/task_l3_02/report.md)
   * [`reports/benchmarks/task_l3_02/summary.json`](file://reports/benchmarks/task_l3_02/summary.json)
-  * [`test_task.md`](../../../test_task.md)
 
 ---
 

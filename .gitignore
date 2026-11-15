@@ -10,10 +10,8 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 *.md
 !/README.md
 !/CHANGELOG.md
-!/KOZALAK_WAF_RESILIENCE_BENCHMARK_REPORT.md
 !docs/*.md
 !docs/**/*.md
-!test_task.md
 !docs/PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md
 !docs/28-scenario-engine-web-mobile-persona.md
 !docs/33-doca-gpunetio-migration-status.md
@@ -33,7 +31,6 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !docs/42-rl-closed-loop-evaluation-and-findings.md
 !docs/scenario_engine.md
 !docs/distributed-ha-smoke.md
-!plan/*.md
 !docs/pitch-teknik-hazirlik-barikat.md
 !docs/PR_TASK_TEST_L2_02_RFC6675_SACK.md
 !docs/PR_TASK_TEST_L3_01_IOURING_VS_EPOLL.md

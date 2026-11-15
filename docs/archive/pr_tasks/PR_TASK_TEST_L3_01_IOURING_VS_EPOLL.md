@@ -2,7 +2,7 @@
 
 * **Source Branch:** `test/task-test-l3-01-iouring-vs-epoll`
 * **Target Branch:** `main` (or `develop`)
-* **Task / Issue Tracking:** `TASK-TEST-L3-01` ([test_task.md](../../../test_task.md#L162-L182))
+* **Task / Issue Tracking:** `TASK-TEST-L3-01`
 * **Architectural Layer:** Layer 3 (L7 Protocol Emulation & Transport Reactor Architecture)
 * **Affected Files:**
   * [`samurai/l7_emu_native/io_uring_compat.hpp`](file://samurai/l7_emu_native/io_uring_compat.hpp)
@@ -12,7 +12,6 @@
   * [`samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp`](file://samurai/l7_emu_native/test_kernel_threaded_io_uring.cpp)
   * [`tests/bench_iouring_vs_epoll_syscalls.sh`](file://tests/bench_iouring_vs_epoll_syscalls.sh)
   * [`tests/test_iouring_vs_epoll_syscalls.py`](file://tests/test_iouring_vs_epoll_syscalls.py)
-  * [`test_task.md`](../../../test_task.md)
   * [`.gitignore`](../../../.gitignore)
 
 ---
@@ -132,4 +131,4 @@ In compliance with our engineering honesty and benchmark rigor standards:
 - [x] **100,000 Requests Completed:** 100.0% HTTP 200 OK responses with zero corrupted payloads across 32 concurrent shards.
 - [x] **Strict DoD Enforcement:** All criteria enforced simultaneously in runner; failure of any metric exits 1.
 - [x] **Regression & Queue Accounting Suite:** Unit test `TestIoUringQueueAccounting()` and CI script [`tests/test_iouring_vs_epoll_syscalls.py`](file://tests/test_iouring_vs_epoll_syscalls.py) verified 100% passing.
-- [x] **Task Tracking Documentation Updated:** [`test_task.md`](../../../test_task.md) updated.
+- [x] **Task Tracking Documentation Updated:** Archived task specification reconciled and closed out.
