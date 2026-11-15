@@ -81,6 +81,10 @@ HeartbeatOutcome SlaveNode::HeartbeatOnce() {
     const Value* se = r.body.find("stop_leader_epoch");
     on_stop_(stop->as_string(""), se ? se->as_int(0) : 0);
   }
+  const Value* reconf = r.body.find("reconfigure_shard");
+  if (reconf && reconf->is_object() && on_reconfigure_) {
+    on_reconfigure_(*reconf);
+  }
   return out;
 }
 

@@ -24,7 +24,9 @@ namespace samurai::control::daemon {
 class SupervisorShardRun : public samurai::control::ShardRun {
  public:
   SupervisorShardRun(samurai::orchestrator::SupervisorConfig cfg,
-                     samurai::orchestrator::JobOptions job);
+                     samurai::orchestrator::JobOptions job,
+                     std::shared_ptr<samurai::orchestrator::WarmWorkerPool> pool = nullptr,
+                     std::string shard_id = "");
   ~SupervisorShardRun() override;
 
   bool IsAlive() override { return !done_.load(); }
@@ -32,17 +34,23 @@ class SupervisorShardRun : public samurai::control::ShardRun {
   std::int64_t Sent() const override { return static_cast<std::int64_t>(stats_.sent); }
   std::int64_t Errors() const override { return static_cast<std::int64_t>(stats_.errors); }
   int ExitCode() const override { return terminated_.load() ? -15 : exit_code_; }
-  void Terminate() override { terminated_.store(true); }  // best-effort; RunJob isn't cancellable
+  void Terminate() override { terminated_.store(true); }
   void Join() override;
 
-  // L7 defense-reaction signals folded from the worker's engine_result, emitted
-  // as top-level numeric fields so the master's aggregator sums them into
-  // numeric_totals (where RlDefenseJson reads them). Read after the run joins.
+  // Sends a live RECONFIGURE_JOB window frame through the warm pool while this
+  // shard is active.
+  bool Reconfigure(const samurai::wire::ReconfigureWindowV1& window);
+  bool Reconfigure(const samurai::core::json::Value& params) override;
+
+  // L7 defense-reaction, IPFIX export, and Telco signals emitted as top-level
+  // numeric fields so MasterCoordinator's aggregator folds them across shards.
   samurai::core::json::Value MetricsJson() const override;
 
  private:
   samurai::orchestrator::SupervisorConfig cfg_;
   samurai::orchestrator::JobOptions job_;
+  std::shared_ptr<samurai::orchestrator::WarmWorkerPool> pool_;
+  std::string shard_id_;
   samurai::orchestrator::RunStats stats_{};
   int exit_code_ = 0;
   std::atomic<bool> done_{false};
@@ -54,16 +62,28 @@ class SupervisorShardRunner : public samurai::control::ShardRunner {
  public:
   // Fixed-flavor: every shard runs `worker`.
   SupervisorShardRunner(samurai::orchestrator::WorkerEntry worker, std::string worker_dir)
-      : fixed_(worker), worker_dir_(std::move(worker_dir)) {}
+      : fixed_(worker),
+        worker_dir_(std::move(worker_dir)),
+        pool_(std::make_shared<samurai::orchestrator::WarmWorkerPool>()) {}
 
   // Bundle: resolve the worker binary per shard from the job's `worker` field
   // (falls back to `fallback` when the field is missing or unknown). The node is
   // expected to hold every worker binary in `worker_dir`.
   SupervisorShardRunner(std::string worker_dir, samurai::orchestrator::WorkerEntry fallback)
-      : fallback_(fallback), worker_dir_(std::move(worker_dir)), bundle_(true) {}
+      : fallback_(fallback),
+        worker_dir_(std::move(worker_dir)),
+        bundle_(true),
+        pool_(std::make_shared<samurai::orchestrator::WarmWorkerPool>()) {}
 
   std::shared_ptr<samurai::control::ShardRun> Start(
       const std::string& shard_id, const samurai::core::json::Value& args) override;
+
+  bool ReconfigureShard(const std::string& shard_id,
+                        const samurai::wire::ReconfigureWindowV1& window);
+  bool ReconfigureShard(const std::string& shard_id,
+                        const samurai::core::json::Value& params) override;
+
+  std::shared_ptr<samurai::orchestrator::WarmWorkerPool> warm_pool() const { return pool_; }
 
  private:
   // Which worker binary to spawn for this shard's args (bundle: from args).
@@ -73,6 +93,7 @@ class SupervisorShardRunner : public samurai::control::ShardRunner {
   samurai::orchestrator::WorkerEntry fallback_{};  // used in bundle_ when unresolved
   std::string worker_dir_;
   bool bundle_ = false;
+  std::shared_ptr<samurai::orchestrator::WarmWorkerPool> pool_;
 };
 
 }  // namespace samurai::control::daemon

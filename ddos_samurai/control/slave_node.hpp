@@ -48,6 +48,9 @@ class SlaveNode {
   void set_on_stop(std::function<void(const std::string&, std::int64_t)> cb) {
     on_stop_ = std::move(cb);
   }
+  void set_on_reconfigure(std::function<void(const samurai::core::json::Value&)> cb) {
+    on_reconfigure_ = std::move(cb);
+  }
 
   // Reverse-mode pickup echo: when set, each heartbeat reports the shard the
   // worker is currently running ("" = idle) so the master can confirm the
@@ -76,6 +79,7 @@ class SlaveNode {
   std::function<void(int)> sleep_ms_;
   std::function<void(const samurai::core::json::Value&)> on_start_;
   std::function<void(const std::string&, std::int64_t)> on_stop_;
+  std::function<void(const samurai::core::json::Value&)> on_reconfigure_;
   std::function<std::string()> active_shard_provider_;
 };
 

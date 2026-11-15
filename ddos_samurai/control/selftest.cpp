@@ -2963,6 +2963,212 @@ int main() {
 
     master_server.Stop();
   }
+
+  // --- ReconfigureShard RPC (direct + epoch fence + reverse heartbeat) & Management API ---
+  {
+    namespace json = samurai::core::json;
+    using namespace samurai::control;
+    struct ReconfRun : ShardRun {
+      std::atomic<bool> alive{true};
+      std::atomic<bool> term{false};
+      std::mutex rmu;
+      std::vector<double> seen_rps;
+      bool IsAlive() override { return alive.load(); }
+      std::int64_t Progress() const override { return 42; }
+      std::int64_t Sent() const override { return 42; }
+      std::int64_t Errors() const override { return 0; }
+      int ExitCode() const override { return 0; }
+      void Terminate() override { term.store(true); alive.store(false); }
+      void Join() override {
+        while (!term.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        alive.store(false);
+      }
+      bool Reconfigure(const json::Value& params) override {
+        std::lock_guard<std::mutex> lk(rmu);
+        if (const json::Value* v = params.find("target_rps")) {
+          seen_rps.push_back(v->as_double(0.0));
+          return true;
+        }
+        return false;
+      }
+    };
+    struct ReconfRunner : ShardRunner {
+      std::shared_ptr<ReconfRun> last;
+      std::shared_ptr<ShardRun> Start(const std::string&, const json::Value&) override {
+        last = std::make_shared<ReconfRun>();
+        return last;
+      }
+    };
+
+    AuthConfig no_auth;
+    ReconfRunner runner;
+    WorkerShardService svc("w-reconf", &runner);
+    ControlServer worker_srv("tcp://127.0.0.1:*", &svc, no_auth);
+    Check(worker_srv.Start(), "reconf-direct: worker server starts");
+    const std::string wep = worker_srv.endpoint();
+
+    json::Value sreq = json::Value::Object();
+    sreq.set("shard_id", json::Value::Str("sh-rc-1"));
+    sreq.set("job_id", json::Value::Str("job-rc-1"));
+    json::Value sargs = json::Value::Object();
+    sargs.set("count", json::Value::Int(100));
+    sargs.set("_leader_epoch", json::Value::Int(5));
+    sreq.set("args_json", json::Value::Str(sargs.dump()));
+    sreq.set("packet_count", json::Value::Int(100));
+    const json::Value start_res = svc.StartShard(sreq, RpcContext{});
+    Check(start_res.find("started") && start_res.find("started")->as_bool(false),
+          "reconf-direct: shard started");
+
+    WorkerControlClient wcli(wep);
+    const auto r_ok = wcli.ReconfigureShard("sh-rc-1", "{\"target_rps\":1234.5}", 5);
+    Check(r_ok.ok && r_ok.body.find("reconfigured") &&
+              r_ok.body.find("reconfigured")->as_bool(false),
+          "reconf-direct: live ReconfigureShard RPC succeeds at epoch 5");
+    const auto r_stale = wcli.ReconfigureShard("sh-rc-1", "{\"target_rps\":9999}", 4);
+    const json::Value* r_stale_ok = r_stale.body.find("reconfigured");
+    const json::Value* r_stale_err = r_stale.body.find("error");
+    Check(r_stale.ok && r_stale_ok && !r_stale_ok->as_bool(true) && r_stale_err &&
+              r_stale_err->as_string("").find("stale leader epoch") != std::string::npos,
+          "reconf-direct: stale leader_epoch 4 rejected by fence");
+    {
+      std::lock_guard<std::mutex> lk(runner.last->rmu);
+      Check(runner.last->seen_rps.size() == 1 &&
+                std::abs(runner.last->seen_rps[0] - 1234.5) < 1e-6,
+            "reconf-direct: ShardRun::Reconfigure received updated target_rps");
+    }
+
+    // Reverse heartbeat reconfigure path
+    ServicerConfig mcfg;
+    mcfg.cluster_id = "cluster-reconf";
+    Servicer master_svc(mcfg);
+    ControlServer master_srv("tcp://127.0.0.1:*", &master_svc, no_auth);
+    Check(master_srv.Start(), "reconf-rev: master server starts");
+    SlaveControlClient sl_cli(master_srv.endpoint());
+    SlaveConfig slcfg;
+    slcfg.worker_id = "w-reconf";
+    slcfg.capabilities["dispatch_mode"] = "reverse";
+    SlaveNode slave(&sl_cli, slcfg);
+    slave.set_on_reconfigure([&svc](const json::Value& r) { svc.ReconfigureShard(r, RpcContext{}); });
+    slave.set_active_shard_provider([&svc]() { return svc.ActiveShardId(); });
+    Check(slave.Register(), "reconf-rev: registers");
+
+    PendingCommand rcmd;
+    rcmd.type = "reconfigure";
+    rcmd.shard_id = "sh-rc-1";
+    rcmd.leader_epoch = 5;
+    rcmd.args_json = "{\"target_rps\":5678.0}";
+    master_svc.EnqueueCommand("w-reconf", rcmd);
+    Check(slave.HeartbeatOnce().ok, "reconf-rev: heartbeat delivers reconfigure");
+    {
+      std::lock_guard<std::mutex> lk(runner.last->rmu);
+      Check(runner.last->seen_rps.size() == 2 &&
+                std::abs(runner.last->seen_rps[1] - 5678.0) < 1e-6,
+            "reconf-rev: ShardRun::Reconfigure updated via reverse heartbeat");
+    }
+
+    json::Value stop = json::Value::Object();
+    stop.set("shard_id", json::Value::Str("sh-rc-1"));
+    stop.set("_leader_epoch", json::Value::Int(5));
+    svc.StopShard(stop, RpcContext{});
+    svc.WaitForShardIdle("sh-rc-1");
+    master_srv.Stop();
+    worker_srv.Stop();
+  }
+
+  // --- Management API POST /v1/shards/reconfigure + MasterCoordinator live tick ---
+  {
+    namespace json = samurai::core::json;
+    using namespace samurai::control;
+    ManagementConfig mcfg;
+    mcfg.role_tokens["viewer"] = "view-tok";
+    mcfg.role_tokens["operator"] = "op-tok";
+    ManagementProviders providers;
+    std::string seen_reconf_shard;
+    providers.reconfigure_callback = [&](const json::Value& b) {
+      if (const auto* s = b.find("shard_id")) seen_reconf_shard = s->as_string("");
+      json::Value o = json::Value::Object();
+      o.set("reconfigured", json::Value::Bool(true));
+      o.set("applied", json::Value::Int(1));
+      return o;
+    };
+    ManagementApi api(mcfg, providers);
+
+    HttpRequest r_view;
+    r_view.method = "POST";
+    r_view.path = "/v1/shards/reconfigure";
+    r_view.headers["authorization"] = "Bearer view-tok";
+    r_view.body = "{\"shard_id\":\"s1\",\"target_rps\":500}";
+    Check(api.Handle(r_view).status == 403, "mgmt-reconf: viewer forbidden");
+
+    HttpRequest r_op = r_view;
+    r_op.headers["authorization"] = "Bearer op-tok";
+    auto resp = api.Handle(r_op);
+    Check(resp.status == 200 && seen_reconf_shard == "s1",
+          "mgmt-reconf: operator succeeds and invokes callback");
+
+    struct LiveTickView : MasterView {
+      std::vector<WorkerInfo> ws;
+      std::map<std::string, std::string> stats;
+      std::vector<WorkerInfo> Workers() override { return ws; }
+      bool ShardReported(const std::string& sid) override { return stats.count(sid) > 0; }
+      std::string GetShardStats(const std::string& sid) override {
+        return stats.count(sid) ? stats[sid] : "{}";
+      }
+      void SetShardStats(const std::string& sid, const std::string& s) override { stats[sid] = s; }
+    };
+    struct LiveTickCmd : WorkerCommander {
+      int reconf_calls = 0;
+      std::string last_reconf_args;
+      bool stopped = false;
+      DispatchOutcome Dispatch(const std::string&, const std::string&, const std::string&,
+                               const std::string&, std::int64_t, std::int64_t) override {
+        return {true, "ok"};
+      }
+      ProbeOutcome Probe(const std::string&, const std::string&) override {
+        ProbeOutcome p;
+        p.state = stopped ? "done" : "running";
+        p.active_shard_id = "live-j-shard-1";
+        p.stats_json = "{\"sent\":100,\"errors\":0}";
+        return p;
+      }
+      bool StopShard(const std::string&, const std::string&, std::int64_t) override {
+        stopped = true;
+        return true;
+      }
+      bool ReconfigureShard(const std::string&, const std::string&,
+                            const std::string& args_json, std::int64_t) override {
+        ++reconf_calls;
+        last_reconf_args = args_json;
+        return true;
+      }
+    };
+
+    LiveTickView ltv;
+    WorkerInfo wi;
+    wi.worker_id = "w1";
+    wi.capabilities["control_endpoint"] = "tcp://127.0.0.1:9";
+    ltv.ws.push_back(wi);
+    LiveTickCmd ltc;
+    std::int64_t fake_now = 1000;
+    MasterCoordinator coord(&ltv, &ltc, [&]() { return fake_now; }, [&](int ms) { fake_now += ms; });
+    JobConfig jc;
+    jc.count = 10000;
+    jc.shard_unit_count = 10000;
+    jc.job_timeout_s = 30;
+    jc.master_poll_interval_ms = 500;
+    jc.window_tick_interval_ms = 500;
+    jc.window_tick_cb = [](int tick, const std::vector<ProbeOutcome>& probes, bool& should_stop) {
+      if (probes.empty()) return std::string();
+      if (tick == 0) return std::string("{\"target_rps\":2500}");
+      should_stop = true;
+      return std::string();
+    };
+    const JobResult jr = coord.RunSingleJob(jc, "live-j");
+    Check(jr.rc == 0 && ltc.reconf_calls == 1 &&
+              ltc.last_reconf_args.find("2500") != std::string::npos &&
+              ltc.stopped,
+          "coord-live-tick: pushes live ReconfigureShard then converges clean stop");
+  }
 #endif  // SAMURAI_CONTROL_HAVE_ZMQ
 
   if (g_failures == 0) {

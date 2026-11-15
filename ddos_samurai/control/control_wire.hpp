@@ -21,6 +21,7 @@ inline constexpr const char* kRegisterWorker = "RegisterWorker";
 inline constexpr const char* kHeartbeat = "Heartbeat";
 inline constexpr const char* kStartShard = "StartShard";
 inline constexpr const char* kStopShard = "StopShard";
+inline constexpr const char* kReconfigureShard = "ReconfigureShard";
 inline constexpr const char* kReportStats = "ReportStats";
 inline constexpr const char* kAbortJob = "AbortJob";
 inline constexpr const char* kGetWorkerStatus = "GetWorkerStatus";

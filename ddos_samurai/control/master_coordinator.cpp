@@ -129,10 +129,59 @@ MasterCoordinator::MasterCoordinator(MasterView* view, WorkerCommander* commande
   });
 }
 
+int MasterCoordinator::ReconfigureActiveShards(const std::string& args_json,
+                                               std::int64_t leader_epoch,
+                                               const std::string& filter_shard_id,
+                                               const std::string& filter_worker_id) {
+  if (!commander_ || args_json.empty()) return 0;
+  std::vector<std::pair<std::string, ActiveShardTarget>> targets;
+  {
+    std::lock_guard<std::mutex> lk(active_mu_);
+    for (const auto& kv : active_shards_) {
+      if (!filter_shard_id.empty() && kv.first != filter_shard_id) continue;
+      if (!filter_worker_id.empty() && kv.second.worker_id != filter_worker_id) continue;
+      targets.push_back(kv);
+    }
+  }
+  int applied = 0;
+  for (const auto& item : targets) {
+    const std::string& sid = item.first;
+    const ActiveShardTarget& tgt = item.second;
+    const std::int64_t eff_epoch = (leader_epoch >= 0) ? leader_epoch : tgt.leader_epoch;
+    bool ok = false;
+    if (tgt.via_reverse) {
+      ok = commander_->ReconfigureShardReverse(tgt.worker_id, sid, args_json, eff_epoch);
+    } else {
+      if (!tgt.endpoint.empty()) {
+        ok = commander_->ReconfigureShard(tgt.endpoint, sid, args_json, eff_epoch);
+      }
+      if (!ok && tgt.is_auto) {
+        ok = commander_->ReconfigureShardReverse(tgt.worker_id, sid, args_json, eff_epoch);
+      }
+    }
+    if (ok) ++applied;
+  }
+  return applied;
+}
+
+std::map<std::string, std::string> MasterCoordinator::ActiveShardWorkers() const {
+  std::lock_guard<std::mutex> lk(active_mu_);
+  std::map<std::string, std::string> out;
+  for (const auto& kv : active_shards_) {
+    out[kv.first] = kv.second.worker_id;
+  }
+  return out;
+}
+
 JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::string& job_id,
                                           std::function<bool()> leadership_guard) {
   JobResult result;
-  const bool is_telco = job.is_telco_job || (job.base_args.is_object() && job.base_args.find("telco") != nullptr);
+  const bool is_telco =
+      job.is_telco_job ||
+      (job.base_args.is_object() &&
+       (job.base_args.find("telco") != nullptr ||
+        (job.base_args.find("worker") != nullptr &&
+         Lower(Strip(job.base_args.find("worker")->as_string(""))) == "telco")));
   const std::int64_t total_workload = is_telco ? (job.telco_subscribers > 0 ? static_cast<std::int64_t>(job.telco_subscribers) : job.count) : job.count;
 
   if (total_workload <= 0) {
@@ -236,6 +285,25 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
   std::set<std::string> done_shards;
   std::vector<std::string> dispatch_failures;
 
+  struct ActiveScopeGuard {
+    std::mutex& mu;
+    std::map<std::string, ActiveShardTarget>& m;
+    std::set<std::string>& sids;
+    ~ActiveScopeGuard() {
+      std::lock_guard<std::mutex> lk(mu);
+      for (const auto& s : sids) m.erase(s);
+    }
+  } active_scope_guard{active_mu_, active_shards_, all_sids};
+
+  auto track_active = [&](const std::string& sid, const ActiveShardTarget& tgt) {
+    std::lock_guard<std::mutex> lk(active_mu_);
+    active_shards_[sid] = tgt;
+  };
+  auto untrack_active = [&](const std::string& sid) {
+    std::lock_guard<std::mutex> lk(active_mu_);
+    active_shards_.erase(sid);
+  };
+
   auto endpoint_of = [&](const std::map<std::string, WorkerInfo>& workers, const std::string& wid) {
     auto it = workers.find(wid);
     if (it == workers.end()) return std::string();
@@ -269,6 +337,12 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
   };
 
   const std::int64_t deadline = now_ms_() + wait_s * 1000;
+  std::int64_t next_window_tick_ms =
+      (job.window_tick_cb && job.window_tick_interval_ms > 0)
+          ? (now_ms_() + job.window_tick_interval_ms)
+          : 0;
+  int window_tick_index = 0;
+  bool converged_stop = false;
 
   while (now_ms_() < deadline) {
     if (leadership_guard && !leadership_guard()) {
@@ -325,6 +399,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
         it = inflight_by_worker.erase(it);
         inflight_by_sid.erase(sh.shard_id);
         reverse_dispatch_ms.erase(sh.shard_id);
+        untrack_active(sh.shard_id);
         if (!done_shards.count(sh.shard_id)) {
           sh.attempt += 1;
           if (sh.attempt <= job.max_shard_retries) pending.push_front(sh);
@@ -344,6 +419,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     }
 
     // Completion via reported stats or status probe.
+    std::map<std::string, ProbeOutcome> probed_this_tick;
     std::vector<std::string> sids;
     sids.reserve(inflight_by_sid.size());
     for (const auto& kv : inflight_by_sid) sids.push_back(kv.first);
@@ -355,6 +431,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
         const std::string wid = sit->second.worker_id;
         inflight_by_sid.erase(sit);
         inflight_by_worker.erase(wid);
+        untrack_active(sid);
         continue;
       }
       const std::string wid = sit->second.worker_id;
@@ -375,6 +452,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
           inflight_by_sid.erase(sid);
           inflight_by_worker.erase(wid);
           reverse_dispatch_ms.erase(sid);
+          untrack_active(sid);
           if (!done_shards.count(sid)) {
             sh.attempt += 1;
             if (sh.attempt <= job.max_shard_retries) {
@@ -390,6 +468,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       const std::string ep = endpoint_of(workers, wid);
       if (ep.empty()) continue;
       const ProbeOutcome probe = commander_->Probe(ep, wid);
+      probed_this_tick[sid] = probe;
       const std::string st = Lower(Strip(probe.state));
       if ((st == "done" || st == "error") &&
           (probe.active_shard_id.empty() || probe.active_shard_id == sid)) {
@@ -399,6 +478,45 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
         done_shards.insert(sid);
         inflight_by_sid.erase(sid);
         inflight_by_worker.erase(wid);
+        untrack_active(sid);
+      }
+    }
+
+    // Live closed-loop / window transition tick: collect probes across active
+    // shards and push live ReconfigureShard RPCs without worker teardown.
+    if (job.window_tick_cb && job.window_tick_interval_ms > 0 &&
+        !inflight_by_sid.empty() && now >= next_window_tick_ms) {
+      std::vector<ProbeOutcome> live_probes;
+      live_probes.reserve(inflight_by_sid.size());
+      for (const auto& kv : inflight_by_sid) {
+        const std::string& sid = kv.first;
+        const std::string& wid = kv.second.worker_id;
+        auto pit = probed_this_tick.find(sid);
+        if (pit != probed_this_tick.end()) {
+          live_probes.push_back(pit->second);
+        } else if (!reverse_dispatch_ms.count(sid)) {
+          const std::string ep = wid.empty() ? std::string() : endpoint_of(workers, wid);
+          if (!ep.empty()) {
+            live_probes.push_back(commander_->Probe(ep, wid));
+          }
+        } else {
+          ProbeOutcome syn;
+          syn.active_shard_id = sid;
+          syn.state = "running";
+          live_probes.push_back(std::move(syn));
+        }
+      }
+      bool should_stop = false;
+      const std::string next_args =
+          job.window_tick_cb(window_tick_index++, live_probes, should_stop);
+      next_window_tick_ms = now + job.window_tick_interval_ms;
+      if (should_stop) {
+        converged_stop = true;
+        pending.clear();
+        break;
+      }
+      if (!next_args.empty()) {
+        ReconfigureActiveShards(next_args, job.leader_epoch);
       }
     }
 
@@ -461,6 +579,15 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
       args.set("_worker_id", Value::Str(wid));
       args.set("_leader_epoch", Value::Int(job.leader_epoch));
       args.set("db_port", Value::Int(job.db_port));
+      if (job.ipfix_enabled) {
+        args.set("ipfix_enabled", Value::Bool(true));
+        args.set("ipfix_collector", Value::Str(job.ipfix_collector));
+        args.set("ipfix_port", Value::Int(job.ipfix_port));
+        args.set("ipfix_sample_rate", Value::Int(job.ipfix_sample_rate));
+        args.set("ipfix_netflow_v9", Value::Bool(job.ipfix_netflow_v9));
+        args.set("ipfix_domain_id", Value::Int(job.ipfix_domain_id));
+        args.set("ipfix_export_interval_ms", Value::Int(job.ipfix_export_interval_ms));
+      }
       if (sh.is_telco) {
         args.set("worker", Value::Str("telco"));
         args.set("telco", sh.telco_spec.ToJson());
@@ -472,6 +599,16 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
         args.set("base_vlan_c", Value::Int(sh.telco_spec.range.base_vlan_c));
         args.set("base_ip", Value::Int(sh.telco_spec.range.base_ip));
         args.set("gateway_ip", Value::Int(sh.telco_spec.range.gateway_ip));
+        if (job.telco_duration_ms > 0) {
+          args.set("duration_ms", Value::Int(job.telco_duration_ms));
+        }
+        if (job.sctp_rate > 0) args.set("sctp_rate", Value::Int(job.sctp_rate));
+        if (job.diameter_rate > 0) args.set("diameter_rate", Value::Int(job.diameter_rate));
+        if (job.sip_rate > 0) args.set("sip_rate", Value::Int(job.sip_rate));
+        if (job.enable_srtp) args.set("enable_srtp", Value::Bool(true));
+        if (job.teid_start > 0) args.set("teid_start", Value::Int(job.teid_start));
+        if (job.teid_count > 0) args.set("teid_count", Value::Int(job.teid_count));
+        args.set("qfi", Value::Int(job.qfi));
       }
       DispatchOutcome d;
       bool via_reverse = false;
@@ -500,6 +637,8 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
         inflight_by_worker[wid] = sh;
         inflight_by_sid[sh.shard_id] = sh;
         if (via_reverse) reverse_dispatch_ms[sh.shard_id] = now;
+        track_active(sh.shard_id,
+                     ActiveShardTarget{wid, ep, via_reverse, is_auto(workers, wid), job.leader_epoch});
       } else {
         dispatch_failures.push_back(d.message.empty()
                                         ? ("E_STARTSHARD_REJECTED worker=" + wid + " shard=" + sh.shard_id)
@@ -532,6 +671,16 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
         stopped = commander_->StopShard(ep, sid, job.leader_epoch);
       }
       if (stopped) {
+        if (converged_stop && !reverse_dispatch_ms.count(sid) && !ep.empty() &&
+            !view_->ShardReported(sid)) {
+          const ProbeOutcome probe = commander_->Probe(ep, wid);
+          if (!probe.stats_json.empty() && probe.stats_json != "{}") {
+            view_->SetShardStats(sid, probe.stats_json);
+          }
+          done_shards.insert(sid);
+          inflight_by_sid.erase(sid);
+          if (!wid.empty()) inflight_by_worker.erase(wid);
+        }
         it = unresolved.erase(it);
       } else {
         ++it;
@@ -578,6 +727,27 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
   snap.set("pending_shards_left", Value::Int(static_cast<std::int64_t>(pending.size())));
   snap.set("inflight_shards_left", Value::Int(static_cast<std::int64_t>(inflight_by_sid.size())));
 
+  if (const Value* nt = agg_field("numeric_totals"); nt && nt->is_object()) {
+    auto ntdbl = [&](const char* k) -> double {
+      const Value* v = nt->find(k);
+      return v ? v->as_double(0.0) : 0.0;
+    };
+    if (nt->find("ipfix_exported_packets") || nt->find("ipfix_exported_records")) {
+      Value ipfix_obj = Value::Object();
+      ipfix_obj.set("exported_packets", Value::Int(static_cast<std::int64_t>(ntdbl("ipfix_exported_packets"))));
+      ipfix_obj.set("exported_records", Value::Int(static_cast<std::int64_t>(ntdbl("ipfix_exported_records"))));
+      snap.set("ipfix_telemetry", std::move(ipfix_obj));
+    }
+    if (is_telco) {
+      Value t_obj = Value::Object();
+      t_obj.set("active_sessions", Value::Int(static_cast<std::int64_t>(ntdbl("telco_active_sessions"))));
+      t_obj.set("established_sessions", Value::Int(static_cast<std::int64_t>(ntdbl("telco_established_sessions"))));
+      t_obj.set("failed_sessions", Value::Int(static_cast<std::int64_t>(ntdbl("telco_failed_sessions"))));
+      t_obj.set("retransmit_count", Value::Int(static_cast<std::int64_t>(ntdbl("telco_retransmit_count"))));
+      snap.set("telco_telemetry", std::move(t_obj));
+    }
+  }
+
   if (is_telco) {
     snap.set("is_telco", Value::Bool(true));
     snap.set("telco_protocol", Value::Str(job.telco_protocol));
@@ -585,13 +755,19 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     snap.set("cluster_db_port", Value::Int(job.db_port));
   }
 
-  // Başarı ölçütü: TÜM shard'lar gerçekten tamamlandı mı (done_shards).
+  if (converged_stop) {
+    snap.set("converged_stop", Value::Bool(true));
+  }
+
+  // Başarı ölçütü: TÜM shard'lar gerçekten tamamlandı mı (done_shards) veya
+  // kapalı çevrim (converged_stop) ile temizce durduruldu mu.
   // Yeniden deneme limitini aşıp düşen shard'lar done_shards'a girmez, dolayısıyla
   // kuyruklar boşalsa bile job başarısız sayılır. dispatch_failures'a bakmıyoruz:
   // içinde W_DIRECT_FALLBACK_REVERSE gibi UYARILAR da var (job yine de başarılı);
   // gerçek başarısızlık zaten done_shards eksikliği olarak yansır.
   const bool all_done = (done_shards.size() == all_sids.size());
-  result.rc = (all_done && pending.empty() && inflight_by_sid.empty()) ? 0 : 1;
+  const bool converged_ok = converged_stop && unresolved.empty();
+  result.rc = ((all_done && pending.empty() && inflight_by_sid.empty()) || converged_ok) ? 0 : 1;
   result.snapshot = std::move(snap);
   return result;
 }

@@ -619,6 +619,22 @@ HttpResponse ManagementApi::Handle(const HttpRequest& req) const {
     return JsonResp(200, "OK", res);
   }
 
+  if (is_post && req.path == "/v1/shards/reconfigure") {
+    if (auto e = guard({"admin", "operator"})) return *e;
+    std::string tenant;
+    if (auto e = effective_tenant(&tenant)) return *e;
+    samurai::core::json::ParseResult parsed =
+        samurai::core::json::Parse(req.body.empty() ? "{}" : req.body);
+    if (!parsed.ok || !parsed.value.is_object()) {
+      return ErrResp(400, "Bad Request", "invalid_json_body");
+    }
+    if (!providers_.reconfigure_callback) {
+      return ErrResp(501, "Not Implemented", "reconfigure_callback_not_set");
+    }
+    Value res = providers_.reconfigure_callback(parsed.value);
+    return JsonResp(200, "OK", res);
+  }
+
   if (is_post && req.path == "/v1/cluster/provision") {
     if (auto e = guard({"admin", "operator"})) return *e;
     std::string tenant;

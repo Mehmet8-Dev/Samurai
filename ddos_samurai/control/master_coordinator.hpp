@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,16 @@ class WorkerCommander {
     (void)worker_id; (void)shard_id; (void)leader_epoch;
     return false;
   }
+  virtual bool ReconfigureShard(const std::string& endpoint, const std::string& shard_id,
+                                const std::string& args_json, std::int64_t leader_epoch) {
+    (void)endpoint; (void)shard_id; (void)args_json; (void)leader_epoch;
+    return false;
+  }
+  virtual bool ReconfigureShardReverse(const std::string& worker_id, const std::string& shard_id,
+                                       const std::string& args_json, std::int64_t leader_epoch) {
+    (void)worker_id; (void)shard_id; (void)args_json; (void)leader_epoch;
+    return false;
+  }
 };
 
 struct JobConfig {
@@ -104,13 +115,30 @@ struct JobConfig {
 
   // Telecom cluster job configuration
   bool is_telco_job = false;
-  std::string telco_protocol = "pppoe";      // "pppoe", "dhcp", "gtpu", "bfd", "qinq", "arp"
+  std::string telco_protocol = "pppoe";      // "pppoe", "dhcp", "gtpu", "bfd", "pfcp", "sctp", "diameter", "sip-rtp", "multi"
   std::uint32_t telco_subscribers = 0;       // Total subscriber pool size across cluster
   std::uint32_t telco_rate_cps = 5000;       // New subscriber setup rate (CPS)
   std::uint16_t telco_base_vlan_s = 100;     // 802.1ad Service Outer VLAN base
   std::uint16_t telco_base_vlan_c = 10;      // 802.1Q Customer Inner VLAN base
   std::uint32_t telco_base_ip = 0x0A000001;  // 10.0.0.1
   std::uint32_t telco_gateway_ip = 0x0A0000FE; // 10.0.0.254
+  std::uint32_t telco_duration_ms = 0;       // 0 = worker default / bounded by count
+  std::uint32_t sctp_rate = 0;
+  std::uint32_t diameter_rate = 0;
+  std::uint32_t sip_rate = 0;
+  bool enable_srtp = false;
+  std::uint32_t teid_start = 1;
+  std::uint32_t teid_count = 1;
+  std::uint8_t qfi = 9;
+
+  // Production IPFIX / NetFlow telemetry propagation
+  bool ipfix_enabled = false;
+  std::string ipfix_collector = "127.0.0.1";
+  std::uint16_t ipfix_port = 4739;
+  std::uint32_t ipfix_sample_rate = 1000;
+  bool ipfix_netflow_v9 = false;
+  std::uint32_t ipfix_domain_id = 1;
+  std::uint32_t ipfix_export_interval_ms = 1000;
 
   // Base shard args (JSON object) cloned per shard; the coordinator injects
   // count/_worker_id/_leader_epoch/role.
@@ -119,6 +147,15 @@ struct JobConfig {
   // current (pending, inflight) shard counts. Empty => no-op (the default; all
   // existing callers and tests are unaffected). Feeds the autoscale controller.
   std::function<void(int pending_shards, int inflight_shards)> progress_cb;
+
+  // Optional live window tick callback invoked every `window_tick_interval_ms`
+  // while shards are in flight. Returning non-empty JSON triggers live
+  // ReconfigureShard RPCs across active shards without tearing down workers.
+  std::int64_t window_tick_interval_ms = 0;
+  std::function<std::string(int tick_index,
+                            const std::vector<ProbeOutcome>& live_probes,
+                            bool& should_stop)>
+      window_tick_cb;
 };
 
 struct JobResult {
@@ -138,11 +175,31 @@ class MasterCoordinator {
   JobResult RunSingleJob(const JobConfig& job, const std::string& job_id,
                          std::function<bool()> leadership_guard = {});
 
+  // Push a live ReconfigureShard RPC to currently active shards (matching
+  // filter_shard_id / filter_worker_id when non-empty; all active when empty).
+  // Returns count of shards that accepted or queued the reconfiguration.
+  int ReconfigureActiveShards(const std::string& args_json,
+                              std::int64_t leader_epoch = -1,
+                              const std::string& filter_shard_id = "",
+                              const std::string& filter_worker_id = "");
+
+  std::map<std::string, std::string> ActiveShardWorkers() const;
+
  private:
+  struct ActiveShardTarget {
+    std::string worker_id;
+    std::string endpoint;
+    bool via_reverse = false;
+    bool is_auto = false;
+    std::int64_t leader_epoch = 0;
+  };
+
   MasterView* view_;
   WorkerCommander* commander_;
   std::function<std::int64_t()> now_ms_;
   std::function<void(int)> sleep_ms_;
+  mutable std::mutex active_mu_;
+  std::map<std::string, ActiveShardTarget> active_shards_;
 };
 
 }  // namespace samurai::control

@@ -189,6 +189,12 @@ Value Servicer::Heartbeat(const Value& body, const RpcContext& ctx) {
     } else if (cmd.type == "stop") {
       out.set("stop_shard", Str(cmd.shard_id));
       out.set("stop_leader_epoch", Value::Int(cmd.leader_epoch));
+    } else if (cmd.type == "reconfigure") {
+      Value rec = Value::Object();
+      rec.set("shard_id", Str(cmd.shard_id));
+      rec.set("args_json", Str(cmd.args_json.empty() ? "{}" : cmd.args_json));
+      rec.set("_leader_epoch", Value::Int(cmd.leader_epoch));
+      out.set("reconfigure_shard", std::move(rec));
     }
   }
   return out;
@@ -245,6 +251,18 @@ Value Servicer::StopShard(const Value& body, const RpcContext& ctx) {
     }
   }
   out.set("stopped", Value::Bool(true));
+  return out;
+}
+
+Value Servicer::ReconfigureShard(const Value& body, const RpcContext& ctx) {
+  Value out = Value::Object();
+  if (!TenantGuard(ctx)) {
+    out.set("reconfigured", Value::Bool(false));
+    out.set("error", Str("tenant namespace mismatch"));
+    return out;
+  }
+  out.set("reconfigured", Value::Bool(true));
+  out.set("shard_id", Str(StrField(body, "shard_id")));
   return out;
 }
 

@@ -306,6 +306,64 @@ Value WorkerShardService::StopShard(const Value& body, const RpcContext& /*ctx*/
   return out;
 }
 
+Value WorkerShardService::ReconfigureShard(const Value& body, const RpcContext& /*ctx*/) {
+  Value out = Value::Object();
+  std::string sid = StrField(body, "shard_id");
+  const Value* ep = body.find("_leader_epoch");
+  std::int64_t req_epoch = ep ? ep->as_int(0) : 0;
+
+  Value params = Value::Object();
+  const std::string args_text = StrField(body, "args_json");
+  if (!args_text.empty()) {
+    const auto parsed = samurai::core::json::Parse(args_text);
+    if (!parsed.ok || !parsed.value.is_object()) {
+      out.set("reconfigured", Value::Bool(false));
+      out.set("error", Str("invalid args_json"));
+      return out;
+    }
+    params = parsed.value;
+    if (const Value* pep = params.find("_leader_epoch")) {
+      req_epoch = std::max(req_epoch, pep->as_int(0));
+    }
+  } else if (body.is_object()) {
+    params = body;
+  }
+
+  std::shared_ptr<ShardRun> run;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (req_epoch < leader_epoch_max_seen_) {
+      out.set("reconfigured", Value::Bool(false));
+      out.set("error", Str("stale leader epoch: got=" + std::to_string(req_epoch) +
+                           " min=" + std::to_string(leader_epoch_max_seen_)));
+      return out;
+    }
+    if (req_epoch > leader_epoch_max_seen_) leader_epoch_max_seen_ = req_epoch;
+
+    if (sid.empty()) sid = worker_active_shard_;
+    auto it = shard_runs_.find(sid);
+    if (it != shard_runs_.end() && it->second.running && it->second.run) {
+      run = it->second.run;
+    }
+  }
+
+  if (!run || !run->IsAlive()) {
+    out.set("reconfigured", Value::Bool(false));
+    out.set("shard_id", Str(sid));
+    out.set("error", Str("shard not active"));
+    return out;
+  }
+
+  bool ok = run->Reconfigure(params);
+  if (!ok && runner_) {
+    ok = runner_->ReconfigureShard(sid, params);
+  }
+  out.set("reconfigured", Value::Bool(ok));
+  out.set("shard_id", Str(sid));
+  out.set("error", Str(ok ? "" : "reconfigure rejected by worker pool"));
+  return out;
+}
+
 Value WorkerShardService::GetWorkerStatus(const Value& body, const RpcContext& /*ctx*/) {
   const std::string wid = StrField(body, "worker_id");
   Value out = Value::Object();

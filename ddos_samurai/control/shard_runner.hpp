@@ -34,6 +34,9 @@ class ShardRun {
   virtual samurai::core::json::Value MetricsJson() const {
     return samurai::core::json::Value::Object();
   }
+  // Live window reconfiguration (e.g. target_rps, request_mix, source_rotation,
+  // telco_cps). Returns true if applied to an active execution.
+  virtual bool Reconfigure(const samurai::core::json::Value& /*params*/) { return false; }
 };
 
 class ShardRunner {
@@ -42,6 +45,10 @@ class ShardRunner {
   // Start a shard from its args (JSON object); nullptr on failure.
   virtual std::shared_ptr<ShardRun> Start(const std::string& shard_id,
                                           const samurai::core::json::Value& args) = 0;
+  virtual bool ReconfigureShard(const std::string& /*shard_id*/,
+                                const samurai::core::json::Value& /*params*/) {
+    return false;
+  }
 };
 
 // Test/offline runner: a shard "completes" immediately with preset counters,

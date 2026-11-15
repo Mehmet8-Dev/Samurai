@@ -48,7 +48,9 @@ std::set<std::string> Interceptor::AllowedRolesForRpc(const std::string& rpc_nam
       name == "ReportStatsStream") {
     return {"admin", "operator", "worker"};
   }
-  if (name == "StartShard" || name == "StopShard") return {"admin", "operator"};
+  if (name == "StartShard" || name == "StopShard" || name == "ReconfigureShard") {
+    return {"admin", "operator"};
+  }
   return {"admin"};
 }
 

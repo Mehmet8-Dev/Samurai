@@ -216,6 +216,16 @@ wire::Response WorkerControlClient::StopShard(const std::string& shard_id, bool 
   return Call(wire::kStopShard, body);
 }
 
+wire::Response WorkerControlClient::ReconfigureShard(const std::string& shard_id,
+                                                    const std::string& args_json,
+                                                    std::int64_t leader_epoch) {
+  Value body = Value::Object();
+  body.set("shard_id", Value::Str(shard_id));
+  body.set("args_json", Value::Str(args_json.empty() ? "{}" : args_json));
+  body.set("_leader_epoch", Value::Int(leader_epoch));
+  return Call(wire::kReconfigureShard, body);
+}
+
 wire::Response WorkerControlClient::GetWorkerStatus(const std::string& worker_id) {
   Value body = Value::Object();
   body.set("worker_id", Value::Str(worker_id));

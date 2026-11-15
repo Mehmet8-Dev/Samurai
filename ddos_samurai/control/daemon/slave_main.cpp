@@ -294,6 +294,9 @@ int main(int argc, char** argv) {
       b.set("_leader_epoch", samurai::core::json::Value::Int(leader_epoch));
       service.StopShard(b, RpcContext{});
     });
+    node.set_on_reconfigure([&service](const samurai::core::json::Value& reconf) {
+      service.ReconfigureShard(reconf, RpcContext{});
+    });
     node.set_active_shard_provider([&service]() { return service.ActiveShardId(); });
     service.set_on_finalize([&reporter, worker_id](const std::string& sid, const std::string& stats) {
       const long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

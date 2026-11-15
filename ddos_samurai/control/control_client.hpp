@@ -70,6 +70,8 @@ class WorkerControlClient {
                             long long timeout_ms);
   wire::Response StopShard(const std::string& shard_id, bool graceful = true,
                            std::int64_t leader_epoch = 0);
+  wire::Response ReconfigureShard(const std::string& shard_id, const std::string& args_json,
+                                  std::int64_t leader_epoch = 0);
   wire::Response GetWorkerStatus(const std::string& worker_id);
   wire::Response AbortJob(const std::string& job_id, const std::string& reason);
   wire::Response ForceSync(const std::string& worker_id);

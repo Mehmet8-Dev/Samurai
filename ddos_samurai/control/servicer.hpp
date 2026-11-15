@@ -48,6 +48,13 @@ class ControlService {
   virtual samurai::core::json::Value AbortJob(const samurai::core::json::Value& body, const RpcContext& ctx) = 0;
   virtual samurai::core::json::Value GetWorkerStatus(const samurai::core::json::Value& body, const RpcContext& ctx) = 0;
   virtual samurai::core::json::Value ForceSync(const samurai::core::json::Value& body, const RpcContext& ctx) = 0;
+  virtual samurai::core::json::Value ReconfigureShard(const samurai::core::json::Value& body, const RpcContext& ctx) {
+    (void)body;
+    (void)ctx;
+    samurai::core::json::Value o = samurai::core::json::Value::Object();
+    o.set("reconfigured", samurai::core::json::Value::Bool(false));
+    return o;
+  }
 };
 
 struct ServicerConfig {
@@ -65,6 +72,7 @@ class Servicer : public ControlService {
   samurai::core::json::Value Heartbeat(const samurai::core::json::Value& body, const RpcContext& ctx) override;
   samurai::core::json::Value StartShard(const samurai::core::json::Value& body, const RpcContext& ctx) override;
   samurai::core::json::Value StopShard(const samurai::core::json::Value& body, const RpcContext& ctx) override;
+  samurai::core::json::Value ReconfigureShard(const samurai::core::json::Value& body, const RpcContext& ctx) override;
   samurai::core::json::Value ReportStats(const samurai::core::json::Value& body, const RpcContext& ctx) override;
   samurai::core::json::Value AbortJob(const samurai::core::json::Value& body, const RpcContext& ctx) override;
   samurai::core::json::Value GetWorkerStatus(const samurai::core::json::Value& body, const RpcContext& ctx) override;

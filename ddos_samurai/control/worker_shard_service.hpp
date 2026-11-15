@@ -32,6 +32,7 @@ class WorkerShardService : public ControlService {
 
   samurai::core::json::Value StartShard(const samurai::core::json::Value& body, const RpcContext& ctx) override;
   samurai::core::json::Value StopShard(const samurai::core::json::Value& body, const RpcContext& ctx) override;
+  samurai::core::json::Value ReconfigureShard(const samurai::core::json::Value& body, const RpcContext& ctx) override;
   samurai::core::json::Value GetWorkerStatus(const samurai::core::json::Value& body, const RpcContext& ctx) override;
 
   // Not served worker-side; inert responses (mirrors _WorkerServicer scope).

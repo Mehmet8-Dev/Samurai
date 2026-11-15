@@ -122,6 +122,17 @@ bool ClientWorkerCommander::StopShard(const std::string& endpoint, const std::st
   return r.ok && BodyBool(r, "stopped");
 }
 
+bool ClientWorkerCommander::ReconfigureShard(const std::string& endpoint,
+                                             const std::string& shard_id,
+                                             const std::string& args_json,
+                                             std::int64_t leader_epoch) {
+  WorkerControlClient wc(endpoint, cluster_secret_, tenant_namespace_, timeout_ms_);
+  const std::string cpub = CurveByEndpoint(servicer_, endpoint);
+  if (!cpub.empty()) (void)wc.set_curve_client(cpub);
+  const wire::Response r = wc.ReconfigureShard(shard_id, args_json, leader_epoch);
+  return r.ok && BodyBool(r, "reconfigured");
+}
+
 DispatchOutcome ClientWorkerCommander::DispatchReverse(const std::string& worker_id,
                                                        const std::string& shard_id,
                                                        const std::string& job_id,
@@ -156,6 +167,20 @@ bool ClientWorkerCommander::StopShardReverse(const std::string& worker_id,
   PendingCommand cmd;
   cmd.type = "stop";
   cmd.shard_id = shard_id;
+  cmd.leader_epoch = leader_epoch;
+  servicer_->EnqueueCommand(worker_id, cmd);
+  return true;  // best-effort enqueue; delivered on the worker's next heartbeat
+}
+
+bool ClientWorkerCommander::ReconfigureShardReverse(const std::string& worker_id,
+                                                    const std::string& shard_id,
+                                                    const std::string& args_json,
+                                                    std::int64_t leader_epoch) {
+  if (!servicer_) return false;
+  PendingCommand cmd;
+  cmd.type = "reconfigure";
+  cmd.shard_id = shard_id;
+  cmd.args_json = args_json.empty() ? "{}" : args_json;
   cmd.leader_epoch = leader_epoch;
   servicer_->EnqueueCommand(worker_id, cmd);
   return true;  // best-effort enqueue; delivered on the worker's next heartbeat

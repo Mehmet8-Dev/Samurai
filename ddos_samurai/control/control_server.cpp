@@ -153,6 +153,8 @@ std::string ControlServer::Handle(const std::string& request_payload) {
     body = service_->StartShard(req.body, ctx);
   } else if (m == wire::kStopShard) {
     body = service_->StopShard(req.body, ctx);
+  } else if (m == wire::kReconfigureShard) {
+    body = service_->ReconfigureShard(req.body, ctx);
   } else if (m == wire::kReportStats) {
     body = service_->ReportStats(req.body, ctx);
   } else if (m == wire::kAbortJob) {

@@ -6,10 +6,12 @@
 // dispatch one job across the cluster and print the aggregated snapshot.
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -64,6 +66,34 @@ std::string LowerCopy(std::string s) {
     if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
   }
   return s;
+}
+
+bool OptBoolFlag(int argc, char** argv, const char* flag, bool def = false) {
+  for (int i = 1; i < argc; ++i) {
+    if (flag == std::string(argv[i])) {
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        const std::string val = LowerCopy(argv[i + 1]);
+        if (val == "0" || val == "false" || val == "no" || val == "off") return false;
+        if (val == "1" || val == "true" || val == "yes" || val == "on") return true;
+      }
+      return true;
+    }
+  }
+  return def;
+}
+
+std::uint32_t ParseIpv4HostOrder(const std::string& s, std::uint32_t def_val) {
+  if (s.empty()) return def_val;
+  struct in_addr addr{};
+  if (::inet_pton(AF_INET, s.c_str(), &addr) == 1) {
+    return ntohl(addr.s_addr);
+  }
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(s.c_str(), &end, 0);
+  if (end != s.c_str() && *end == '\0') {
+    return static_cast<std::uint32_t>(parsed);
+  }
+  return def_val;
 }
 
 // `mm` (nullable) surfaces the federated region snapshots for the management API
@@ -245,15 +275,25 @@ samurai::control::LoadSample DeriveSample(const Value& snap) {
   return s;
 }
 
+const char* StrategyName(samurai::control::ClosedLoopStrategy s) {
+  switch (s) {
+    case samurai::control::ClosedLoopStrategy::kBinSearch:
+      return "binsearch";
+    case samurai::control::ClosedLoopStrategy::kRl:
+      return "rl";
+    case samurai::control::ClosedLoopStrategy::kAimd:
+    default:
+      return "aimd";
+  }
+}
+
 // Serialize a closed-loop decision into the JSON object surfaced by the
 // management API (/v1/cluster/summary -> "closed_loop").
 Value ClosedLoopStateJson(const samurai::control::ClosedLoopDecision& d,
                           const samurai::control::ClosedLoopConfig& cfg) {
   Value o = Value::Object();
   o.set("enabled", Value::Bool(d.enabled));
-  o.set("strategy", Value::Str(cfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch
-                                   ? "binsearch"
-                                   : "aimd"));
+  o.set("strategy", Value::Str(StrategyName(cfg.strategy)));
   o.set("done", Value::Bool(d.done));
   o.set("phase", Value::Str(d.phase));
   o.set("reason", Value::Str(d.reason));
@@ -413,8 +453,7 @@ Value RlTransitionJson(const std::string& run_id, int win, double action_rps,
   // Dataplane transport for this run — lets the offline pipeline gate the
   // flow-level IPS features (only meaningful on a flow-capable transport).
   o.set("transport", Value::Str(transport));
-  o.set("strategy",
-        Value::Str(cfg.strategy == ClosedLoopStrategy::kBinSearch ? "binsearch" : "aimd"));
+  o.set("strategy", Value::Str(StrategyName(cfg.strategy)));
   o.set("min_rps", Value::Double(cfg.min_rps));
   o.set("max_rps", Value::Double(cfg.max_rps));
   o.set("window_s", Value::Int(window_s));
@@ -459,6 +498,35 @@ Value JobSpecFromArgs(int argc, char** argv) {
   s.set("max_shard_retries", Value::Int(OptInt(argc, argv, "--max-shard-retries", 3)));
   s.set("on_worker_loss", Value::Str(Opt(argc, argv, "--on-worker-loss", "continue")));
   s.set("worker_status_probe", Value::Int(OptInt(argc, argv, "--worker-status-probe", 1)));
+  s.set("target_rps", Value::Double(OptDouble(argc, argv, "--rps", 0.0)));
+  s.set("db_port", Value::Int(OptInt(argc, argv, "--db-port", 5099)));
+
+  // Telco distributed worker fields
+  s.set("telco_subscribers", Value::Int(OptInt(argc, argv, "--telco-subscribers", 0)));
+  s.set("telco_cps", Value::Int(OptInt(argc, argv, "--telco-cps", 5000)));
+  s.set("telco_duration_ms", Value::Int(OptInt(argc, argv, "--telco-duration-ms", 0)));
+  s.set("vlan_s", Value::Int(OptInt(argc, argv, "--vlan-s", 100)));
+  s.set("vlan_c", Value::Int(OptInt(argc, argv, "--vlan-c", 10)));
+  s.set("telco_base_ip", Value::Str(Opt(argc, argv, "--telco-base-ip", "10.0.0.1")));
+  s.set("telco_gateway_ip", Value::Str(Opt(argc, argv, "--telco-gateway-ip", "10.0.0.254")));
+  s.set("sctp_rate", Value::Int(OptInt(argc, argv, "--sctp-rate", 0)));
+  const long diam_rate = OptInt(argc, argv, "--diameter-rate", 0);
+  const long diam_ccr = OptInt(argc, argv, "--diameter-ccr-rate", 0);
+  s.set("diameter_rate", Value::Int(diam_rate > 0 ? diam_rate : diam_ccr));
+  s.set("sip_rate", Value::Int(OptInt(argc, argv, "--sip-rate", 0)));
+  s.set("enable_srtp", Value::Bool(OptBoolFlag(argc, argv, "--enable-srtp", false)));
+  s.set("teid_start", Value::Int(OptInt(argc, argv, "--teid-start", 1)));
+  s.set("teid_count", Value::Int(OptInt(argc, argv, "--teid-count", 1)));
+  s.set("qfi", Value::Int(OptInt(argc, argv, "--qfi", 9)));
+
+  // Production IPFIX / NetFlow v9 telemetry fields
+  s.set("ipfix_enabled", Value::Bool(OptBoolFlag(argc, argv, "--ipfix-enabled", false)));
+  s.set("ipfix_collector", Value::Str(Opt(argc, argv, "--ipfix-collector", "127.0.0.1")));
+  s.set("ipfix_port", Value::Int(OptInt(argc, argv, "--ipfix-port", 4739)));
+  s.set("ipfix_sample_rate", Value::Int(OptInt(argc, argv, "--ipfix-sample-rate", 1000)));
+  s.set("ipfix_netflow_v9", Value::Bool(OptBoolFlag(argc, argv, "--ipfix-netflow-v9", false)));
+  s.set("ipfix_domain_id", Value::Int(OptInt(argc, argv, "--ipfix-domain-id", 1)));
+  s.set("ipfix_export_interval_ms", Value::Int(OptInt(argc, argv, "--ipfix-export-interval-ms", 1000)));
   return s;
 }
 
@@ -469,9 +537,24 @@ samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leade
     const Value* v = spec.find(k);
     return v ? v->as_int(d) : d;
   };
+  auto getd = [&](const char* k, double d) {
+    const Value* v = spec.find(k);
+    return v ? v->as_double(d) : d;
+  };
+  auto getb = [&](const char* k, bool d) {
+    const Value* v = spec.find(k);
+    return v ? v->as_bool(d) : d;
+  };
   auto gets = [&](const char* k, const char* d) {
     const Value* v = spec.find(k);
     return v ? v->as_string(d) : std::string(d);
+  };
+  auto get_ip_host = [&](const char* k, std::uint32_t d) -> std::uint32_t {
+    const Value* v = spec.find(k);
+    if (!v) return d;
+    if (v->is_int()) return static_cast<std::uint32_t>(v->as_int(d));
+    if (v->is_string()) return ParseIpv4HostOrder(v->as_string(""), d);
+    return d;
   };
   samurai::control::JobConfig job;
   job.count = geti("count", 0);
@@ -482,6 +565,7 @@ samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leade
   job.max_shard_retries = static_cast<int>(geti("max_shard_retries", 3));
   job.on_worker_loss = gets("on_worker_loss", "continue");
   job.worker_status_probe = geti("worker_status_probe", 1) != 0;
+  job.db_port = static_cast<int>(geti("db_port", 5099));
   job.tenant_namespace = tenant;
   job.leader_epoch = leader_epoch;
   const std::string tr = LowerCopy(gets("target_region", ""));
@@ -489,12 +573,84 @@ samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leade
   job.worker_region = master_region;
   job.region_aware_routing = !tr.empty();
   if (!tr.empty()) job.shard_strategy = "region";
+
+  const std::string wk = LowerCopy(gets("worker", "cpu"));
+  const std::string proto = gets("protocol", "udp");
+  const std::uint32_t tsubs =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(0, geti("telco_subscribers", 0)));
+  job.is_telco_job = (wk == "telco" || tsubs > 0);
+  job.telco_protocol = (!proto.empty() && LowerCopy(proto) != "udp") ? proto : "pppoe";
+  job.telco_subscribers =
+      tsubs > 0 ? tsubs : static_cast<std::uint32_t>(std::max<std::int64_t>(0, job.count));
+  job.telco_rate_cps =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(1, geti("telco_cps", 5000)));
+  job.telco_base_vlan_s =
+      static_cast<std::uint16_t>(std::max<std::int64_t>(0, geti("vlan_s", 100)));
+  job.telco_base_vlan_c =
+      static_cast<std::uint16_t>(std::max<std::int64_t>(0, geti("vlan_c", 10)));
+  job.telco_base_ip = get_ip_host("telco_base_ip", 0x0A000001u);
+  job.telco_gateway_ip = get_ip_host("telco_gateway_ip", 0x0A0000FEu);
+  job.telco_duration_ms =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(0, geti("telco_duration_ms", 0)));
+  job.sctp_rate =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(0, geti("sctp_rate", 0)));
+  job.diameter_rate =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(0, geti("diameter_rate", 0)));
+  job.sip_rate =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(0, geti("sip_rate", 0)));
+  job.enable_srtp = getb("enable_srtp", false);
+  job.teid_start =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(0, geti("teid_start", 1)));
+  job.teid_count =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(1, geti("teid_count", 1)));
+  job.qfi = static_cast<std::uint8_t>(std::clamp<std::int64_t>(geti("qfi", 9), 0, 255));
+
+  job.ipfix_enabled = getb("ipfix_enabled", false);
+  job.ipfix_collector = gets("ipfix_collector", "127.0.0.1");
+  job.ipfix_port = static_cast<std::uint16_t>(std::max<std::int64_t>(0, geti("ipfix_port", 4739)));
+  job.ipfix_sample_rate =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(1, geti("ipfix_sample_rate", 1000)));
+  job.ipfix_netflow_v9 = getb("ipfix_netflow_v9", false);
+  job.ipfix_domain_id =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(0, geti("ipfix_domain_id", 1)));
+  job.ipfix_export_interval_ms =
+      static_cast<std::uint32_t>(std::max<std::int64_t>(50, geti("ipfix_export_interval_ms", 1000)));
+
   job.base_args = Value::Object();
   job.base_args.set("target", Value::Str(gets("target", "127.0.0.1")));
   job.base_args.set("port", Value::Int(geti("port", 80)));
-  job.base_args.set("protocol", Value::Str(gets("protocol", "udp")));
+  job.base_args.set("protocol", Value::Str(proto));
   job.base_args.set("size", Value::Int(geti("size", 64)));
   job.base_args.set("worker", Value::Str(gets("worker", "cpu")));
+  job.base_args.set("db_port", Value::Int(job.db_port));
+  const double trps = getd("target_rps", 0.0);
+  if (trps > 0.0) {
+    job.base_args.set("target_rps", Value::Double(trps));
+  }
+  job.base_args.set("ipfix_enabled", Value::Bool(job.ipfix_enabled));
+  job.base_args.set("ipfix_collector", Value::Str(job.ipfix_collector));
+  job.base_args.set("ipfix_port", Value::Int(job.ipfix_port));
+  job.base_args.set("ipfix_sample_rate", Value::Int(job.ipfix_sample_rate));
+  job.base_args.set("ipfix_netflow_v9", Value::Bool(job.ipfix_netflow_v9));
+  job.base_args.set("ipfix_domain_id", Value::Int(job.ipfix_domain_id));
+  job.base_args.set("ipfix_export_interval_ms", Value::Int(job.ipfix_export_interval_ms));
+  if (job.is_telco_job) {
+    job.base_args.set("telco_protocol", Value::Str(job.telco_protocol));
+    job.base_args.set("telco_subscribers", Value::Int(job.telco_subscribers));
+    job.base_args.set("telco_cps", Value::Int(job.telco_rate_cps));
+    job.base_args.set("telco_duration_ms", Value::Int(job.telco_duration_ms));
+    job.base_args.set("vlan_s", Value::Int(job.telco_base_vlan_s));
+    job.base_args.set("vlan_c", Value::Int(job.telco_base_vlan_c));
+    job.base_args.set("telco_base_ip", Value::Int(job.telco_base_ip));
+    job.base_args.set("telco_gateway_ip", Value::Int(job.telco_gateway_ip));
+    job.base_args.set("sctp_rate", Value::Int(job.sctp_rate));
+    job.base_args.set("diameter_rate", Value::Int(job.diameter_rate));
+    job.base_args.set("sip_rate", Value::Int(job.sip_rate));
+    job.base_args.set("enable_srtp", Value::Bool(job.enable_srtp));
+    job.base_args.set("teid_start", Value::Int(job.teid_start));
+    job.base_args.set("teid_count", Value::Int(job.teid_count));
+    job.base_args.set("qfi", Value::Int(job.qfi));
+  }
   // Dataplane transport for L7 workers. Made explicit here (rather than relying on
   // the worker's SAMURAI_L7_TRANSPORT env) so master and worker agree on a single
   // source of truth and the RL corpus can record it — the flow-level IPS features
@@ -528,10 +684,28 @@ void Usage(const char* argv0) {
       "  --allow-public-target     permit any public target (use with care; a\n"
       "                            --deny-target still wins)\n"
       "  --deny-target IP|CIDR     denylist a target (repeatable; always wins)\n"
-      "  --protocol P              l4 protocol (default udp)\n"
+      "  --protocol P              l4/telco protocol (default udp; telco: pppoe|dhcp|gtpu|bfd|pfcp|sctp|diameter|sip-rtp|multi)\n"
       "  --size N                  packet size (default 64)\n"
-      "  --worker NAME             worker flavor this job needs (default cpu); only\n"
+      "  --worker NAME             worker flavor this job needs (default cpu; includes telco); only\n"
       "                            dispatched to workers advertising that kind\n"
+      "  --db-port N               telemetry/state DB port (default 5099)\n"
+      "  Telco distributed workload flags:\n"
+      "  --telco-subscribers N     subscriber count across cluster\n"
+      "  --telco-cps N             subscriber setup rate CPS (default 5000)\n"
+      "  --telco-duration-ms N     bounded run duration in ms (allows --count 0 with --worker telco)\n"
+      "  --vlan-s N / --vlan-c N   QinQ S-VLAN / C-VLAN base (defaults 100 / 10)\n"
+      "  --telco-base-ip IP        subscriber base IP (default 10.0.0.1)\n"
+      "  --telco-gateway-ip IP     BNG/UPF gateway IP (default 10.0.0.254)\n"
+      "  --sctp-rate N / --diameter-rate N / --sip-rate N / --enable-srtp\n"
+      "  --teid-start N / --teid-count N / --qfi N\n"
+      "  Production IPFIX / NetFlow v9 telemetry:\n"
+      "  --ipfix-enabled [0|1]     enable live UDP IPFIX/NetFlow v9 flow export\n"
+      "  --ipfix-collector IP      collector host (default 127.0.0.1)\n"
+      "  --ipfix-port N            collector UDP port (default 4739)\n"
+      "  --ipfix-sample-rate N     1:N flow sampling rate (default 1000)\n"
+      "  --ipfix-netflow-v9 [0|1]  use NetFlow v9 instead of IPFIX v10\n"
+      "  --ipfix-domain-id N       observation domain id (default 1)\n"
+      "  --ipfix-export-interval-ms N  export cadence in ms (default 1000)\n"
       "  --transport T             L7 dataplane transport (kernel_socket|custom_tcp|\n"
       "                            dpdk|af_xdp|af_packet); recorded in the RL corpus\n"
       "                            and gates the flow-level IPS features (custom_tcp\n"
@@ -607,6 +781,7 @@ void Usage(const char* argv0) {
       "                            and hold the max load that stays SLO-green\n"
       "  --cl-strategy S           aimd | binsearch | rl (default aimd)\n"
       "  --cl-window-s N           seconds per measured window (default 5)\n"
+      "  --cl-live-reconfigure     drive closed-loop transitions via live ReconfigureShard RPCs\n"
       "  --cl-min-rps N            setpoint floor (default 1)\n"
       "  --cl-max-rps N            setpoint ceiling (default 1000000)\n"
       "  --cl-initial-rps N        first setpoint (0 => min)\n"
@@ -683,13 +858,6 @@ int main(int argc, char** argv) {
   using namespace samurai::control;
   using namespace samurai::control::daemon;
 
-  // 1. Anti-tamper & binary self-integrity verification
-  const samurai::licensing::IntegrityResult integrity = samurai::licensing::VerifySelfIntegrity();
-  if (!integrity.ok) {
-    std::fprintf(stderr, "samurai_master security violation: %s\n", integrity.reason.c_str());
-    return 126;
-  }
-
   if (Flag(argc, argv, "-h") || Flag(argc, argv, "--help")) {
     Usage(argv[0]);
     return 0;
@@ -702,6 +870,13 @@ int main(int argc, char** argv) {
     }
     std::printf("curve_public=%s\ncurve_secret=%s\n", kp.public_key.c_str(), kp.secret_key.c_str());
     return 0;
+  }
+
+  // 1. Anti-tamper & binary self-integrity verification (deferred past diagnostic flags)
+  const samurai::licensing::IntegrityResult integrity = samurai::licensing::VerifySelfIntegrity();
+  if (!integrity.ok) {
+    std::fprintf(stderr, "samurai_master security violation: %s\n", integrity.reason.c_str());
+    return 126;
   }
 
   // 2. License resolution and feature-gate enforcement
@@ -766,16 +941,23 @@ int main(int argc, char** argv) {
   }
 
   const long count = OptInt(argc, argv, "--count", 0);
+  const long telco_subs = OptInt(argc, argv, "--telco-subscribers", 0);
+  const long telco_dur_ms = OptInt(argc, argv, "--telco-duration-ms", 0);
   const bool mm_enabled = Flag(argc, argv, "--multi-master-enable");
-  // Multi-master masters may be serve-only (they run delegated jobs pulled from
-  // peer regions), so --count 0 is allowed then; otherwise a job needs a count.
-  if (count <= 0 && !mm_enabled) {
-    std::fprintf(stderr, "samurai_master: --count must be > 0\n");
-    return 2;
-  }
 
   // Feature gate check for Master parameters
   const std::string worker_kind = Opt(argc, argv, "--worker", "cpu");
+  const bool has_telco_job =
+      (LowerCopy(worker_kind) == "telco" && (telco_subs > 0 || telco_dur_ms > 0));
+  const bool has_local_job = (count > 0) || has_telco_job;
+  const long effective_count = count > 0 ? count : telco_subs;
+  // Multi-master masters may be serve-only (they run delegated jobs pulled from
+  // peer regions), so --count 0 is allowed then; otherwise a job needs a count
+  // (or --worker telco with subscribers/duration).
+  if (!has_local_job && !mm_enabled) {
+    std::fprintf(stderr, "samurai_master: --count must be > 0\n");
+    return 2;
+  }
   const std::string vector = Opt(argc, argv, "--vector", "basic");
   const double rps = std::strtod(Opt(argc, argv, "--rps", "0").c_str(), nullptr);
   const int expected_workers = OptInt(argc, argv, "--workers", 1);
@@ -788,9 +970,11 @@ int main(int argc, char** argv) {
   gate_in.role = "master";
   gate_in.license_key = license_key;
   gate_in.license_file = license_file;
-  if (count > 0 && rps > 0.0) {
-    gate_in.duration = static_cast<long>(count / rps);
-  } else if (count > 0) {
+  if (effective_count > 0 && rps > 0.0) {
+    gate_in.duration = static_cast<long>(effective_count / rps);
+  } else if (telco_dur_ms > 0) {
+    gate_in.duration = std::max<long>(1, telco_dur_ms / 1000);
+  } else if (effective_count > 0) {
     gate_in.duration = 1;
   }
 
@@ -820,7 +1004,7 @@ int main(int argc, char** argv) {
   // allowlist (a --deny-target always wins). Serve-only masters (count<=0,
   // multi-master) carry no local target; delegated jobs are gated at their
   // originating master, so only validate when there is a local job to run.
-  if (count > 0) {
+  if (has_local_job) {
     const std::string tgt = Opt(argc, argv, "--target", "127.0.0.1");
     const auto safety = samurai::core::ValidateTargetSafety(
         tgt, OptAll(argc, argv, "--allow-target"),
@@ -1046,6 +1230,14 @@ int main(int argc, char** argv) {
   }
   std::printf("samurai_master: control server on %s\n", server.endpoint().c_str());
 
+  // Coordinator & client commander declared before optional Management API so
+  // live reconfigure callbacks never dangle during shutdown.
+  ServicerMasterView view(&servicer);
+  const int rpc_timeout_ms = static_cast<int>(OptInt(argc, argv, "--rpc-timeout-ms", 2000));
+  ClientWorkerCommander commander(cluster_secret, tenant, rpc_timeout_ms, &servicer);
+  MasterCoordinator coord(&view, &commander);
+  auto guard = [&elector]() { return !elector || elector->IsLeader(); };
+
   // Management API (optional).
   std::unique_ptr<ManagementApiServer> mgmt;
   const std::string mgmt_listen = Opt(argc, argv, "--management-listen", "");
@@ -1121,6 +1313,63 @@ int main(int argc, char** argv) {
       Value r = Value::Object();
       r.set("aborted", Value::Bool(true));
       return r;
+    };
+    providers.reconfigure_callback = [&coord, &commander, &servicer, &current_leader_epoch](
+                                         const Value& body) {
+      std::string shard_id;
+      if (const Value* v = body.find("shard_id")) shard_id = v->as_string("");
+      if (shard_id.empty()) {
+        if (const Value* v = body.find("active_shard_id")) shard_id = v->as_string("");
+      }
+      std::string worker_id;
+      if (const Value* v = body.find("worker_id")) worker_id = v->as_string("");
+
+      std::string args_json;
+      if (const Value* a = body.find("args_json")) {
+        args_json = a->is_string() ? a->as_string("") : a->dump();
+      } else if (const Value* p = body.find("params"); p && p->is_object()) {
+        args_json = p->dump();
+      } else {
+        Value fwd = Value::Object();
+        for (const auto& kv : body.members()) {
+          if (kv.first == "shard_id" || kv.first == "active_shard_id" || kv.first == "worker_id") {
+            continue;
+          }
+          fwd.set(kv.first, kv.second);
+        }
+        args_json = fwd.dump();
+      }
+
+      const std::int64_t ep = current_leader_epoch();
+      int applied = coord.ReconfigureActiveShards(args_json, ep, shard_id, worker_id);
+      if (applied == 0 && (!worker_id.empty() || !shard_id.empty())) {
+        for (const auto& w : servicer.SnapshotWorkers()) {
+          if (!worker_id.empty() && w.worker_id != worker_id) continue;
+          const std::string sid = !shard_id.empty() ? shard_id : w.active_shard_id;
+          if (sid.empty()) continue;
+          auto cit = w.capabilities.find("control_endpoint");
+          auto mit = w.capabilities.find("dispatch_mode");
+          const std::string dep = (cit != w.capabilities.end()) ? cit->second : "";
+          const std::string dmode = (mit != w.capabilities.end()) ? LowerCopy(mit->second) : "";
+          bool ok = false;
+          if (dmode == "reverse") {
+            ok = commander.ReconfigureShardReverse(w.worker_id, sid, args_json, ep);
+          } else {
+            if (!dep.empty()) ok = commander.ReconfigureShard(dep, sid, args_json, ep);
+            if (!ok && dmode == "auto") {
+              ok = commander.ReconfigureShardReverse(w.worker_id, sid, args_json, ep);
+            }
+          }
+          if (ok) ++applied;
+        }
+      }
+
+      Value resp = Value::Object();
+      resp.set("reconfigured", Value::Bool(applied > 0));
+      resp.set("applied", Value::Int(applied));
+      if (!shard_id.empty()) resp.set("shard_id", Value::Str(shard_id));
+      if (!worker_id.empty()) resp.set("worker_id", Value::Str(worker_id));
+      return resp;
     };
 
     auto provisioner = std::make_shared<samurai::control::NodeProvisioner>();
@@ -1212,14 +1461,8 @@ int main(int argc, char** argv) {
                  servicer.worker_count(), expect);
   }
 
-  // Build + dispatch the job. The base_args `worker` field declares the flavor
-  // the job needs; bundle slaves resolve their binary per shard from it, and the
-  // coordinator only dispatches to workers advertising it (WorkerDispatchScore).
-  ServicerMasterView view(&servicer);
-  const int rpc_timeout_ms = static_cast<int>(OptInt(argc, argv, "--rpc-timeout-ms", 2000));
-  ClientWorkerCommander commander(cluster_secret, tenant, rpc_timeout_ms, &servicer);
-  MasterCoordinator coord(&view, &commander);
-  auto guard = [&elector]() { return !elector || elector->IsLeader(); };
+  // The coordinator dispatches shards to workers advertising the requested flavor.
+  // `view`, `commander`, `coord`, `guard` are initialized above Management API.
 
   // Feed the autoscale controller live shard backlog/in-flight counts from the
   // coordinator (no-op when autoscale is off).
@@ -1292,12 +1535,12 @@ int main(int argc, char** argv) {
 
   // Primary job: run it on this region's workers, or delegate the whole job to a
   // peer region when --target-region names a different region.
-  if (count > 0) {
+  if (has_local_job) {
     const Value spec = JobSpecFromArgs(argc, argv);
     const std::string tr = LowerCopy(Opt(argc, argv, "--target-region", ""));
     if (mm && mm->active() && !tr.empty() && tr != master_region) {
       if (mm->EnqueueJob(tr, spec)) {
-        std::printf("samurai_master: delegated job (count=%ld) to region %s\n", count, tr.c_str());
+        std::printf("samurai_master: delegated job (count=%ld) to region %s\n", effective_count, tr.c_str());
       } else {
         std::fprintf(stderr, "samurai_master: delegation to region %s failed\n", tr.c_str());
         rc = 1;
@@ -1317,10 +1560,7 @@ int main(int argc, char** argv) {
                       sut.config().prometheus_url.c_str(),
                       sut.config().latency_p99_query.empty() ? "<none>" : "set");
         }
-        const char* strat_name =
-            clcfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch ? "binsearch"
-            : clcfg.strategy == samurai::control::ClosedLoopStrategy::kRl      ? "rl"
-                                                                              : "aimd";
+        const char* strat_name = StrategyName(clcfg.strategy);
         std::printf(
             "samurai_master: closed-loop enabled (strategy=%s window=%ds min=%.0f max=%.0f "
             "initial=%.0f slo_max_error_pct=%.2f)\n",
@@ -1560,70 +1800,47 @@ int main(int argc, char** argv) {
         int no_traffic_retries = 0;
         const int kNoTrafficRetryBudget = OptInt(argc, argv, "--cl-no-traffic-retries", 8);
         samurai::control::ClosedLoopDecision dec;
-        while (!g_stop.load() && guard()) {
-          const double setpoint = ctl.current_setpoint();
-          // A window runs `setpoint * window_s` packets at the requested rps.
-          const std::int64_t win_count =
-              std::max<std::int64_t>(1, static_cast<std::int64_t>(setpoint * window_s));
-          Value wspec = spec;
-          wspec.set("count", Value::Int(win_count));
-          wspec.set("target_rps", Value::Double(setpoint));
-          JobConfig job = BuildJobConfig(wspec, ep_now, tenant, master_region);
-          job.base_args.set("target_rps", Value::Double(setpoint));
-          job.base_args.set("pacing_mode", Value::Int(1));
-          // Apply the policy's Mahoraga levers (dims >=1) to this window's job spec.
-          // Field names follow the canonical action order (kActionFields); the L7
-          // worker honors those it understands, others are inert plumbing for now.
+
+        auto prepare_job_levers = [&](Value& base_args, int win_idx, int& applied_variant) {
           for (std::size_t k = 1;
                k < rl_next_levers.size() &&
                k < sizeof(samurai::control::kActionFields) /
                        sizeof(samurai::control::kActionFields[0]);
                ++k) {
-            job.base_args.set(samurai::control::kActionFields[k],
-                              Value::Int(static_cast<std::int64_t>(
-                                  std::llround(rl_next_levers[k]))));
+            base_args.set(samurai::control::kActionFields[k],
+                          Value::Int(static_cast<std::int64_t>(
+                              std::llround(rl_next_levers[k]))));
           }
-          // Exploration schedule fills the shaping levers the policy did not (or,
-          // in a capture-only run, all of them). Only dims with a non-sentinel
-          // draw are applied; rps (dim 0) is never touched here.
           if (rl_explore.enabled && rl_next_levers.empty()) {
-            const std::vector<double> ex = samurai::control::ExploreLevers(win, rl_explore);
+            const std::vector<double> ex = samurai::control::ExploreLevers(win_idx, rl_explore);
             for (std::size_t k = 1; k < ex.size(); ++k) {
               if (ex[k] < 0.0) continue;
-              job.base_args.set(samurai::control::kActionFields[k],
-                                Value::Int(static_cast<std::int64_t>(std::llround(ex[k]))));
+              base_args.set(samurai::control::kActionFields[k],
+                            Value::Int(static_cast<std::int64_t>(std::llround(ex[k]))));
             }
           }
-          // Online lever shield: veto a request_mix the target is path-blocking this
-          // episode, substituting the best-known honored variant. Track the applied
-          // variant so its reaction can be fed back after the window runs.
-          int applied_variant = -1;
+          applied_variant = -1;
           if (const Value* rm =
-                  job.base_args.find(samurai::control::kActionFields[kRequestMixDim])) {
+                  base_args.find(samurai::control::kActionFields[kRequestMixDim])) {
             applied_variant = static_cast<int>(rm->as_int(-1));
           }
           if (lever_shield_on && applied_variant >= 0) {
             const int governed = lever_shield.Govern(applied_variant);
             if (governed != applied_variant) {
-              job.base_args.set(samurai::control::kActionFields[kRequestMixDim],
-                                Value::Int(static_cast<std::int64_t>(governed)));
+              base_args.set(samurai::control::kActionFields[kRequestMixDim],
+                            Value::Int(static_cast<std::int64_t>(governed)));
               applied_variant = governed;
             }
           }
-          attach_progress(job);
-          const JobResult res =
-              coord.RunSingleJob(job, "cl-" + std::to_string(++win), guard);
-          samurai::control::LoadSample sample = DeriveSample(res.snapshot);
-          // The per-shard stats carry no achieved-rps field, so the aggregated
-          // snapshot's actual_rps is 0. Derive it from the window's total
-          // attempted count instead — this is the measured load the RL state and
-          // reward key on (rps_norm, throughput progress), so a zero here would
-          // flatten the whole learning signal.
+        };
+
+        enum class WindowStatus { kContinue, kRetryNoTraffic, kDone, kAbortNoTraffic };
+        auto evaluate_window = [&](double setpoint, const Value& applied_base_args,
+                                   int applied_variant, const Value& snap, int job_rc) -> WindowStatus {
+          samurai::control::LoadSample sample = DeriveSample(snap);
           if (sample.actual_rps <= 0.0 && window_s > 0) {
             sample.actual_rps = sample.attempted / static_cast<double>(window_s);
           }
-          // Scrape the SUT (Prometheus) so the p99 latency drives the closed-loop
-          // SLO and the target-side metrics can be correlated with the load.
           samurai::control::SutSample sut_sample;
           if (sut.enabled()) {
             sut_sample = sut.Scrape();
@@ -1631,9 +1848,6 @@ int main(int argc, char** argv) {
               sample.latency_p99_ms = sut_sample.latency_p99_ms;
             }
           }
-          // A window that generated no traffic (no workers / dispatch failure)
-          // is "no data", not SLO-green — treating it as green would make the
-          // controller ramp forever. Abort the search with a clear error.
           if (sample.attempted <= 0.0) {
             if (no_traffic_retries < kNoTrafficRetryBudget) {
               ++no_traffic_retries;
@@ -1641,15 +1855,14 @@ int main(int argc, char** argv) {
                            "samurai_master: closed-loop window=%d produced no traffic "
                            "(rc=%d); retrying same setpoint (%d/%d) — workers may still "
                            "be warming up.\n",
-                           win, res.rc, no_traffic_retries, kNoTrafficRetryBudget);
-              std::this_thread::sleep_for(std::chrono::milliseconds(500));
-              continue;
+                           win, job_rc, no_traffic_retries, kNoTrafficRetryBudget);
+              return WindowStatus::kRetryNoTraffic;
             }
             std::fprintf(stderr,
                          "samurai_master: closed-loop window=%d produced no traffic "
                          "(rc=%d); aborting search after %d retries — check "
                          "workers/dispatch.\n",
-                         win, res.rc, no_traffic_retries);
+                         win, job_rc, no_traffic_retries);
             rc = 1;
             Value clj = Value::Object();
             clj.set("enabled", Value::Bool(true));
@@ -1662,13 +1875,10 @@ int main(int argc, char** argv) {
               cl_json = clj;
             }
             cl_aborted = true;
-            break;
+            return WindowStatus::kAbortNoTraffic;
           }
-          // Defense-reaction signals for this window (used by both the RL policy
-          // proposal below and the corpus record).
-          const Value rl_defense = RlDefenseJson(res.snapshot);
-          // Open-vocabulary novelty: fold this window's reaction, so an unmodelled
-          // defense (success failing with no known signal) is noticed and named.
+
+          const Value rl_defense = RlDefenseJson(snap);
           if (nvcfg.enabled) {
             samurai::control::NoveltySignals ns;
             auto ratio = [&](const char* num, const char* den) -> double {
@@ -1689,29 +1899,16 @@ int main(int argc, char** argv) {
             }
             novelty.Observe(ns);
           }
-          // Feed the window's per-variant reaction into the variant memory so a
-          // path-blocked variant (served ~0) is both vetoed (shield) and visible to
-          // the policy (block state feature). Tracked whenever serving, so the veto
-          // toggle and the state feature share one up-to-date memory.
           if (track_variants && applied_variant >= 0) {
             double resp = 0.0, s2xx = 0.0;
             if (const Value* v = rl_defense.find("responses_total")) resp = v->as_double(0.0);
             if (const Value* v = rl_defense.find("status_2xx")) s2xx = v->as_double(0.0);
             if (resp > 0.0) lever_shield.Observe(applied_variant, s2xx / resp);
           }
-          // kRl: ask the (shielded) policy for the next setpoint from THIS measured
-          // state. StepRl clamps/overrides the proposal; a negative value means
-          // "no proposal" and the shield uses its AIMD fallback.
           if (rl_policy.loaded()) {
             samurai::control::RlStateInputs rin =
                 RlInputsFrom(sample, rl_defense, win, clcfg);
-            // Path-aware: hand the policy the current per-variant block memory (post
-            // this window's Observe, matching the corpus's causal block-after-window
-            // semantics) so BuildFeatures appends the block features it was trained on.
             if (block_state_on) rin.variant_block_success = lever_shield.snapshot();
-            // Persistent-ban: fold THIS window's conn_drop into the running EWMA (same
-            // causal, after-window semantics as the block memory) and hand it to the
-            // policy. kBanEwmaAlpha must match the Python RLConfig.ban_ewma_alpha.
             if (ban_state_on) {
               const double cd = rin.conn_drop_ratio;
               if (cd >= 0.0) {
@@ -1723,25 +1920,15 @@ int main(int argc, char** argv) {
               rin.ban_features = true;
               rin.ban_pressure = ban_ewma;
             }
-            // Flow-level IPS/NSM: the rates are already populated by RlInputsFrom
-            // from the defense counters; only enable the group + mark whether this
-            // run's transport actually measures them (kernel_socket => masked).
             if (flow_state_on) {
               rin.flow_features = true;
               rin.flow_capable = rl_transport_flow_capable;
             }
-            // Online adapter: the reward of THIS window realizes the correction the
-            // adapter applied one window earlier (it shaped the setpoint that just
-            // ran), so fold it in before proposing the next. Reward proxy mirrors the
-            // EffectiveThroughputReward objective: served throughput minus pushback.
             if (adapt_on && adapt_pending) {
-              // Reward proxy = EffectiveThroughputReward (models/rl/reward.py), the same
-              // objective the offline policy optimizes; coefficients mirror RLConfig
-              // defaults so the online lever and the frozen policy pull the same way.
-              constexpr double kLambdaDefense = 1.0;  // 4xx/5xx status pushback weight
-              constexpr double kLambdaFlow = 1.0;     // conn-drop/reset flow pushback weight
-              constexpr double kLambdaSlo = 2.0;      // SLO-overshoot penalty weight
-              constexpr double kStepCost = 0.02;      // flat per-window cost (fast convergence)
+              constexpr double kLambdaDefense = 1.0;
+              constexpr double kLambdaFlow = 1.0;
+              constexpr double kLambdaSlo = 2.0;
+              constexpr double kStepCost = 0.02;
               const double max_rps = clcfg.max_rps > 0.0 ? clcfg.max_rps : 1.0;
               double resp = 0.0, s2xx = 0.0;
               if (const Value* v = rl_defense.find("responses_total")) resp = v->as_double(0.0);
@@ -1755,11 +1942,8 @@ int main(int argc, char** argv) {
               }
               double served;
               if (resp > 0.0 && window_s > 0) {
-                // Raw honored throughput (2xx/s), counted exactly like the fingerprint.
                 served = (s2xx / window_s) / max_rps;
               } else {
-                // No L7 status telemetry: degrade to SLO-green sustainable-rps progress,
-                // matching reward.py's non-L7 fallback (credit only when the window held).
                 const double prev_rps = rl_have_prev ? rl_prev_sample.actual_rps : sample.actual_rps;
                 served = (overshoot <= 0.0)
                              ? std::max(0.0, (sample.actual_rps - prev_rps) / max_rps)
@@ -1774,7 +1958,7 @@ int main(int argc, char** argv) {
             }
             const std::vector<double> action = rl_policy.ProposeFor(rin);
             if (!action.empty()) {
-              double rps = action[0];  // dim 0 = rps -> shield
+              double rps = action[0];
               if (adapt_on) {
                 const double max_rps = clcfg.max_rps > 0.0 ? clcfg.max_rps : 1.0;
                 auto pos = [](double x) { return x > 0.0 ? x : 0.0; };
@@ -1784,11 +1968,9 @@ int main(int argc, char** argv) {
                 rps = online_adapter.Apply(rps, phi);
                 adapt_pending = true;
               }
-              // Cautious response to an un-modelled defense: damp the proposal while a
-              // novel regime holds (the rps shield still bounds the result downward).
               if (nvcfg.enabled) rps = novelty.DampSetpoint(rps);
               sample.rl_action_rps = rps;
-              rl_next_levers = action;           // dims >=1 -> next window's job spec
+              rl_next_levers = action;
             }
           }
           dec = ctl.Step(sample);
@@ -1804,12 +1986,10 @@ int main(int argc, char** argv) {
                         win, novelty.last_unexplained(), novelty.score(),
                         novelty.last_signature().c_str());
           }
-          // Log the transition: state that produced `setpoint` (previous window),
-          // the (Mahoraga) action, and the state + defense-reaction it led to.
           if (rl_corpus.is_open()) {
-            const Value action = RlActionJson(setpoint, job.base_args);
+            const Value action = RlActionJson(setpoint, applied_base_args);
             std::string cap_transport = "kernel_socket";
-            if (const Value* ct = job.base_args.find("connection_template"))
+            if (const Value* ct = applied_base_args.find("connection_template"))
               if (const Value* tb = ct->find("transport_backend"))
                 cap_transport = tb->as_string("kernel_socket");
             const Value tr =
@@ -1827,7 +2007,166 @@ int main(int argc, char** argv) {
               "p99_ms=%.1f next_setpoint=%.0f best_good=%.0f phase=%s\n",
               dec.window, setpoint, dec.last_healthy ? 1 : 0, dec.error_pct,
               sut_sample.latency_p99_ms, dec.setpoint_rps, dec.best_good_rps, dec.phase.c_str());
-          if (dec.done) break;
+          return dec.done ? WindowStatus::kDone : WindowStatus::kContinue;
+        };
+
+        const bool cl_live_reconfigure = Flag(argc, argv, "--cl-live-reconfigure");
+        if (cl_live_reconfigure) {
+          double cur_setpoint = ctl.current_setpoint();
+          const int max_wins =
+              clcfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch
+                  ? std::max(1, clcfg.binsearch_max_windows)
+                  : (clcfg.aimd_max_windows > 0 ? clcfg.aimd_max_windows : 64);
+          const double est_packets =
+              std::max(clcfg.max_rps, cur_setpoint) * static_cast<double>(window_s) *
+              static_cast<double>(max_wins + kNoTrafficRetryBudget + 2);
+          const std::int64_t live_budget = static_cast<std::int64_t>(std::min<double>(
+              est_packets, static_cast<double>(std::numeric_limits<std::int64_t>::max() / 2)));
+          Value wspec = spec;
+          wspec.set("count", Value::Int(std::max<std::int64_t>(1, live_budget)));
+          wspec.set("target_rps", Value::Double(cur_setpoint));
+          if (LowerCopy(worker_kind) == "telco" || telco_subs > 0) {
+            wspec.set("telco_duration_ms", Value::Int(window_s * (max_wins + 4) * 1000LL));
+            wspec.set("telco_cps", Value::Int(std::max<std::int64_t>(1, std::llround(cur_setpoint))));
+          }
+          JobConfig job = BuildJobConfig(wspec, ep_now, tenant, master_region);
+          if (job.job_timeout_s < window_s * (max_wins + 4)) {
+            job.job_timeout_s = static_cast<std::int64_t>(window_s) * (max_wins + 4);
+          }
+          job.base_args.set("target_rps", Value::Double(cur_setpoint));
+          job.base_args.set("pacing_mode", Value::Int(1));
+          int active_variant = -1;
+          prepare_job_levers(job.base_args, 0, active_variant);
+          Value active_base_args = job.base_args;
+          attach_progress(job);
+
+          std::map<std::string, std::int64_t> prev_sent_by_shard;
+          std::map<std::string, std::int64_t> prev_err_by_shard;
+          std::map<std::string, std::map<std::string, double>> prev_totals_by_shard;
+
+          job.window_tick_interval_ms = static_cast<std::int64_t>(window_s) * 1000;
+          job.window_tick_cb = [&](int /*tick_idx*/,
+                                   const std::vector<samurai::control::ProbeOutcome>& live_probes,
+                                   bool& should_stop) -> std::string {
+            std::int64_t delta_sent = 0;
+            std::int64_t delta_err = 0;
+            double total_actual_rps = 0.0;
+            std::map<std::string, double> delta_totals;
+            std::size_t probe_idx = 0;
+            for (const auto& p : live_probes) {
+              ++probe_idx;
+              if (p.stats_json.empty()) continue;
+              const auto parsed = samurai::core::json::Parse(p.stats_json);
+              if (!parsed.ok || !parsed.value.is_object()) continue;
+              const std::string sid = p.active_shard_id.empty()
+                                          ? ("probe-" + std::to_string(probe_idx))
+                                          : p.active_shard_id;
+              const Value& st = parsed.value;
+              const std::int64_t s_now = st.find("sent") ? st.find("sent")->as_int(0) : 0;
+              const std::int64_t e_now = st.find("errors") ? st.find("errors")->as_int(0) : 0;
+              delta_sent += std::max<std::int64_t>(0, s_now - prev_sent_by_shard[sid]);
+              delta_err += std::max<std::int64_t>(0, e_now - prev_err_by_shard[sid]);
+              prev_sent_by_shard[sid] = s_now;
+              prev_err_by_shard[sid] = e_now;
+
+              const Value* nt = st.find("numeric_totals");
+              const Value& src = (nt && nt->is_object()) ? *nt : st;
+              for (const auto& kv : src.members()) {
+                if (!kv.second.is_number()) continue;
+                const double val = kv.second.as_double(0.0);
+                if (kv.first == "actual_rps") {
+                  total_actual_rps += val;
+                  continue;
+                }
+                const double dval = std::max(0.0, val - prev_totals_by_shard[sid][kv.first]);
+                prev_totals_by_shard[sid][kv.first] = val;
+                delta_totals[kv.first] += dval;
+              }
+            }
+
+            Value win_snap = Value::Object();
+            win_snap.set("sent", Value::Int(delta_sent));
+            win_snap.set("errors", Value::Int(delta_err));
+            Value nt_obj = Value::Object();
+            for (const auto& kv : delta_totals) {
+              nt_obj.set(kv.first, Value::Double(kv.second));
+            }
+            if (total_actual_rps > 0.0) {
+              nt_obj.set("actual_rps", Value::Double(total_actual_rps));
+            }
+            win_snap.set("numeric_totals", std::move(nt_obj));
+
+            ++win;
+            const WindowStatus ws =
+                evaluate_window(cur_setpoint, active_base_args, active_variant, win_snap, 0);
+            if (ws == WindowStatus::kRetryNoTraffic) {
+              if (g_stop.load() || !guard()) should_stop = true;
+              return "";
+            }
+            if (ws == WindowStatus::kAbortNoTraffic || ws == WindowStatus::kDone ||
+                g_stop.load() || !guard()) {
+              should_stop = true;
+              return "";
+            }
+
+            cur_setpoint = dec.setpoint_rps;
+            active_base_args.set("target_rps", Value::Double(cur_setpoint));
+            active_base_args.set("pacing_mode", Value::Int(1));
+            prepare_job_levers(active_base_args, win, active_variant);
+
+            Value reconf = Value::Object();
+            reconf.set("target_rps", Value::Double(cur_setpoint));
+            reconf.set("rps", Value::Double(cur_setpoint));
+            reconf.set("pacing_mode", Value::Int(1));
+            if (LowerCopy(worker_kind) == "telco" || telco_subs > 0) {
+              reconf.set("telco_cps", Value::Int(std::max<std::int64_t>(1, std::llround(cur_setpoint))));
+            }
+            for (std::size_t k = 1;
+                 k < sizeof(samurai::control::kActionFields) /
+                         sizeof(samurai::control::kActionFields[0]);
+                 ++k) {
+              if (const Value* fv = active_base_args.find(samurai::control::kActionFields[k])) {
+                reconf.set(samurai::control::kActionFields[k], *fv);
+              }
+            }
+            return reconf.dump();
+          };
+
+          const JobResult res = coord.RunSingleJob(job, "cl-live-1", guard);
+          if (win == 0 && !cl_aborted) {
+            ++win;
+            (void)evaluate_window(cur_setpoint, active_base_args, active_variant, res.snapshot, res.rc);
+          }
+        } else {
+          while (!g_stop.load() && guard()) {
+            const double setpoint = ctl.current_setpoint();
+            const std::int64_t win_count =
+                std::max<std::int64_t>(1, static_cast<std::int64_t>(setpoint * window_s));
+            Value wspec = spec;
+            wspec.set("count", Value::Int(win_count));
+            wspec.set("target_rps", Value::Double(setpoint));
+            if (LowerCopy(worker_kind) == "telco" || telco_subs > 0) {
+              wspec.set("telco_duration_ms", Value::Int(window_s * 1000));
+              wspec.set("telco_cps", Value::Int(std::max<std::int64_t>(1, std::llround(setpoint))));
+            }
+            JobConfig job = BuildJobConfig(wspec, ep_now, tenant, master_region);
+            job.base_args.set("target_rps", Value::Double(setpoint));
+            job.base_args.set("pacing_mode", Value::Int(1));
+            int applied_variant = -1;
+            prepare_job_levers(job.base_args, win, applied_variant);
+            attach_progress(job);
+            const JobResult res =
+                coord.RunSingleJob(job, "cl-" + std::to_string(++win), guard);
+            const WindowStatus ws =
+                evaluate_window(setpoint, job.base_args, applied_variant, res.snapshot, res.rc);
+            if (ws == WindowStatus::kRetryNoTraffic) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(500));
+              continue;
+            }
+            if (ws == WindowStatus::kAbortNoTraffic || ws == WindowStatus::kDone) {
+              break;
+            }
+          }
         }
         // Persist what this run learned about the target so the next run warm-starts
         // instead of rediscovering the same path-blocks (cross-episode memory).
@@ -1897,10 +2236,7 @@ int main(int argc, char** argv) {
         }
         Value clsummary = Value::Object();
         clsummary.set("event", Value::Str("closed_loop_result"));
-        clsummary.set("strategy",
-                      Value::Str(clcfg.strategy == samurai::control::ClosedLoopStrategy::kBinSearch
-                                     ? "binsearch"
-                                     : "aimd"));
+        clsummary.set("strategy", Value::Str(StrategyName(clcfg.strategy)));
         clsummary.set("windows", Value::Int(dec.window));
         clsummary.set("best_good_rps", Value::Double(dec.best_good_rps));
         clsummary.set("final_phase", Value::Str(dec.phase));

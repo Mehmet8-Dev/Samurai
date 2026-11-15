@@ -83,6 +83,7 @@ struct ManagementProviders {
   std::function<samurai::core::json::Value()> abort_callback;
   std::function<std::string()> metrics_provider;  // may be empty
   std::function<samurai::core::json::Value(const samurai::core::json::Value&)> provision_callback;  // node trigger/provision
+  std::function<samurai::core::json::Value(const samurai::core::json::Value&)> reconfigure_callback;  // live shard window reconfig
 };
 
 class RateLimiter {
