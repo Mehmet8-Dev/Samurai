@@ -18,8 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.0.0] - 2026-11-15
 
-Codename: **Shogun**
-
 ### Added
 - **Native C++ CLI, Core & Licensing (`samurai`, `samurai_core`, `samurai_license`)**:
   - Replaced legacy Python CLI/utils entrypoints with native C++17 `samurai` CLI and `samurai_core` library.
@@ -53,7 +51,7 @@ Codename: **Shogun**
   - Standardized SVG architecture diagrams and modernized operational guides for core runtime, kernel-bypass, GPU P2P doorbell, DPU-GPU CUPS, telecom, and distributed clustering.
 
 ### Changed
-- **Project Identity, Version & Codename**: Rebranded repository, Python package, C++ namespaces, Helm chart, CI workflows, and documentation from `DDoSamurai` / `ddos_samurai` to `Samurai` / `samurai`; updated project codename from `Kenjaku` to **Shogun** and bumped canonical SemVer to `3.0.0`.
+- **Project Identity & Versioning**: Rebranded repository, Python package, C++ namespaces, Helm chart, CI workflows, and documentation from `DDoSamurai` / `ddos_samurai` to `Samurai` / `samurai`, retired project codenames, and bumped canonical SemVer to `3.0.0`.
 - **L4 TCP Flow Efficiency & False-Sharing Removal**: Cut 1M flow RAM footprint by 63.3% (605 B/flow) and added 64-shard `PaddedMutex` / cache-line alignment across L4 and worker structs.
 - **Worker & Pacing Consolidation**: Consolidated pacing engine into `samurai/zmq/lib` and harmonized DPDK, GPU, and telecom ZMQ worker daemons around zero-copy interfaces.
 - **CLI Safety & Native Reporting**: Gated `--run-rfc-suite` behind `cli::Validate()` target safety checks using real RFC 2544 / 3511 / 8219 timings, and extended `--report-json` / `--report-text` with live IPFIX and Telco telemetry.
@@ -70,7 +68,7 @@ Codename: **Shogun**
 - Dropped `setup.py`, dead `dataplane_core.c` CPython extension, legacy root Python modules, superseded Python ZMQ launcher/orchestration layer, legacy pybind `l7_emu` + `gpu_cuda_payload` stacks, unused `L4StateEngineCore` / `l4se` FFI, and legacy attack sender implementations.
 
 ### Notes
-- Codename updated to `Shogun` (previous codename: `Kenjaku`).
+- Retired project codenames; releases use SemVer (`3.0.0`) exclusively.
 
 ## [2.2.0] - 2026-05-13
 

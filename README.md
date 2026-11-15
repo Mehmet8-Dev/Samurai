@@ -1,6 +1,6 @@
 # Samurai Network Resilience & Line-Rate Stress Platform
 
-Samurai (Release 3.0.0, Codename: **Shogun**) is an enterprise-grade, high-performance network resilience and line-rate stress testing platform designed strictly for authorized lab and infrastructure validation environments.
+Samurai (Release 3.0.0) is an enterprise-grade, high-performance network resilience and line-rate stress testing platform designed strictly for authorized lab and infrastructure validation environments.
 
 The platform is engineered in modern **C++ (C++17)** with zero runtime Python latency, featuring a **ZeroMQ (ZMQ) binary IPC wire protocol**, **Kernel-Bypass (AF_XDP, DPDK)** drivers, **NVIDIA CUDA & DOCA GPUNetIO packet synthesis**, and a **64-shard Userspace TCP/L7 engine**.
 

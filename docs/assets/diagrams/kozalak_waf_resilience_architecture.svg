@@ -71,7 +71,7 @@
   <!-- Left Column: Samurai Closed-Loop Autopilot & Test Engines -->
   <g class="group">
     <rect class="g" x="40" y="104" width="320" height="400" rx="12"/>
-    <text class="gl tm" x="56" y="128">Samurai (Shogun) Stress &amp; RL Engine</text>
+    <text class="gl tm" x="56" y="128">Samurai Stress &amp; RL Engine</text>
 
     <g class="node">
       <rect class="k-nvkr" x="60" y="148" width="280" height="64" rx="8"/>
@@ -209,6 +209,6 @@
     <rect class="k-tp" x="970" y="530" width="22" height="16" rx="4"/>
     <text class="s t" x="1000" y="543">Cache &amp; Metrics</text>
 
-    <text class="s tm" x="40" y="580">Kozalak WAF Resilience Benchmark — Samurai (Shogun) Architecture</text>
+    <text class="s tm" x="40" y="580">Kozalak WAF Resilience Benchmark — Samurai Architecture</text>
   </g>
 </svg>

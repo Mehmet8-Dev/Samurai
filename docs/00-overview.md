@@ -1,6 +1,6 @@
 # 00 - System Architecture & Subsystem Map
 
-Samurai (Codename: **Shogun**) is an enterprise-grade, high-performance network resilience and line-rate stress testing platform designed for authorized lab environments. Built in pure C++17 with zero runtime Python latency, it provides modular, hardware-accelerated packet synthesis, stateful protocol simulation, and distributed control planes.
+Samurai is an enterprise-grade, high-performance network resilience and line-rate stress testing platform designed for authorized lab environments. Built in pure C++17 with zero runtime Python latency, it provides modular, hardware-accelerated packet synthesis, stateful protocol simulation, and distributed control planes.
 
 ![Samurai End-to-End System Architecture](assets/diagrams/samurai_system_architecture.svg)
 

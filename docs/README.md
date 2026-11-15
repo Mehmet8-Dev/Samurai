@@ -1,4 +1,4 @@
-# Samurai Documentation Index (Native C++ / Shogun)
+# Samurai Documentation Index (Native C++)
 
 This directory serves as the centralized technical index for the Samurai network resilience and stress testing platform, covering its native C++17 modular runtime, kernel-bypass engines, hardware accelerators, and distributed control planes.
 

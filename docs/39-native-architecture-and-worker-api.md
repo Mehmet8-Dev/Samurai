@@ -2,7 +2,7 @@
 
 ## 1. Architectural Overview
 
-Samurai (Release 2.2+, Codename: **Shogun**) is an enterprise-grade, high-throughput, low-latency network resilience and stress testing platform built entirely in native C++17.
+Samurai (Release 3.0.0) is an enterprise-grade, high-throughput, low-latency network resilience and stress testing platform built entirely in native C++17.
 
 ![Samurai End-to-End System Architecture](assets/diagrams/samurai_system_architecture.svg)
 
