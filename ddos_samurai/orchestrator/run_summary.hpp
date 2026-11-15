@@ -67,6 +67,19 @@ struct RunStats {
   std::uint64_t tcp_connect_timeout_count = 0;  // SYN never answered — filtering / drop
   std::uint64_t tcp_retransmit_count = 0;       // loss/throttle-induced retransmits
   std::uint64_t tcp_timeout_close_count = 0;    // idle/stall closes under pressure
+
+  // Production IPFIX / NetFlow telemetry export totals
+  std::uint64_t ipfix_exported_packets = 0;
+  std::uint64_t ipfix_exported_records = 0;
+
+  // Telco control & user plane telemetry
+  std::uint64_t telco_active_sessions = 0;
+  std::uint64_t telco_established_sessions = 0;
+  std::uint64_t telco_failed_sessions = 0;
+  std::uint32_t telco_current_cps = 0;
+  std::uint32_t telco_avg_setup_latency_us = 0;
+  std::uint32_t telco_p99_setup_latency_us = 0;
+  std::uint64_t telco_retransmit_count = 0;
 };
 
 // Folds one snapshot into the accumulator. Counters add up across snapshots;
@@ -111,12 +124,16 @@ inline void RecomputeLoss(RunStats& acc) {
 }
 
 inline std::string SummaryJson(const RunStats& s) {
-  char buf[2048];
+  char buf[4096];
   std::snprintf(
       buf, sizeof(buf),
       "{\"event\":\"run_summary\",\"attempted\":%llu,\"sent\":%llu,\"errors\":%llu,"
       "\"bytes_sent\":%llu,\"actual_rps\":%.2f,\"rate_accuracy_pct\":%.2f,"
       "\"wire_loss_est_packets\":%llu,\"wire_loss_est_pct\":%.4f,"
+      "\"ipfix_telemetry\":{\"exported_packets\":%llu,\"exported_records\":%llu},"
+      "\"telco_telemetry\":{\"active_sessions\":%llu,\"established_sessions\":%llu,"
+      "\"failed_sessions\":%llu,\"current_cps\":%u,\"avg_setup_latency_us\":%u,"
+      "\"p99_setup_latency_us\":%u,\"retransmit_count\":%llu},"
       "\"l7_telemetry\":{\"tls_handshakes\":%llu,\"dns_queries\":%llu,"
       "\"tcp_tcb\":%llu,\"zc_tx_bytes\":%llu}}",
       static_cast<unsigned long long>(s.attempted),
@@ -127,6 +144,15 @@ inline std::string SummaryJson(const RunStats& s) {
       s.rate_accuracy_pct,
       static_cast<unsigned long long>(s.wire_loss_est_packets),
       s.wire_loss_est_pct,
+      static_cast<unsigned long long>(s.ipfix_exported_packets),
+      static_cast<unsigned long long>(s.ipfix_exported_records),
+      static_cast<unsigned long long>(s.telco_active_sessions),
+      static_cast<unsigned long long>(s.telco_established_sessions),
+      static_cast<unsigned long long>(s.telco_failed_sessions),
+      static_cast<unsigned>(s.telco_current_cps),
+      static_cast<unsigned>(s.telco_avg_setup_latency_us),
+      static_cast<unsigned>(s.telco_p99_setup_latency_us),
+      static_cast<unsigned long long>(s.telco_retransmit_count),
       static_cast<unsigned long long>(s.tls_handshakes_completed),
       static_cast<unsigned long long>(s.dns_queries_sent),
       static_cast<unsigned long long>(s.tcp_active_tcb_count),

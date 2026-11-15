@@ -7,6 +7,8 @@
 // that consumes it by construction (see the static_asserts in wire_protocol.h).
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -74,6 +76,33 @@ struct JobOptions {
   std::uint8_t  echo_mode = 0;
   bool gpu_bar1_p2p = false;
   bool gpu_persistent = false;
+
+  // Production telemetry / IPFIX exporter options (delivered via SET_TELEMETRY)
+  bool ipfix_enabled = false;
+  std::string ipfix_collector = "127.0.0.1";
+  std::uint16_t ipfix_port = 4739;
+  std::uint32_t ipfix_sample_rate = 1000;
+  bool ipfix_netflow_v9 = false;
+  std::uint32_t ipfix_domain_id = 1;
+  std::uint32_t ipfix_export_interval_ms = 1000;
+
+  // Distributed Telco control & user plane options (TelcoJobEnvelopeV1)
+  std::uint32_t telco_subscriber_start = 0;
+  std::uint32_t telco_subscribers = 100;
+  std::uint32_t telco_rate_cps = 50;
+  std::uint16_t telco_base_vlan_s = 100;
+  std::uint16_t telco_base_vlan_c = 100;
+  std::string telco_base_ip = "10.0.0.1";
+  std::string telco_gateway_ip;  // empty => fall back to target_ip (or 10.0.0.254)
+  std::uint32_t telco_duration_ms = 5000;
+  std::uint32_t sctp_rate = 0;
+  std::uint32_t diameter_rate = 0;
+  std::uint32_t sip_rate = 0;
+  bool enable_srtp = false;
+  std::uint16_t telco_db_port = 5099;
+  std::string telco_username = "samurai";
+  std::string telco_password = "pass";
+  std::array<std::uint8_t, 6> telco_base_mac = {0x02, 0x1a, 0x2b, 0x3c, 0x00, 0x01};
 };
 
 // Copies a std::string into a fixed-size char buffer, always NUL-terminating and
@@ -160,6 +189,94 @@ inline samurai::wire::TelcoGpuJobEnvelopeV1 BuildTelcoGpuJobEnvelope(const JobOp
   if (opt.gpu_bar1_p2p) fl |= samurai::wire::kTelcoGpuJobFlagBar1P2p;
   if (opt.gpu_persistent) fl |= samurai::wire::kTelcoGpuJobFlagPersistent;
   env.flags = fl;
+  return env;
+}
+
+inline std::uint32_t ParseIpv4HostOrder(const std::string& ip, std::uint32_t fallback) {
+  std::uint32_t parts[4] = {0, 0, 0, 0};
+  int part_idx = 0;
+  std::uint32_t cur = 0;
+  bool has_digit = false;
+  for (char c : ip) {
+    if (c >= '0' && c <= '9') {
+      cur = cur * 10u + static_cast<std::uint32_t>(c - '0');
+      if (cur > 255u) return fallback;
+      has_digit = true;
+    } else if (c == '.') {
+      if (!has_digit || part_idx >= 3) return fallback;
+      parts[part_idx++] = cur;
+      cur = 0;
+      has_digit = false;
+    } else {
+      return fallback;
+    }
+  }
+  if (!has_digit || part_idx != 3) return fallback;
+  parts[3] = cur;
+  return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+}
+
+inline samurai::wire::TelcoProtocolKind ResolveTelcoProtocolKind(const std::string& proto) {
+  std::string lower;
+  lower.reserve(proto.size());
+  for (unsigned char c : proto) {
+    lower.push_back(static_cast<char>(std::tolower(c)));
+  }
+  if (lower == "pppoe") return samurai::wire::TelcoProtocolKind::PPPOE;
+  if (lower == "dhcp" || lower == "dhcpv4") return samurai::wire::TelcoProtocolKind::DHCP;
+  if (lower == "bfd") return samurai::wire::TelcoProtocolKind::BFD;
+  if (lower == "gtpu" || lower == "gtp-u" || lower == "5g-gtpu") return samurai::wire::TelcoProtocolKind::GTPU;
+  if (lower == "qinq") return samurai::wire::TelcoProtocolKind::QINQ;
+  if (lower == "arp") return samurai::wire::TelcoProtocolKind::ARP;
+  if (lower == "pfcp" || lower == "cups") return samurai::wire::TelcoProtocolKind::PFCP;
+  if (lower == "sctp") return samurai::wire::TelcoProtocolKind::SCTP;
+  if (lower == "diameter") return samurai::wire::TelcoProtocolKind::DIAMETER;
+  if (lower == "sip" || lower == "rtp" || lower == "sip-rtp" || lower == "sip_rtp") {
+    return samurai::wire::TelcoProtocolKind::SIP_RTP;
+  }
+  return samurai::wire::TelcoProtocolKind::MULTI;
+}
+
+inline samurai::wire::TelemetryConfigV1 BuildTelemetryConfig(const JobOptions& opt) {
+  samurai::wire::TelemetryConfigV1 cfg{};
+  cfg.enabled = opt.ipfix_enabled ? 1u : 0u;
+  cfg.netflow_v9 = opt.ipfix_netflow_v9 ? 1u : 0u;
+  cfg.collector_port = opt.ipfix_port > 0 ? opt.ipfix_port : 4739u;
+  cfg.sample_rate = opt.ipfix_sample_rate > 0 ? opt.ipfix_sample_rate : 1u;
+  cfg.domain_id = opt.ipfix_domain_id;
+  cfg.export_interval_ms = opt.ipfix_export_interval_ms > 0 ? opt.ipfix_export_interval_ms : 1000u;
+  CopyFixed(cfg.collector_ip, sizeof(cfg.collector_ip),
+            opt.ipfix_collector.empty() ? std::string("127.0.0.1") : opt.ipfix_collector);
+  return cfg;
+}
+
+inline samurai::wire::TelcoJobEnvelopeV1 BuildTelcoJobEnvelope(const JobOptions& opt) {
+  samurai::wire::TelcoJobEnvelopeV1 env{};
+  env.base = BuildJobEnvelope(opt);
+  env.subscriber_start_idx = opt.telco_subscriber_start;
+  env.subscriber_count = std::max(1u, opt.telco_subscribers);
+  env.rate_cps = std::max(1u, opt.telco_rate_cps);
+  env.sctp_rate = opt.sctp_rate;
+  env.diameter_rate = opt.diameter_rate;
+  env.sip_rate = opt.sip_rate;
+  env.teid_start = opt.teid_start;
+  env.teid_count = std::max(1u, opt.teid_count);
+  env.base_client_ip = ParseIpv4HostOrder(opt.telco_base_ip, 0x0A000001u);
+  const std::string& gw = opt.telco_gateway_ip.empty() ? opt.target_ip : opt.telco_gateway_ip;
+  env.gateway_ip = ParseIpv4HostOrder(gw, 0x0A0000FEu);
+  env.duration_ms = opt.telco_duration_ms;
+  env.base_vlan_s = opt.svlan_tci > 0 ? opt.svlan_tci : opt.telco_base_vlan_s;
+  env.base_vlan_c = opt.cvlan_tci > 0 ? opt.cvlan_tci : opt.telco_base_vlan_c;
+  env.db_port = opt.telco_db_port > 0 ? opt.telco_db_port : 5099u;
+  env.qfi = opt.qfi;
+  env.inner_proto = opt.inner_proto;
+  env.enable_srtp = opt.enable_srtp ? 1u : 0u;
+  const auto kind = ResolveTelcoProtocolKind(opt.protocol);
+  env.telco_protocol_kind = static_cast<std::uint8_t>(kind);
+  std::memcpy(env.base_mac, opt.telco_base_mac.data(), 6);
+  CopyFixed(env.telco_protocol_name, sizeof(env.telco_protocol_name), opt.protocol);
+  CopyFixed(env.auth_username, sizeof(env.auth_username), opt.telco_username);
+  CopyFixed(env.auth_password, sizeof(env.auth_password), opt.telco_password);
   return env;
 }
 

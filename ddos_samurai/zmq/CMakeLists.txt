@@ -27,13 +27,19 @@ if(NOT SAMURAI_ENGINES_OWNED_BY_ROOT)
   add_subdirectory(../l4 l4)
   add_subdirectory(../l7_emu_native l7_emu_native)
 endif()
+if(NOT TARGET samurai_telemetry)
+  add_subdirectory(../telemetry telemetry)
+endif()
 
 add_library(
   pacing_engine_static
   STATIC
   lib/pacing_engine.c
 )
-target_include_directories(pacing_engine_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib)
+target_include_directories(pacing_engine_static
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(pacing_engine_static PUBLIC m pthread)
 
 add_library(
   cpu_native_static
@@ -63,12 +69,13 @@ endfunction()
 
 add_samurai_worker(samurai_cpu_worker daemon/cpu_worker.cpp)
 target_include_directories(samurai_cpu_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
-target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static pthread)
+target_link_libraries(samurai_cpu_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static samurai_telemetry pthread)
 add_samurai_worker(samurai_gpu_worker daemon/gpu_worker.cpp)
 # Link the af_packet engine so the CUDA host path's weak AF_PACKET TX_RING
 # bridge symbols (afpkt_send_ring_bridge/afpkt_cleanup_ring_bridge) resolve.
 target_include_directories(samurai_gpu_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
-target_link_libraries(samurai_gpu_worker PRIVATE pacing_engine_static af_packet_static pthread dl)
+target_link_libraries(samurai_gpu_worker PRIVATE pacing_engine_static af_packet_static samurai_telemetry pthread dl)
+set_target_properties(samurai_gpu_worker PROPERTIES ENABLE_EXPORTS ON)
 add_samurai_worker(samurai_dpdk_worker daemon/dpdk_worker.cpp)
 # Tek native DPDK çekirdeği (dpdk/dpdk_core) artık samurai_l7emu içinde konsolide
 # derlenir ve SAMURAI_WITH_DPDK + DPDK link bayrakları PUBLIC yayılır; worker onu
@@ -76,7 +83,7 @@ add_samurai_worker(samurai_dpdk_worker daemon/dpdk_worker.cpp)
 # Paylaşılan userspace stateful TCP fast-path sürücüsü (rte/xdp header'ı içermez).
 target_sources(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
 target_include_directories(samurai_dpdk_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../dpdk)
-target_link_libraries(samurai_dpdk_worker PRIVATE pacing_engine_static cpu_native_static samurai_l7emu pthread dl)
+target_link_libraries(samurai_dpdk_worker PRIVATE pacing_engine_static cpu_native_static samurai_l7emu samurai_telemetry pthread dl)
 if(DPDK_FOUND)
   target_compile_definitions(samurai_dpdk_worker PRIVATE SAMURAI_WITH_DPDK=1)
   target_include_directories(samurai_dpdk_worker PRIVATE ${DPDK_INCLUDE_DIRS})
@@ -89,11 +96,11 @@ else()
 endif()
 add_samurai_worker(samurai_afxdp_worker daemon/afxdp_worker.cpp)
 target_sources(samurai_afxdp_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
-target_link_libraries(samurai_afxdp_worker PRIVATE pacing_engine_static cpu_native_static samurai_l7emu pthread dl)
+target_link_libraries(samurai_afxdp_worker PRIVATE pacing_engine_static cpu_native_static samurai_l7emu samurai_telemetry pthread dl)
 add_samurai_worker(samurai_doca_worker daemon/doca_gpunetio_worker.cpp)
-target_link_libraries(samurai_doca_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
+target_link_libraries(samurai_doca_worker PRIVATE pacing_engine_static cpu_native_static samurai_telemetry pthread dl)
 add_samurai_worker(samurai_l7_worker daemon/l7_worker.cpp)
-target_link_libraries(samurai_l7_worker PRIVATE pacing_engine_static samurai_l7emu pthread)
+target_link_libraries(samurai_l7_worker PRIVATE pacing_engine_static samurai_l7emu samurai_telemetry pthread)
 add_samurai_worker(samurai_defense_worker daemon/defense_worker.cpp)
 target_link_libraries(samurai_defense_worker PRIVATE pacing_engine_static cpu_native_static pthread dl)
 add_samurai_worker(samurai_scenario_worker daemon/scenario_worker.cpp)
@@ -104,7 +111,7 @@ target_include_directories(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURC
 # kernel_socket'e düşer (varsayılan commodity yol değişmez). dpdk_core artık
 # samurai_l7emu içinde konsolide (bkz. l7_emu_native/CMakeLists.txt); transitif link'lenir.
 target_sources(samurai_scenario_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/daemon/stateful_fastpath.cpp)
-target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static samurai_scenario samurai_l7emu pthread)
+target_link_libraries(samurai_scenario_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static samurai_scenario samurai_l7emu samurai_telemetry pthread)
 if(DPDK_FOUND)
   target_compile_definitions(samurai_scenario_worker PRIVATE SAMURAI_WITH_DPDK=1)
   target_include_directories(samurai_scenario_worker PRIVATE ${DPDK_INCLUDE_DIRS})
@@ -115,7 +122,7 @@ if(DPDK_FOUND)
 endif()
 add_samurai_worker(samurai_afpacket_worker daemon/afpacket_worker.cpp)
 target_include_directories(samurai_afpacket_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../af_packet)
-target_link_libraries(samurai_afpacket_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static pthread)
+target_link_libraries(samurai_afpacket_worker PRIVATE pacing_engine_static cpu_native_static af_packet_static samurai_telemetry pthread)
 
 add_samurai_worker(samurai_telco_worker daemon/telco_worker.cpp)
 target_include_directories(samurai_telco_worker PRIVATE
@@ -133,6 +140,7 @@ target_link_libraries(samurai_telco_worker PRIVATE
     samurai_telecom_static
     samurai_core
     pacing_engine_static
+    samurai_telemetry
     pthread
     dl)
 
@@ -189,4 +197,27 @@ target_include_directories(bench_l7_stateful_userspace PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../core
   ${CMAKE_CURRENT_SOURCE_DIR}/../l7_emu_native)
 target_link_libraries(bench_l7_stateful_userspace PRIVATE pacing_engine_static samurai_l7emu samurai_core samurai_l4 pthread dl)
+
+add_executable(test_pacing_telemetry_warm
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_pacing_telemetry_warm.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator/supervisor.cpp)
+target_compile_definitions(test_pacing_telemetry_warm PRIVATE
+  SAMURAI_WORKER_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(test_pacing_telemetry_warm PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/daemon
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator
+  ${CMAKE_CURRENT_SOURCE_DIR}/../core
+  ${LIBZMQ_INCLUDE_DIRS})
+target_link_directories(test_pacing_telemetry_warm PRIVATE ${LIBZMQ_LIBRARY_DIRS})
+target_link_libraries(test_pacing_telemetry_warm PRIVATE
+  pacing_engine_static
+  samurai_telemetry
+  samurai_core
+  ${LIBZMQ_LIBRARIES}
+  pthread)
+target_compile_options(test_pacing_telemetry_warm PRIVATE ${LIBZMQ_CFLAGS_OTHER})
+add_test(NAME pacing_telemetry_warm COMMAND test_pacing_telemetry_warm)
+
 
