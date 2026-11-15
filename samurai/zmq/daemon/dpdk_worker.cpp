@@ -178,11 +178,14 @@ struct DpdkPortGuard {
 
 // DPDK taşıma shim'i (DpdkShim) artık dpdk_fastpath_shim.hpp'de tanımlı ve
 // scenario_worker ile paylaşılır; burada using ile kısa adla kullanılır.
+using samurai::daemon::DpdkMultiQueueGuard;
 using samurai::daemon::DpdkShim;
+using samurai::daemon::DpdkShimConfig;
 
-// Stateful fast-path job'unu koşar: portu açar, tcpdp'yi yapılandırır, L4 connect'leri
-// seed eder, ortak sürücü loop'unu çalıştırır ve nihai METRIC_SNAPSHOT + JOB_DONE
-// yayınlar. Blast (stateless) yolu değişmeden kalır — bu yalnız stateful branch'tir.
+// Stateful fast-path job'unu koşar: multi-queue+rte_flow veya tek-kuyruk portu
+// açar, tcpdp'yi yapılandırır, L4 connect'leri seed eder, sürücü loop'unu
+// (zero-copy rte_mbuf RX + strided bulk TX) çalıştırır ve METRIC_SNAPSHOT +
+// JOB_DONE yayınlar. Blast (stateless) yolu değişmeden kalır.
 inline void RunDpdkStatefulJob(
     void* pull,
     void* push,
@@ -191,6 +194,7 @@ inline void RunDpdkStatefulJob(
     const samurai::wire::JobEnvelopeV2& env2,
     int cli_port_id,
     int cli_queue_id,
+    int cli_tx_queues,
     const std::string& cli_eal_args,
     samurai::daemon::TelemetrySink& telemetry,
     bool& running_out) {
@@ -201,7 +205,10 @@ inline void RunDpdkStatefulJob(
                               ? std::atoi(std::getenv("SAMURAI_DPDK_PORT_ID"))
                               : 0)));
   const std::uint16_t queue_id = static_cast<std::uint16_t>(std::max(0,
-      cli_queue_id >= 0 ? cli_queue_id : static_cast<int>(env.xdp_queue_id)));
+      cli_queue_id >= 0 ? cli_queue_id
+                        : (std::getenv("SAMURAI_DPDK_QUEUE_ID")
+                               ? std::atoi(std::getenv("SAMURAI_DPDK_QUEUE_ID"))
+                               : static_cast<int>(env.xdp_queue_id))));
   std::string eal_args = cli_eal_args;
   if (eal_args.empty()) {
     const char* p = std::getenv("SAMURAI_DPDK_EAL_ARGS");
@@ -215,19 +222,27 @@ inline void RunDpdkStatefulJob(
     return;
   }
 
-  DpdkShim shim(port_id, queue_id, eal_args);
-  if (!shim.ok()) {
-    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
-                    header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
-                    JsonError(shim.open_err.empty() ? "dpdk_open_port_failed" : shim.open_err));
-    return;
-  }
-
   samurai::daemon::FastpathParams params =
       samurai::daemon::FastpathParamsFromEnvelope(env);
   params.backend = "dpdk";
 
-  samurai::daemon::StatefulFastpathDriver driver(shim);
+  const bool l7 = samurai::daemon::JobWantsL7Fastpath(env);
+
+  // Kuyruk sayısını belirle: --dpdk-tx-queues veya SAMURAI_DPDK_TX_QUEUES varsa
+  // onu kullan; belirtilmemişse ve açık --dpdk-queue-id verilmemişse donanım
+  // eşzamanlılığına göre multi-queue başlat (rte_flow yoksa 1 kuyruğa düşer).
+  std::uint16_t requested_queues = 1;
+  if (!l7) {
+    if (cli_tx_queues > 0) {
+      requested_queues = static_cast<std::uint16_t>(cli_tx_queues);
+    } else if (const char* tqe = std::getenv("SAMURAI_DPDK_TX_QUEUES")) {
+      requested_queues = static_cast<std::uint16_t>(std::max(1, std::atoi(tqe)));
+    } else if (cli_queue_id < 0 && env.xdp_queue_id == 0) {
+      const unsigned hw = std::thread::hardware_concurrency();
+      requested_queues =
+          static_cast<std::uint16_t>(std::clamp<unsigned>(hw == 0 ? 1u : hw, 1u, 16u));
+    }
+  }
 
   std::atomic<bool> stop{false};
   samurai::daemon::ControlPollState ctrl{};
@@ -250,23 +265,71 @@ inline void RunDpdkStatefulJob(
                     SerializeSnapshotV2(snap));
   };
 
-  const bool l7 = samurai::daemon::JobWantsL7Fastpath(env);
   samurai::daemon::L7RunnerBundle l7b;
   samurai::daemon::FastpathResult res;
-  if (l7) {
-    // L7: run_profile_json (dpdk_direct) kendi connect'lerini açar; SeedL4 yok.
-    // tcpdp yapılandırmasını da configure_custom_tcp_bridge yapar; driver.Configure yok.
-    l7b = samurai::daemon::MakeL7Runner(env2, "dpdk_direct");
-    res = driver.Run(params, l7b.runner, stop, hooks);
-  } else {
-    // Pure L4: driver tcpdp'yi yapılandırır ve connect'leri seed eder.
-    if (!driver.Configure(params, err)) {
+  std::uint16_t active_queues = 1;
+
+  if (!l7 && requested_queues > 1) {
+    DpdkMultiQueueGuard mq_guard;
+    if (!samurai::daemon::PrepareDpdkMultiQueueStateful(
+            port_id, requested_queues, params.target_flows, eal_args, mq_guard, err)) {
       (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
-                      header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
+                      header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                      JsonError(err.empty() ? "dpdk_open_port_failed" : err));
       return;
     }
-    driver.SeedL4(params);
-    res = driver.Run(params, {}, stop, hooks);
+    active_queues = mq_guard.active_queues;
+    if (active_queues > 1) {
+      const int base_core = std::getenv("SAMURAI_DPDK_BASE_CORE")
+          ? std::atoi(std::getenv("SAMURAI_DPDK_BASE_CORE"))
+          : -1;
+      samurai::daemon::ShardedFastpathConfig scfg;
+      scfg.workers = active_queues;
+      scfg.cpu_base = base_core;
+      auto factory = [port_id, active_queues, &eal_args](std::uint32_t w)
+          -> std::unique_ptr<samurai::daemon::FastpathTxRxShim> {
+        DpdkShimConfig cfg;
+        cfg.port_id = port_id;
+        cfg.queue_id = static_cast<std::uint16_t>(w);
+        cfg.num_tx_queues = active_queues;
+        cfg.num_rx_queues = active_queues;
+        cfg.enable_rss = true;
+        cfg.burst_size = 64u;
+        cfg.eal_args = eal_args;
+        auto shim = std::make_unique<DpdkShim>(cfg);
+        if (!shim->ok()) return nullptr;
+        return shim;
+      };
+      samurai::daemon::ShardedFastpathDriver sharded_driver(std::move(factory), scfg);
+      res = sharded_driver.Run(params, stop, hooks);
+    }
+  }
+
+  if (l7 || active_queues <= 1) {
+    DpdkShim shim(port_id, queue_id, eal_args);
+    if (!shim.ok()) {
+      (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                      header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
+                      JsonError(shim.open_err.empty() ? "dpdk_open_port_failed" : shim.open_err));
+      return;
+    }
+
+    samurai::daemon::StatefulFastpathDriver driver(shim);
+    if (l7) {
+      // L7: run_profile_json (dpdk_direct) kendi connect'lerini açar; SeedL4 yok.
+      // tcpdp yapılandırmasını da configure_custom_tcp_bridge yapar; driver.Configure yok.
+      l7b = samurai::daemon::MakeL7Runner(env2, "dpdk_direct");
+      res = driver.Run(params, l7b.runner, stop, hooks);
+    } else {
+      // Pure L4: driver tcpdp'yi yapılandırır ve connect'leri seed eder.
+      if (!driver.Configure(params, err)) {
+        (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                        header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id, JsonError(err));
+        return;
+      }
+      driver.SeedL4(params);
+      res = driver.Run(params, {}, stop, hooks);
+    }
   }
 
   const std::uint64_t done_ns = samurai_pacing_monotonic_now_ns();
@@ -280,6 +343,7 @@ inline void RunDpdkStatefulJob(
   done.set("mode", samurai::core::json::Value::Str(l7 ? "stateful_fastpath_l7" : "stateful_fastpath"));
   if (l7 && l7b.result) done.set("l7", *l7b.result);
   done.set("job_id", samurai::core::json::Value::Str(job_id));
+  done.set("queues", samurai::core::json::Value::Int(static_cast<int64_t>(active_queues)));
   done.set("tx_packets", samurai::core::json::Value::Int(static_cast<int64_t>(res.tx_packets)));
   done.set("rx_frames", samurai::core::json::Value::Int(static_cast<int64_t>(res.rx_frames)));
   done.set("connect_attempts", samurai::core::json::Value::Int(static_cast<int64_t>(res.connect_attempts)));
@@ -512,8 +576,8 @@ int main(int argc, char** argv) {
       // NIC'i sahiplenip TcpDataplaneCore'u koşar. Stateless blast yolu değişmez.
       if (samurai::daemon::IsStatefulFastpathJob(env)) {
         telemetry.BeginJob();
-        RunDpdkStatefulJob(pull, push, header, job_id, env2, cli_port_id, cli_queue_id, cli_eal_args,
-                           telemetry, running);
+        RunDpdkStatefulJob(pull, push, header, job_id, env2, cli_port_id, cli_queue_id,
+                           cli_tx_queues, cli_eal_args, telemetry, running);
         continue;
       }
       telemetry.BeginJob();

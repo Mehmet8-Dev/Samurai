@@ -196,6 +196,37 @@ bool steer_l4_dst_port_to_queue(int64_t handle, uint8_t l4_proto, uint16_t queue
 // Sayaç + donanım istatistik anlık görüntüsü.
 Snapshot snapshot(int64_t handle);
 
+// Lock-free fast-path RX/TX kuyruk ucu. `open_port` yaşam süresi boyunca
+// geçerlidir (`close_port` çağrılmadan önce `valid = false` yapılmalıdır).
+struct DirectQueueEndpoint {
+    void* mempool = nullptr;
+    void* ctx = nullptr;
+    uint16_t port_id = 0;
+    uint16_t queue_id = 0;
+    uint16_t burst_size = 64;
+    bool can_rx = false;
+    bool valid = false;
+};
+
+// Açık port + kuyruk için doğrudan (g_mu kilitsiz) veri-yolu ucu çözümler.
+bool resolve_direct_queue(int64_t handle, uint16_t queue_id, DirectQueueEndpoint& out);
+
+// Doğrudan rte_eth_rx_burst ile ham rte_mbuf* işaretçilerini ara kopya (memcpy)
+// olmadan döner. n > 0 ise mbuf sahipliği (rte_pktmbuf_free / IngestDpdkRxBurst)
+// çağırana geçer. out_bytes != nullptr ise burst içindeki paket uzunluklarını ekler.
+int rx_burst_mbufs(const DirectQueueEndpoint& ep, uint16_t budget, void** out_mbufs,
+                   uint64_t* out_bytes = nullptr);
+
+// Önceden oluşturulmuş rte_mbuf* dizisini doğrudan rte_eth_tx_burst ile gönderir.
+// Kısmi TX veya hata durumunda kalan mbuf'ları serbest bırakır (leak yok).
+TxResult tx_burst_mbufs(const DirectQueueEndpoint& ep, void** mbufs, uint16_t count);
+
+// Strided ring tamponundan (TcpDataplaneCore::PeekTxPacketsStrided) doğrudan bulk
+// rte_mbuf ayırıp tam paket verisini kopyalar ve toplu rte_eth_tx_burst yapar.
+// Kısmi TX'te yalnızca `res.sent` kadar paket ConsumeTxPackets ile tüketilmelidir.
+TxResult tx_burst_strided(const DirectQueueEndpoint& ep, const uint8_t* base,
+                          uint16_t packet_size, std::size_t stride, uint32_t count);
+
 // Port bağlamını kapat (son kullanıcı çıkınca portu teardown eder).
 void close_port(int64_t handle);
 

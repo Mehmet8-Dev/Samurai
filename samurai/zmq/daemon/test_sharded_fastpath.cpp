@@ -16,6 +16,7 @@
 #include <deque>
 #include <memory>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "stateful_fastpath.hpp"
@@ -38,6 +39,7 @@ constexpr std::uint8_t kAck = 0x10;
 // Per-worker observation: which CPU the worker's Send() ran on (pinning proof).
 struct WorkerObs {
   std::atomic<int> cpu{-2};
+  std::vector<std::uint16_t> src_ports;
 };
 
 // SYN -> SYN-ACK loopback peer. One instance per worker (shared-nothing wire).
@@ -67,6 +69,7 @@ struct LoopbackPeerShim : samurai::daemon::FastpathTxRxShim {
       const std::uint16_t src_port = ReadBe16(pkt + 34);
       const std::uint16_t dst_port = ReadBe16(pkt + 36);
       const std::uint32_t syn_seq = ReadBe32(pkt + 38);
+      if (obs) obs->src_ports.push_back(src_port);
 
       std::vector<std::uint8_t> resp(54, 0);
       WriteBe16(resp.data() + 12, 0x0800);
@@ -170,6 +173,94 @@ int main() {
       CHECK(cpu >= 0 && static_cast<std::uint32_t>(cpu) < workers,
             "worker %u ran on pinned cpu in [0,%u), observed %d", w, workers, cpu);
     }
+  }
+
+  // Ephemeral port stride / rte_flow mask separation across shards:
+  // (src_port & (next_pow2(workers) - 1)) == w and globally disjoint.
+  std::uint16_t stride = 1;
+  while (stride < workers) stride <<= 1;
+  const std::uint16_t mask = static_cast<std::uint16_t>(stride - 1u);
+  std::unordered_set<std::uint16_t> global_ports;
+  for (std::uint32_t w = 0; w < workers; ++w) {
+    CHECK(obs[w].src_ports.size() >= flows_per_worker,
+          "worker %u observed %zu SYN src ports, expected >= %u",
+          w, obs[w].src_ports.size(), flows_per_worker);
+    for (std::uint16_t sp : obs[w].src_ports) {
+      CHECK((sp & mask) == w,
+            "worker %u src_port=%u mask=0x%x residue=%u != %u (rte_flow steering mismatch)",
+            w, sp, mask, static_cast<unsigned>(sp & mask), w);
+      CHECK(global_ports.insert(sp).second,
+            "duplicate ephemeral src_port=%u across shards (worker %u)", sp, w);
+    }
+  }
+
+  // Verify FastpathTxRxShim::SupportsDirectMbufBurst() routes through RecvRawMbufs
+  // instead of Recv() on both ShardedFastpathDriver::Run(hooks) and StatefulFastpathDriver::Run().
+  {
+    struct SpyObs {
+      std::atomic<int> raw_calls{0};
+      std::atomic<int> legacy_calls{0};
+    };
+    struct DirectBurstSpyShim : samurai::daemon::FastpathTxRxShim {
+      SpyObs& obs;
+      int bursts_left = 1;
+      explicit DirectBurstSpyShim(SpyObs& o) : obs(o) {}
+      int Send(const std::uint8_t*, std::size_t, std::size_t,
+               std::uint32_t count, std::string&) override {
+        return static_cast<int>(count);
+      }
+      int Recv(std::uint8_t*, std::uint16_t, std::uint16_t*, std::uint16_t,
+               std::string&) override {
+        obs.legacy_calls.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+      }
+      bool SupportsDirectMbufBurst() const override { return true; }
+      int RecvRawMbufs(void** out_mbufs, std::uint16_t max_burst,
+                       std::uint64_t& out_bytes, std::string&) override {
+        obs.raw_calls.fetch_add(1, std::memory_order_relaxed);
+        if (bursts_left <= 0 || max_burst < 2) return 0;
+        --bursts_left;
+        out_mbufs[0] = nullptr;
+        out_mbufs[1] = nullptr;
+        out_bytes += 128;
+        return 2;
+      }
+      bool RxAvailable() const override { return true; }
+    };
+
+    SpyObs sharded_spy;
+    auto spy_factory = [&](std::uint32_t) -> std::unique_ptr<samurai::daemon::FastpathTxRxShim> {
+      return std::make_unique<DirectBurstSpyShim>(sharded_spy);
+    };
+    samurai::daemon::ShardedFastpathConfig scfg;
+    scfg.workers = 2;
+    scfg.cpu_base = -1;
+    samurai::daemon::FastpathParams sp = p;
+    sp.target_flows = 2;
+    sp.max_duration_ms = 50;
+    sp.drain_ms = 10;
+    std::atomic<bool> stop2{false};
+    samurai::daemon::FastpathHooks hooks;
+    hooks.emit_heartbeat = []() {};
+    samurai::daemon::ShardedFastpathDriver sdriver(spy_factory, scfg);
+    const auto sres = sdriver.Run(sp, stop2, hooks);
+    CHECK(sharded_spy.raw_calls.load() > 0, "ShardedFastpathDriver did not call RecvRawMbufs");
+    CHECK(sharded_spy.legacy_calls.load() == 0,
+          "ShardedFastpathDriver fell back to Recv() (%d calls)", sharded_spy.legacy_calls.load());
+    CHECK(sres.rx_frames >= 4, "ShardedFastpathDriver raw rx_frames=%llu expected >= 4",
+          (unsigned long long)sres.rx_frames);
+
+    SpyObs single_spy;
+    DirectBurstSpyShim single_shim(single_spy);
+    samurai::daemon::StatefulFastpathDriver single_driver(single_shim);
+    std::string cfg_err;
+    CHECK(single_driver.Configure(sp, cfg_err), "single_driver Configure failed: %s", cfg_err.c_str());
+    const auto fpres = single_driver.Run(sp, {}, stop2, hooks);
+    CHECK(single_spy.raw_calls.load() > 0, "StatefulFastpathDriver did not call RecvRawMbufs");
+    CHECK(single_spy.legacy_calls.load() == 0,
+          "StatefulFastpathDriver fell back to Recv() (%d calls)", single_spy.legacy_calls.load());
+    CHECK(fpres.rx_frames >= 2, "StatefulFastpathDriver raw rx_frames=%llu expected >= 2",
+          (unsigned long long)fpres.rx_frames);
   }
 
   if (g_fails == 0) {

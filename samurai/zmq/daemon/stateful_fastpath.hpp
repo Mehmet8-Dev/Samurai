@@ -48,6 +48,21 @@ struct FastpathTxRxShim {
   // Taşıma RX ingest destekliyor mu? false ise handshake tamamlanamaz (half-duplex)
   // — sürücü bunu tespit edip raporlar, asmaz.
   virtual bool RxAvailable() const = 0;
+
+  // Taşıma ara kopya (poll_rx memcpy) olmadan ham rte_mbuf* burst dönebiliyor mu?
+  virtual bool SupportsDirectMbufBurst() const { return false; }
+
+  // En fazla `max_burst` ham rte_mbuf* işaretçisini `out_mbufs` içine alır ve toplam
+  // bayt uzunluğunu `out_bytes`e yazar; mbuf sahipliği IngestDpdkRxBurst'e geçer.
+  // Desteklenmiyorsa <0, aksinde alınan mbuf sayısını (>=0) döner.
+  virtual int RecvRawMbufs(void** out_mbufs, std::uint16_t max_burst,
+                           std::uint64_t& out_bytes, std::string& err) {
+    (void)out_mbufs;
+    (void)max_burst;
+    (void)out_bytes;
+    (void)err;
+    return -1;
+  }
 };
 
 // Sürücünün job envelope'undan türettiği çalışma parametreleri.
@@ -142,6 +157,11 @@ class ShardedFastpathDriver {
   // stop tetiklenince ya da tüm flow'lar/deadline bitince döner. Birleşik sonucu döner;
   // per_worker != nullptr ise her worker'ın kendi FastpathResult'ı da yazılır.
   FastpathResult Run(const FastpathParams& p, const std::atomic<bool>& stop,
+                     std::vector<FastpathResult>* per_worker = nullptr);
+
+  // Worker ZMQ heartbeat/control kancalarıyla birlikte sharded L4 yürütümü.
+  FastpathResult Run(const FastpathParams& p, const std::atomic<bool>& stop,
+                     const FastpathHooks& hooks,
                      std::vector<FastpathResult>* per_worker = nullptr);
 
   // L7 shared-nothing modu: her worker kendi core'u ve shim'i üzerinde izole çalışır.

@@ -2577,6 +2577,9 @@ uint32_t TcpDataplaneCore::DrainDpdkTxBurst(void* mempool_ptr, void** out_mbufs,
   size_t stride = 0;
 
   if (PeekTxPacketsStrided(max_burst, &base, &count, &pkt_size, &stride) && count > 0 && base) {
+    if (count > max_burst) {
+      count = max_burst;
+    }
     const uint16_t alloc_count = static_cast<uint16_t>(count);
     if (rte_pktmbuf_alloc_bulk(mp, reinterpret_cast<rte_mbuf**>(out_mbufs), alloc_count) == 0) {
       for (uint32_t i = 0; i < count; ++i) {

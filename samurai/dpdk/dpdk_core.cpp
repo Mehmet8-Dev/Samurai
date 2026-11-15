@@ -211,6 +211,10 @@ bool ensure_port_ready(uint16_t port_id, uint16_t num_tx_queues,
             err = "dpdk_rx_not_configured";
             return false;
         }
+        if (rx_enable && rxq > it->second.rx_queues) {
+            err = "dpdk_rx_queue_unavailable";
+            return false;
+        }
         out = it->second;
         return true;
     }
@@ -1347,6 +1351,206 @@ Snapshot snapshot(int64_t handle) {
     return snap;
 }
 
+bool resolve_direct_queue(int64_t handle, uint16_t queue_id, DirectQueueEndpoint& out) {
+    out = DirectQueueEndpoint{};
+    std::shared_lock<std::shared_mutex> lock(g_mu);
+    auto it = g_contexts.find(static_cast<long>(handle));
+    if (it == g_contexts.end()) {
+        return false;
+    }
+    auto pt = g_ports.find(it->second.port_id);
+    if (pt == g_ports.end() || !pt->second.started || !pt->second.mempool) {
+        return false;
+    }
+    if (queue_id >= pt->second.tx_queues) {
+        return false;
+    }
+    out.mempool = pt->second.mempool;
+    out.ctx = &it->second;
+    out.port_id = it->second.port_id;
+    out.queue_id = queue_id;
+    out.burst_size = it->second.burst_size;
+    out.can_rx = it->second.rx_enable && queue_id < pt->second.rx_queues;
+    out.valid = true;
+    return true;
+}
+
+int rx_burst_mbufs(const DirectQueueEndpoint& ep, uint16_t budget, void** out_mbufs,
+                   uint64_t* out_bytes) {
+    if (!ep.valid || !ep.can_rx || !out_mbufs || budget == 0) {
+        return 0;
+    }
+    const uint16_t clamped = std::min<uint16_t>(budget, kMaxBurst);
+    rte_mbuf** mbufs = reinterpret_cast<rte_mbuf**>(out_mbufs);
+    const uint16_t n = rte_eth_rx_burst(ep.port_id, ep.queue_id, mbufs, clamped);
+    if (n == 0) {
+        return 0;
+    }
+    uint64_t bytes = 0;
+    for (uint16_t i = 0; i < n; ++i) {
+        bytes += rte_pktmbuf_pkt_len(mbufs[i]);
+    }
+    if (out_bytes) {
+        *out_bytes += bytes;
+    }
+    if (auto* ctx = static_cast<Context*>(ep.ctx)) {
+        ctx->rx_packets.fetch_add(n, std::memory_order_relaxed);
+        ctx->rx_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    return static_cast<int>(n);
+}
+
+namespace {
+
+TxResult submit_tx_mbuf_chunk(const DirectQueueEndpoint& ep, rte_mbuf** mbufs, uint16_t count) {
+    TxResult r{};
+    if (count == 0) {
+        return r;
+    }
+    // PMD owns mbufs immediately on rte_eth_tx_burst success; snapshot lengths first.
+    uint32_t pkt_lens[kMaxBurst];
+    for (uint16_t i = 0; i < count; ++i) {
+        pkt_lens[i] = rte_pktmbuf_pkt_len(mbufs[i]);
+    }
+
+    uint16_t offset = 0;
+    uint16_t remaining = count;
+    int retry = 0;
+    while (remaining > 0 && retry < 8) {
+        const uint16_t n = rte_eth_tx_burst(ep.port_id, ep.queue_id, &mbufs[offset], remaining);
+        offset = static_cast<uint16_t>(offset + n);
+        remaining = static_cast<uint16_t>(remaining - n);
+        if (remaining > 0 && n == 0) {
+            ++retry;
+            rte_pause();
+        }
+    }
+
+    uint64_t sent_bytes = 0;
+    for (uint16_t i = 0; i < offset; ++i) {
+        sent_bytes += pkt_lens[i];
+    }
+    for (uint16_t i = 0; i < remaining; ++i) {
+        rte_pktmbuf_free(mbufs[offset + i]);
+    }
+
+    r.sent = offset;
+    r.dropped = remaining;
+    if (auto* ctx = static_cast<Context*>(ep.ctx)) {
+        ctx->tx_packets.fetch_add(r.sent, std::memory_order_relaxed);
+        ctx->tx_bytes.fetch_add(sent_bytes, std::memory_order_relaxed);
+        ctx->tx_dropped.fetch_add(r.dropped, std::memory_order_relaxed);
+    }
+    return r;
+}
+
+}  // namespace
+
+TxResult tx_burst_mbufs(const DirectQueueEndpoint& ep, void** mbufs, uint16_t count) {
+    TxResult total{};
+    if (!ep.valid || !mbufs || count == 0) {
+        return total;
+    }
+    rte_mbuf** m = reinterpret_cast<rte_mbuf**>(mbufs);
+    uint16_t pos = 0;
+    while (pos < count) {
+        const uint16_t chunk = std::min<uint16_t>(static_cast<uint16_t>(count - pos), kMaxBurst);
+        const TxResult r = submit_tx_mbuf_chunk(ep, m + pos, chunk);
+        total.sent += r.sent;
+        total.dropped += r.dropped;
+        pos = static_cast<uint16_t>(pos + chunk);
+        if (r.sent < chunk) {
+            for (uint16_t i = pos; i < count; ++i) {
+                rte_pktmbuf_free(m[i]);
+            }
+            const uint64_t unattempted = static_cast<uint64_t>(count - pos);
+            total.dropped += unattempted;
+            if (auto* ctx = static_cast<Context*>(ep.ctx)) {
+                ctx->tx_dropped.fetch_add(unattempted, std::memory_order_relaxed);
+            }
+            break;
+        }
+    }
+    return total;
+}
+
+TxResult tx_burst_strided(const DirectQueueEndpoint& ep, const uint8_t* base,
+                          uint16_t packet_size, std::size_t stride, uint32_t count) {
+    TxResult total{};
+    if (!ep.valid || !ep.mempool || !base || packet_size == 0 || count == 0) {
+        return total;
+    }
+    rte_mempool* mp = static_cast<rte_mempool*>(ep.mempool);
+    const std::size_t step = (stride == 0) ? static_cast<std::size_t>(packet_size) : stride;
+    const uint16_t max_chunk = std::clamp<uint16_t>(ep.burst_size, kMinBurst, kMaxBurst);
+
+    uint32_t pos = 0;
+    while (pos < count) {
+        const uint16_t req = static_cast<uint16_t>(
+            std::min<uint32_t>(count - pos, static_cast<uint32_t>(max_chunk)));
+        rte_mbuf* mbufs[kMaxBurst];
+        uint16_t alloc_n = 0;
+        if (rte_pktmbuf_alloc_bulk(mp, mbufs, req) == 0) {
+            alloc_n = req;
+        } else {
+            for (uint16_t i = 0; i < req; ++i) {
+                rte_mbuf* m = rte_pktmbuf_alloc(mp);
+                if (!m) break;
+                mbufs[alloc_n++] = m;
+            }
+        }
+        if (alloc_n < req) {
+            const uint64_t fail_n = static_cast<uint64_t>(req - alloc_n);
+            total.alloc_failures += fail_n;
+            total.errors += fail_n;
+            total.dropped += fail_n;
+            if (auto* ctx = static_cast<Context*>(ep.ctx)) {
+                ctx->mbuf_alloc_failures.fetch_add(fail_n, std::memory_order_relaxed);
+                ctx->tx_errors.fetch_add(fail_n, std::memory_order_relaxed);
+                ctx->tx_dropped.fetch_add(fail_n, std::memory_order_relaxed);
+            }
+        }
+        if (alloc_n == 0) {
+            break;
+        }
+
+        uint16_t ready = 0;
+        for (uint16_t i = 0; i < alloc_n; ++i) {
+            if (packet_size > rte_pktmbuf_tailroom(mbufs[i])) {
+                for (uint16_t j = i; j < alloc_n; ++j) {
+                    rte_pktmbuf_free(mbufs[j]);
+                }
+                const uint64_t err_n = static_cast<uint64_t>(alloc_n - i);
+                total.errors += err_n;
+                total.dropped += err_n;
+                if (auto* ctx = static_cast<Context*>(ep.ctx)) {
+                    ctx->tx_errors.fetch_add(err_n, std::memory_order_relaxed);
+                    ctx->tx_dropped.fetch_add(err_n, std::memory_order_relaxed);
+                }
+                break;
+            }
+            const uint8_t* src = base + static_cast<std::size_t>(pos + i) * step;
+            uint8_t* dst = rte_pktmbuf_mtod(mbufs[i], uint8_t*);
+            std::memcpy(dst, src, packet_size);
+            mbufs[i]->data_len = packet_size;
+            mbufs[i]->pkt_len = packet_size;
+            ++ready;
+        }
+        if (ready == 0) {
+            break;
+        }
+
+        const TxResult r = submit_tx_mbuf_chunk(ep, mbufs, ready);
+        total.sent += r.sent;
+        total.dropped += r.dropped;
+        pos += req;
+        if (r.sent < req) {
+            break;
+        }
+    }
+    return total;
+}
+
 void close_port(int64_t handle) {
     std::unique_lock<std::shared_mutex> lock(g_mu);
     auto it = g_contexts.find(static_cast<long>(handle));
@@ -1429,6 +1633,16 @@ bool steer_l4_dst_port_to_queue(int64_t, uint8_t, uint16_t, uint16_t, uint16_t,
     return false;
 }
 Snapshot snapshot(int64_t) { return {}; }
+bool resolve_direct_queue(int64_t, uint16_t, DirectQueueEndpoint& out) {
+    out = DirectQueueEndpoint{};
+    return false;
+}
+int rx_burst_mbufs(const DirectQueueEndpoint&, uint16_t, void**, uint64_t*) { return 0; }
+TxResult tx_burst_mbufs(const DirectQueueEndpoint&, void**, uint16_t) { return {}; }
+TxResult tx_burst_strided(const DirectQueueEndpoint&, const uint8_t*, uint16_t, std::size_t,
+                          uint32_t) {
+    return {};
+}
 void close_port(int64_t) {}
 
 }  // namespace samurai::dpdk
