@@ -28,6 +28,7 @@
 #include <vector>
 #include <algorithm>
 
+#include <arpa/inet.h>
 #include <sched.h>
 #include <strings.h>
 #include <zmq.h>
@@ -126,6 +127,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  samurai::daemon::TelemetrySink telemetry;
   bool running = true;
   while (running) {
     zmq_msg_t msg;
@@ -137,47 +139,38 @@ int main(int argc, char** argv) {
     }
 
     const std::size_t sz = static_cast<std::size_t>(zmq_msg_size(&msg));
-    if (sz < sizeof(samurai::wire::SamuraiWireHeaderV1)) {
+    samurai::wire::DecodedWireFrame frame{};
+    if (!samurai::wire::DecodeWireFrame(zmq_msg_data(&msg), sz, frame)) {
       zmq_msg_close(&msg);
       continue;
     }
 
-    const auto* raw = static_cast<const std::uint8_t*>(zmq_msg_data(&msg));
-    samurai::wire::SamuraiWireHeaderV1 header{};
-    std::memcpy(&header, raw, sizeof(header));
-    const std::size_t payload_len = sz - sizeof(header);
-    const std::uint8_t* payload_ptr = raw + sizeof(header);
+    const auto msg_type = static_cast<samurai::wire::MessageType>(frame.msg_type);
+    const std::string& job_id = frame.job_id;
+    const auto header = frame.as_v1_header;
+    const std::uint8_t* payload_ptr = frame.payload_ptr;
+    const std::size_t payload_len = frame.actual_payload_len;
 
-    if (!samurai::wire::IsHeaderV1Compatible(header)) {
-      zmq_msg_close(&msg);
-      continue;
-    }
-
-    const auto msg_type = static_cast<samurai::wire::MessageType>(header.msg_type);
-    const std::string job_id = samurai::daemon::ReadJobId(header);
-
-    if (msg_type == samurai::wire::MessageType::SHUTDOWN) {
-      (void)SendAck(push, header.correlation_id, job_id);
-      running = false;
+    if (samurai::daemon::HandleCommonIdleMessage(push, kKind, frame, telemetry, running)) {
       zmq_msg_close(&msg);
       continue;
     }
 
     if (msg_type == samurai::wire::MessageType::START_JOB) {
-      if (payload_len != sizeof(samurai::wire::JobEnvelopeV1) || header.payload_len != sizeof(samurai::wire::JobEnvelopeV1)) {
+      samurai::wire::JobEnvelopeV1 env{};
+      if (!samurai::daemon::DecodeJobEnvelopeV1Frame(frame, env, &telemetry)) {
         (void)SendFrame(
             push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
-            header.correlation_id, kKind, job_id, JsonError("job_envelope_size_mismatch"));
+            frame.correlation_id, kKind, job_id, JsonError("job_envelope_size_mismatch"));
         zmq_msg_close(&msg);
         continue;
       }
 
-      samurai::wire::JobEnvelopeV1 env{};
-      std::memcpy(&env, payload_ptr, sizeof(env));
-      (void)SendAck(push, header.correlation_id, job_id);
+      (void)SendAck(push, frame.correlation_id, job_id);
       zmq_msg_close(&msg);
 
       try {
+        telemetry.BeginJob();
         ApplyAffinity(env.pin_cpu);
         PacketConfig cfg = ConfigFromEnvelope(env);
         const int packet_count = std::max(1, static_cast<int>(env.packet_count));
@@ -227,6 +220,19 @@ int main(int argc, char** argv) {
         const std::uint64_t packets_sent = static_cast<std::uint64_t>(std::max(0, metrics.sent));
         const std::uint64_t packets_errors = static_cast<std::uint64_t>(std::max(0, metrics.errors));
         const std::uint64_t bytes_sent = packets_sent * static_cast<std::uint64_t>(packet_size);
+        if (telemetry.Enabled() && packets_sent > 0) {
+          const std::uint32_t src_be = htonl(0x0A000001u);
+          const std::uint32_t dst_be = samurai::daemon::TelemetrySink::ParseIpBe(cfg.target_ip);
+          const std::uint16_t dst_port_be = htons(env.target_port);
+          const std::uint8_t flow_proto = samurai::daemon::TelemetrySink::ProtoFromName(cfg.protocol);
+          const std::uint8_t flags = (flow_proto == 6u) ? 0x02u : 0x00u;
+          const std::uint64_t limit = std::min<std::uint64_t>(packets_sent, 1024u);
+          for (std::uint64_t k = 0; k < limit; ++k) {
+            telemetry.RecordPacketNet(src_be, dst_be, htons(static_cast<std::uint16_t>(1024u + (k & 0x3FFu))),
+                                      dst_port_be, flow_proto, static_cast<std::uint32_t>(packet_size), flags, 0, end_ns);
+          }
+        }
+        telemetry.FlushEnd(end_ns);
         const double duration_s = std::max(1e-9, static_cast<double>(end_ns - start_ns) / 1e9);
         const double actual_rps = static_cast<double>(packets_sent) / duration_s;
         double rate_accuracy_pct = 100.0;
@@ -263,7 +269,8 @@ int main(int argc, char** argv) {
 
         const std::vector<std::uint8_t> done = JsonPayloadFromStats(
             header.correlation_id, job_id, packets_sent, packets_errors,
-            bytes_sent, actual_rps, rate_accuracy_pct, note);
+            bytes_sent, actual_rps, rate_accuracy_pct, note,
+            telemetry.JobExportedPackets(), telemetry.JobExportedRecords());
         (void)SendFrame(
             push, static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
             header.correlation_id, kKind, job_id, done);

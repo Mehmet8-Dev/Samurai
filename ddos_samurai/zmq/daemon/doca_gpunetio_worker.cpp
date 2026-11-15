@@ -1182,7 +1182,9 @@ std::vector<std::uint8_t> JsonDone(
     double rate_accuracy_pct,
     int queue_id,
     bool bar1_zero_copy = false,
-    std::uint64_t bar1_phys_base = 0u) {
+    std::uint64_t bar1_phys_base = 0u,
+    std::uint64_t ipfix_exported_packets = 0u,
+    std::uint64_t ipfix_exported_records = 0u) {
   const std::string note = bar1_zero_copy
       ? "dpu_stateful_l4+geforce_bar1_p2p_zero_copy+pacing_static"
       : "doca_gpunetio_native+cpu_native+pacing_static";
@@ -1198,6 +1200,8 @@ std::vector<std::uint8_t> JsonDone(
       ",\"doca_queue_id\":" + std::to_string(queue_id) +
       ",\"bar1_zero_copy\":" + std::string(bar1_zero_copy ? "true" : "false") +
       ",\"bar1_phys_base\":" + std::to_string(bar1_phys_base) +
+      ",\"ipfix_exported_packets\":" + std::to_string(ipfix_exported_packets) +
+      ",\"ipfix_exported_records\":" + std::to_string(ipfix_exported_records) +
       ",\"note\":\"" + note + "\"}";
   return std::vector<std::uint8_t>(json.begin(), json.end());
 }
@@ -1342,6 +1346,7 @@ int main(int argc, char** argv) {
 
   DocaNativeBridge doca{};
   samurai::dpu::FlowStateTable dpu_state{};
+  samurai::daemon::TelemetrySink telemetry;
   bool running = true;
   while (running) {
     zmq_msg_t msg;
@@ -1372,23 +1377,10 @@ int main(int argc, char** argv) {
     const auto msg_type = static_cast<samurai::wire::MessageType>(header.msg_type);
     const std::string job_id = samurai::daemon::ReadJobId(header);
 
-    if (msg_type == samurai::wire::MessageType::SHUTDOWN) {
-      (void)SendAck(push, header.correlation_id, job_id);
-      running = false;
+    if (samurai::daemon::HandleCommonIdleMessage(
+            push, samurai::wire::WorkerKind::DOCA, header, job_id,
+            payload_ptr, payload_len, telemetry, running)) {
       zmq_msg_close(&msg);
-      continue;
-    }
-
-    if (msg_type == samurai::wire::MessageType::STOP_JOB) {
-      zmq_msg_close(&msg);
-      (void)SendAck(push, header.correlation_id, job_id);
-      const std::string stopped = "{\"status\":\"stopped\",\"worker_kind\":\"doca\"}";
-      (void)SendFrame(push,
-                      static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
-                      header.correlation_id,
-                      samurai::wire::WorkerKind::DOCA,
-                      job_id,
-                      std::vector<std::uint8_t>(stopped.begin(), stopped.end()));
       continue;
     }
 
@@ -1597,6 +1589,7 @@ int main(int argc, char** argv) {
         samurai_pacing_config_t pace_cfg = PacingFromEnvelope(env);
         samurai_pacing_state_t pace_state{};
         samurai_pacing_init(&pace_state, &pace_cfg);
+        telemetry.BeginJob();
         const std::uint16_t established_tx_flags = EstablishedTxFlagsFromEnvelope(env);
 
         const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
@@ -1613,7 +1606,18 @@ int main(int argc, char** argv) {
 
         int offset = 0;
         const std::uint32_t seq_advance_per_pkt = TcpSequenceAdvanceFromEnvelope(env);
+        samurai::daemon::ControlPollState ctrl{};
         while (offset < packet_count) {
+          samurai::daemon::PollControlNonBlocking(
+              pull, push, samurai::wire::WorkerKind::DOCA, &telemetry, ctrl);
+          if (ctrl.shutdown) running = false;
+          if (ctrl.stop_job) break;
+          if (ctrl.reconfigure) {
+            (void)samurai::daemon::ApplyReconfigureWindow(
+                reinterpret_cast<const std::uint8_t*>(&ctrl.reconf),
+                sizeof(ctrl.reconf), pace_cfg, pace_state);
+            ctrl.reconfigure = false;
+          }
           const int n_this = std::min(batch_size, packet_count - offset);
           const samurai::dpu::FlowState* cur_flow = dpu_state.Find(initial_flow.flow_id);
           const samurai::dpu::FlowState active_flow = cur_flow ? *cur_flow : initial_flow;
@@ -1855,6 +1859,11 @@ int main(int argc, char** argv) {
 
         const samurai::wire::MetricSnapshotV1 snap =
             BuildSnapshot(end_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
+        samurai::daemon::RecordBatchToTelemetry(
+            telemetry, ReadFixed(env.target_ip, sizeof(env.target_ip)), env.target_port,
+            ReadFixed(env.protocol, sizeof(env.protocol)), packets_sent,
+            static_cast<std::uint32_t>(std::max<std::size_t>(64u, stride)), end_ns);
+        telemetry.FlushEnd(end_ns);
         (void)SendFrame(push,
                         static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
                         header.correlation_id,
@@ -1871,7 +1880,9 @@ int main(int argc, char** argv) {
                                                         snap.rate_accuracy_pct,
                                                         queue_id,
                                                         bar1_pool.active,
-                                                        bar1_pool.bar1_phys_base);
+                                                        bar1_pool.bar1_phys_base,
+                                                        telemetry.JobExportedPackets(),
+                                                        telemetry.JobExportedRecords());
         (void)SendFrame(push,
                         static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
                         header.correlation_id,

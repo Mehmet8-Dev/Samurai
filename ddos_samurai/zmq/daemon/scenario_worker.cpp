@@ -114,7 +114,9 @@ std::vector<std::uint8_t> JsonDone(
     double actual_rps,
     double rate_accuracy_pct,
     double scenario_latency_p95_ms,
-    bool scenario_l7_executed) {
+    bool scenario_l7_executed,
+    std::uint64_t ipfix_exported_packets = 0,
+    std::uint64_t ipfix_exported_records = 0) {
   std::ostringstream oss;
   oss
       << "{\"status\":\"ok\",\"worker_kind\":\"scenario\""
@@ -133,6 +135,8 @@ std::vector<std::uint8_t> JsonDone(
       << ",\"scenario_dataplane\":\"" << (scenario_l7_executed ? "l7_emu_native_real_http" : "afpacket_packet_pool") << "\""
       << ",\"actual_rps\":" << actual_rps
       << ",\"rate_accuracy_pct\":" << rate_accuracy_pct
+      << ",\"ipfix_exported_packets\":" << ipfix_exported_packets
+      << ",\"ipfix_exported_records\":" << ipfix_exported_records
       << ",\"scenario_engine_path\":\"samurai_scenario_static_cpp\""
       << ",\"note\":\"" << (scenario_l7_executed
                                 ? "scenario_payload_ref+compile_soa+l7emu_exec+sla_native_real"
@@ -505,6 +509,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  samurai::daemon::TelemetrySink telemetry;
   bool running = true;
   while (running) {
     zmq_msg_t msg;
@@ -516,61 +521,37 @@ int main(int argc, char** argv) {
     }
 
     const std::size_t sz = static_cast<std::size_t>(zmq_msg_size(&msg));
-    if (sz < sizeof(samurai::wire::SamuraiWireHeaderV1)) {
+    samurai::wire::DecodedWireFrame frame{};
+    if (!samurai::wire::DecodeWireFrame(zmq_msg_data(&msg), sz, frame)) {
       zmq_msg_close(&msg);
       continue;
     }
 
-    const auto* raw = static_cast<const std::uint8_t*>(zmq_msg_data(&msg));
-    samurai::wire::SamuraiWireHeaderV1 header{};
-    std::memcpy(&header, raw, sizeof(header));
-    const std::size_t payload_len = sz - sizeof(header);
-    const std::uint8_t* payload_ptr = raw + sizeof(header);
+    const auto msg_type = static_cast<samurai::wire::MessageType>(frame.msg_type);
+    const std::string& job_id = frame.job_id;
+    const auto header = frame.as_v1_header;
 
-    if (!samurai::wire::IsHeaderV1Compatible(header)) {
+    if (samurai::daemon::HandleCommonIdleMessage(
+            push, samurai::wire::WorkerKind::SCENARIO, frame, telemetry, running)) {
       zmq_msg_close(&msg);
-      continue;
-    }
-
-    const auto msg_type = static_cast<samurai::wire::MessageType>(header.msg_type);
-    const std::string job_id = samurai::daemon::ReadJobId(header);
-
-    if (msg_type == samurai::wire::MessageType::SHUTDOWN) {
-      (void)SendAck(push, header.correlation_id, job_id);
-      running = false;
-      zmq_msg_close(&msg);
-      continue;
-    }
-
-    if (msg_type == samurai::wire::MessageType::STOP_JOB) {
-      zmq_msg_close(&msg);
-      (void)SendAck(push, header.correlation_id, job_id);
-      const std::string stopped = "{\"status\":\"stopped\",\"worker_kind\":\"scenario\"}";
-      (void)SendFrame(
-          push,
-          static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
-          header.correlation_id,
-          samurai::wire::WorkerKind::SCENARIO,
-          job_id,
-          std::vector<std::uint8_t>(stopped.begin(), stopped.end()));
       continue;
     }
 
     if (msg_type == samurai::wire::MessageType::START_JOB) {
-      if (payload_len != sizeof(samurai::wire::JobEnvelopeV1) || header.payload_len != sizeof(samurai::wire::JobEnvelopeV1)) {
+      telemetry.BeginJob();
+      samurai::wire::JobEnvelopeV1 env{};
+      if (!samurai::daemon::DecodeJobEnvelopeV1Frame(frame, env, &telemetry)) {
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
-            header.correlation_id,
+            frame.correlation_id,
             samurai::wire::WorkerKind::SCENARIO,
             job_id,
             JsonError("job_envelope_size_mismatch"));
         zmq_msg_close(&msg);
         continue;
       }
-      samurai::wire::JobEnvelopeV1 env{};
-      std::memcpy(&env, payload_ptr, sizeof(env));
-      (void)SendAck(push, header.correlation_id, job_id);
+      (void)SendAck(push, frame.correlation_id, job_id);
       zmq_msg_close(&msg);
 
       try {
@@ -706,6 +687,7 @@ int main(int argc, char** argv) {
         samurai_pacing_config_t pace_cfg = PacingFromEnvelope(env);
         samurai_pacing_state_t pace_state{};
         samurai_pacing_init(&pace_state, &pace_cfg);
+        telemetry.BeginJob();
 
         std::uint64_t last_hb_ns = start_ns;
         std::uint64_t last_metric_ns = start_ns;
@@ -739,7 +721,18 @@ int main(int argc, char** argv) {
             bytes_sent = tx.bytes_sent;
             scenario_backend += "+" + tx.note;  // surface the af_packet path taken
           } else {
+            samurai::daemon::ControlPollState ctrl{};
             for (int i = 0; i < packet_count; ++i) {
+              samurai::daemon::PollControlNonBlocking(
+                  pull, push, samurai::wire::WorkerKind::SCENARIO, &telemetry, ctrl);
+              if (ctrl.shutdown) running = false;
+              if (ctrl.stop_job) break;
+              if (ctrl.reconfigure) {
+                (void)samurai::daemon::ApplyReconfigureWindow(
+                    reinterpret_cast<const std::uint8_t*>(&ctrl.reconf),
+                    sizeof(ctrl.reconf), pace_cfg, pace_state);
+                ctrl.reconfigure = false;
+              }
               samurai_pacing_wait_next(&pace_state, &pace_cfg);
               const std::size_t off = static_cast<std::size_t>(i) * stride;
               if (off + stride > pool.size()) {
@@ -778,6 +771,14 @@ int main(int argc, char** argv) {
         (void)l7_rps;
 
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
+        const std::uint32_t avg_bytes = packets_sent > 0
+            ? static_cast<std::uint32_t>(std::max<std::uint64_t>(64u, bytes_sent / packets_sent))
+            : env.packet_size;
+        samurai::daemon::RecordBatchToTelemetry(
+            telemetry, ReadFixed(env.target_ip, sizeof(env.target_ip)), env.target_port,
+            scenario_l7_executed ? std::string("http") : ReadFixed(env.protocol, sizeof(env.protocol)),
+            packets_sent, avg_bytes, end_ns);
+        telemetry.FlushEnd(end_ns);
         const samurai::wire::MetricSnapshotV1 snap =
             BuildSnapshot(end_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
         (void)SendFrame(
@@ -803,7 +804,9 @@ int main(int argc, char** argv) {
             snap.actual_rps,
             snap.rate_accuracy_pct,
             l7_p95,
-            scenario_l7_executed);
+            scenario_l7_executed,
+            telemetry.JobExportedPackets(),
+            telemetry.JobExportedRecords());
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),

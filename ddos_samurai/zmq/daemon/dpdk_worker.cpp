@@ -184,13 +184,16 @@ using samurai::daemon::DpdkShim;
 // seed eder, ortak sürücü loop'unu çalıştırır ve nihai METRIC_SNAPSHOT + JOB_DONE
 // yayınlar. Blast (stateless) yolu değişmeden kalır — bu yalnız stateful branch'tir.
 inline void RunDpdkStatefulJob(
+    void* pull,
     void* push,
     const samurai::wire::SamuraiWireHeaderV1& header,
     const std::string& job_id,
     const samurai::wire::JobEnvelopeV2& env2,
     int cli_port_id,
     int cli_queue_id,
-    const std::string& cli_eal_args) {
+    const std::string& cli_eal_args,
+    samurai::daemon::TelemetrySink& telemetry,
+    bool& running_out) {
   const samurai::wire::JobEnvelopeV1& env = env2.base;
   const std::uint16_t port_id = static_cast<std::uint16_t>(std::max(0,
       cli_port_id >= 0 ? cli_port_id
@@ -226,8 +229,18 @@ inline void RunDpdkStatefulJob(
 
   samurai::daemon::StatefulFastpathDriver driver(shim);
 
+  std::atomic<bool> stop{false};
+  samurai::daemon::ControlPollState ctrl{};
   samurai::daemon::FastpathHooks hooks;
   hooks.emit_heartbeat = [&]() {
+    samurai::daemon::PollControlNonBlocking(
+        pull, push, samurai::wire::WorkerKind::DPDK, &telemetry, ctrl);
+    if (ctrl.stop_job) {
+      stop.store(true, std::memory_order_release);
+    }
+    if (ctrl.shutdown) {
+      running_out = false;
+    }
     (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
                     header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id);
   };
@@ -237,7 +250,6 @@ inline void RunDpdkStatefulJob(
                     SerializeSnapshotV2(snap));
   };
 
-  std::atomic<bool> stop{false};
   const bool l7 = samurai::daemon::JobWantsL7Fastpath(env);
   samurai::daemon::L7RunnerBundle l7b;
   samurai::daemon::FastpathResult res;
@@ -257,6 +269,12 @@ inline void RunDpdkStatefulJob(
     res = driver.Run(params, {}, stop, hooks);
   }
 
+  const std::uint64_t done_ns = samurai_pacing_monotonic_now_ns();
+  samurai::daemon::RecordBatchToTelemetry(
+      telemetry, ReadFixed(env.target_ip, sizeof(env.target_ip)), env.target_port,
+      ReadFixed(env.protocol, sizeof(env.protocol)), res.tx_packets, env.packet_size, done_ns);
+  telemetry.FlushEnd(done_ns);
+
   samurai::core::json::Value done = samurai::core::json::Value::Object();
   done.set("status", samurai::core::json::Value::Str("ok"));
   done.set("mode", samurai::core::json::Value::Str(l7 ? "stateful_fastpath_l7" : "stateful_fastpath"));
@@ -270,6 +288,10 @@ inline void RunDpdkStatefulJob(
   done.set("retransmit_exhausted", samurai::core::json::Value::Int(static_cast<int64_t>(res.retransmit_exhausted)));
   done.set("connect_timeout", samurai::core::json::Value::Int(static_cast<int64_t>(res.connect_timeout)));
   done.set("rx_available", samurai::core::json::Value::Bool(res.rx_available));
+  done.set("ipfix_exported_packets",
+           samurai::core::json::Value::Int(static_cast<int64_t>(telemetry.JobExportedPackets())));
+  done.set("ipfix_exported_records",
+           samurai::core::json::Value::Int(static_cast<int64_t>(telemetry.JobExportedRecords())));
   const std::string done_str = done.dump();
   (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
                   header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id,
@@ -286,6 +308,7 @@ struct alignas(64) TxWorkerThread {
   std::atomic<std::uint64_t> bytes_sent{0};
   std::atomic<std::uint64_t> sleep_calls{0};
   std::atomic<bool> done{false};
+  std::atomic<bool>* stop_flag{nullptr};
 };
 
 // Her TX thread kendi kuyruğuna, kendi paket alt-aralığına ve kendi pacing
@@ -310,6 +333,9 @@ void tx_thread_func(TxWorkerThread* tw, std::int64_t handle,
   constexpr std::uint16_t kTxBurstMax = 64;
   int i = start;
   while (i < end) {
+    if (tw->stop_flag && tw->stop_flag->load(std::memory_order_relaxed)) {
+      break;
+    }
     samurai_pacing_wait_next(&st, &pace_cfg);
     std::uint16_t batch = static_cast<std::uint16_t>(
         std::min<int>(end - i, static_cast<int>(kTxBurstMax)));
@@ -411,6 +437,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  samurai::daemon::TelemetrySink telemetry;
   bool running = true;
   while (running) {
     zmq_msg_t msg;
@@ -441,10 +468,9 @@ int main(int argc, char** argv) {
     const auto msg_type = static_cast<samurai::wire::MessageType>(header.msg_type);
     const std::string job_id = samurai::daemon::ReadJobId(header);
 
-    if (msg_type == samurai::wire::MessageType::SHUTDOWN) {
-      (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK), header.correlation_id,
-                      samurai::wire::WorkerKind::DPDK, job_id);
-      running = false;
+    if (samurai::daemon::HandleCommonIdleMessage(
+            push, samurai::wire::WorkerKind::DPDK, header, job_id,
+            payload_ptr, payload_len, telemetry, running)) {
       zmq_msg_close(&msg);
       continue;
     }
@@ -485,9 +511,12 @@ int main(int argc, char** argv) {
       // Stateful userspace TCP fast-path (protocol=custom_tcp / attack_vector=stateful):
       // NIC'i sahiplenip TcpDataplaneCore'u koşar. Stateless blast yolu değişmez.
       if (samurai::daemon::IsStatefulFastpathJob(env)) {
-        RunDpdkStatefulJob(push, header, job_id, env2, cli_port_id, cli_queue_id, cli_eal_args);
+        telemetry.BeginJob();
+        RunDpdkStatefulJob(pull, push, header, job_id, env2, cli_port_id, cli_queue_id, cli_eal_args,
+                           telemetry, running);
         continue;
       }
+      telemetry.BeginJob();
       try {
         PacketConfig cfg = ConfigFromEnvelope(env);
         const int packet_count = std::max(1, static_cast<int>(env.packet_count));
@@ -619,6 +648,7 @@ int main(int argc, char** argv) {
         }
 
         // TX thread'lerini başlat: her biri kendi kuyruğu + paket alt-aralığı.
+        std::atomic<bool> stop_threads{false};
         std::deque<TxWorkerThread> workers;
         const int base_packets = packet_count / num_queues;
         const int remainder = packet_count % num_queues;
@@ -628,6 +658,7 @@ int main(int argc, char** argv) {
           TxWorkerThread& tw = workers.back();
           tw.queue_id = multi_queue ? static_cast<std::uint16_t>(q) : queue_id;
           tw.cpu_core = base_core >= 0 ? base_core + q : -1;
+          tw.stop_flag = &stop_threads;
           const int cnt = base_packets + (q < remainder ? 1 : 0);
           const int seg_start = cursor;
           const int seg_end = cursor + cnt;
@@ -650,12 +681,21 @@ int main(int argc, char** argv) {
         const std::uint64_t start_ns = samurai_pacing_monotonic_now_ns();
         std::uint64_t last_hb_ns = start_ns;
         std::uint64_t last_metric_ns = start_ns;
+        samurai::daemon::ControlPollState ctrl{};
 
         // Ana thread ilerlemeyi zamana göre yoklar; TX'i thread'ler yapar.
         bool all_done = false;
         while (!all_done) {
           struct timespec ts{0, 50'000'000L};  // 50 ms
           nanosleep(&ts, nullptr);
+          samurai::daemon::PollControlNonBlocking(
+              pull, push, samurai::wire::WorkerKind::DPDK, &telemetry, ctrl);
+          if (ctrl.stop_job) {
+            stop_threads.store(true, std::memory_order_release);
+          }
+          if (ctrl.shutdown) {
+            running = false;
+          }
           all_done = true;
           for (auto& w : workers) {
             if (!w.done.load(std::memory_order_acquire)) {
@@ -695,6 +735,11 @@ int main(int argc, char** argv) {
         aggregate(packets_sent, packets_errors, bytes_sent, sleep_calls);
 
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
+        samurai::daemon::RecordBatchToTelemetry(
+            telemetry, ReadFixed(env.target_ip, sizeof(env.target_ip)), env.target_port,
+            ReadFixed(env.protocol, sizeof(env.protocol)), packets_sent,
+            static_cast<std::uint32_t>(stride), end_ns);
+        telemetry.FlushEnd(end_ns);
         samurai_pacing_state_t final_state{};
         final_state.sleep_calls = sleep_calls;
         const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
@@ -705,7 +750,9 @@ int main(int argc, char** argv) {
 
         const std::vector<std::uint8_t> done = JsonPayloadFromStats(
             header.correlation_id, job_id, packets_sent, packets_errors, bytes_sent,
-            snap.actual_rps, snap.rate_accuracy_pct);
+            snap.actual_rps, snap.rate_accuracy_pct,
+            ctrl.stop_job ? "aborted" : "done",
+            telemetry.JobExportedPackets(), telemetry.JobExportedRecords());
         (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
                         header.correlation_id, samurai::wire::WorkerKind::DPDK, job_id, done);
       } catch (const std::exception& exc) {
@@ -714,17 +761,6 @@ int main(int argc, char** argv) {
       }
       continue;
 #endif
-    }
-
-    if (msg_type == samurai::wire::MessageType::STOP_JOB) {
-      zmq_msg_close(&msg);
-      (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK), header.correlation_id,
-                      samurai::wire::WorkerKind::DPDK, job_id);
-      const std::string stopped = "{\"status\":\"stopped\",\"worker_kind\":\"dpdk\"}";
-      (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE), header.correlation_id,
-                      samurai::wire::WorkerKind::DPDK, job_id,
-                      std::vector<std::uint8_t>(stopped.begin(), stopped.end()));
-      continue;
     }
 
     zmq_msg_close(&msg);

@@ -21,6 +21,12 @@
 #include "engine.hpp"
 #include "json.hpp"
 #include "pacing_engine.h"
+#if __has_include("flow_cache.hpp")
+#define SAMURAI_HAS_TELEMETRY_SINK 1
+#include "telemetry_sink.hpp"
+#else
+#define SAMURAI_HAS_TELEMETRY_SINK 0
+#endif
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
 
@@ -85,7 +91,9 @@ inline std::vector<std::uint8_t> JsonPayloadFromStats(
     std::uint64_t bytes_sent,
     double actual_rps,
     double rate_accuracy_pct,
-    const std::string& note = "done") {
+    const std::string& note = "done",
+    std::uint64_t ipfix_exported_packets = 0,
+    std::uint64_t ipfix_exported_records = 0) {
   samurai::core::json::Value val = samurai::core::json::Value::Object();
   val.set("status", samurai::core::json::Value::Str("ok"));
   val.set("correlation_id", samurai::core::json::Value::Int(static_cast<int64_t>(correlation_id)));
@@ -95,6 +103,10 @@ inline std::vector<std::uint8_t> JsonPayloadFromStats(
   val.set("bytes_sent", samurai::core::json::Value::Int(static_cast<int64_t>(bytes_sent)));
   val.set("actual_rps", samurai::core::json::Value::Double(actual_rps));
   val.set("rate_accuracy_pct", samurai::core::json::Value::Double(rate_accuracy_pct));
+  val.set("ipfix_exported_packets",
+          samurai::core::json::Value::Int(static_cast<int64_t>(ipfix_exported_packets)));
+  val.set("ipfix_exported_records",
+          samurai::core::json::Value::Int(static_cast<int64_t>(ipfix_exported_records)));
   val.set("note", samurai::core::json::Value::Str(note));
   const std::string json = val.dump();
   return std::vector<std::uint8_t>(json.begin(), json.end());
@@ -180,11 +192,14 @@ inline samurai_pacing_config_t PacingFromEnvelope(const samurai::wire::JobEnvelo
   out.ipg_ns = env.ipg_ns;
   out.burst_size = env.burst_size > 0u ? env.burst_size : 1u;
   out.burst_gap_ns = env.burst_gap_ns;
+  out.jitter_model = env.jitter_model;
+  out.jitter_pct = env.jitter_pct;
+  out.use_so_txtime = env.use_so_txtime;
   return out;
 }
 
-// Version-agnostic overload: derives the pacing config from either a V1 or a V2
-// envelope payload (the pacing fields live in the shared V1 prefix).
+// Version-agnostic overload: derives the pacing config from V1, V2, or V3
+// decoded frame payload.
 inline samurai_pacing_config_t PacingFromEnvelope(
     const samurai::wire::SamuraiWireHeaderV1& header, const std::uint8_t* payload) {
   samurai_pacing_config_t out{};
@@ -200,6 +215,58 @@ inline samurai_pacing_config_t PacingFromEnvelope(
   std::memcpy(&env, payload, sizeof(env));
   return PacingFromEnvelope(env);
 }
+
+inline samurai_pacing_config_t PacingFromDecodedFrame(
+    const samurai::wire::DecodedWireFrame& frame) {
+  if (frame.version == samurai::wire::kVersionV3) {
+    samurai::wire::JobV3Payload v3{};
+    if (samurai::wire::ParseJobV3Payload(
+            frame.payload_ptr, frame.actual_payload_len, frame.ext_count, v3)) {
+      return PacingFromEnvelope(samurai::wire::ToJobEnvelopeV1(v3.base));
+    }
+    return samurai_pacing_config_t{};
+  }
+  return PacingFromEnvelope(frame.as_v1_header, frame.payload_ptr);
+}
+
+#if SAMURAI_HAS_TELEMETRY_SINK
+inline void ApplyTelemetrySectionV3(
+    const samurai::wire::JobSectionTelemetryV3& sec, TelemetrySink* sink) {
+  if (!sink) return;
+  samurai::wire::TelemetryConfigV1 tcfg{};
+  tcfg.enabled = sec.enabled;
+  tcfg.netflow_v9 = sec.netflow_v9;
+  tcfg.collector_port = sec.collector_port;
+  tcfg.sample_rate = sec.sample_rate;
+  tcfg.domain_id = sec.domain_id;
+  tcfg.export_interval_ms = sec.export_interval_ms;
+  std::memcpy(tcfg.collector_ip, sec.collector_ip, sizeof(tcfg.collector_ip));
+  sink->ApplyWireConfig(tcfg, samurai_pacing_monotonic_now_ns());
+}
+
+inline bool DecodeJobEnvelopeV1Frame(
+    const samurai::wire::DecodedWireFrame& frame,
+    samurai::wire::JobEnvelopeV1& out,
+    TelemetrySink* telemetry = nullptr) {
+  if (frame.version == samurai::wire::kVersionV3) {
+    samurai::wire::JobV3Payload v3{};
+    if (!samurai::wire::ParseJobV3Payload(
+            frame.payload_ptr, frame.actual_payload_len, frame.ext_count, v3)) {
+      return false;
+    }
+    out = samurai::wire::ToJobEnvelopeV1(v3.base);
+    if (v3.has_telemetry) ApplyTelemetrySectionV3(v3.telemetry, telemetry);
+    return true;
+  }
+  if (!frame.payload_ptr ||
+      frame.actual_payload_len != sizeof(samurai::wire::JobEnvelopeV1) ||
+      frame.payload_len != sizeof(samurai::wire::JobEnvelopeV1)) {
+    return false;
+  }
+  std::memcpy(&out, frame.payload_ptr, sizeof(out));
+  return true;
+}
+#endif  // SAMURAI_HAS_TELEMETRY_SINK
 
 inline samurai::wire::MetricSnapshotV1 BuildSnapshot(
     std::uint64_t now_ns,
@@ -222,9 +289,10 @@ inline samurai::wire::MetricSnapshotV1 BuildSnapshot(
   snap.packets_errors = packets_errors;
   snap.bytes_sent = bytes_sent;
   snap.actual_rps = actual_rps;
-  snap.jitter_p99_ns = 0.0;
+  snap.jitter_p99_ns = samurai_pacing_get_jitter_p99_ns(&pace_state);
   snap.rate_accuracy_pct = rate_accuracy_pct;
-  snap.busywait_cycles = 0;
+  snap.busywait_cycles = static_cast<std::uint32_t>(
+      pace_state.busywait_cycles > 0xFFFFFFFFull ? 0xFFFFFFFFull : pace_state.busywait_cycles);
   snap.sleep_calls = static_cast<std::uint32_t>(pace_state.sleep_calls & 0xFFFFFFFFu);
   return snap;
 }
@@ -240,5 +308,207 @@ inline std::vector<std::uint8_t> SerializeSnapshotV2(const samurai::wire::Metric
   std::memcpy(payload.data(), &snap, sizeof(snap));
   return payload;
 }
+
+inline bool ApplyReconfigureWindow(
+    const std::uint8_t* payload,
+    std::size_t payload_len,
+    samurai_pacing_config_t& pace_cfg,
+    samurai_pacing_state_t& pace_state,
+    std::uint32_t* request_mix = nullptr,
+    std::uint32_t* source_rotation = nullptr,
+    std::uint32_t* telco_rate_cps = nullptr) {
+  if (!payload || payload_len < sizeof(samurai::wire::ReconfigureWindowV1)) {
+    return false;
+  }
+  samurai::wire::ReconfigureWindowV1 w{};
+  std::memcpy(&w, payload, sizeof(w));
+  if (w.flags & samurai::wire::ReconfigureFlag::kPacingMode) {
+    pace_cfg.mode = w.pacing_mode;
+  }
+  if (w.flags & samurai::wire::ReconfigureFlag::kRps) {
+    pace_cfg.target_rps = w.target_rps;
+  }
+  if (w.flags & samurai::wire::ReconfigureFlag::kIpg) {
+    pace_cfg.ipg_ns = w.ipg_ns;
+  }
+  if (w.flags & samurai::wire::ReconfigureFlag::kJitter) {
+    pace_cfg.jitter_model = w.jitter_model;
+    pace_cfg.jitter_pct = w.jitter_pct;
+  }
+  if (w.flags & samurai::wire::ReconfigureFlag::kBurst) {
+    pace_cfg.burst_size = w.burst_size > 0u ? w.burst_size : 1u;
+  }
+  if (w.flags & samurai::wire::ReconfigureFlag::kRequestMix && request_mix) {
+    *request_mix = w.request_mix;
+  }
+  if (w.flags & samurai::wire::ReconfigureFlag::kSourceRotation && source_rotation) {
+    *source_rotation = w.source_rotation;
+  }
+  if (w.flags & samurai::wire::ReconfigureFlag::kTelcoCps && telco_rate_cps) {
+    *telco_rate_cps = w.telco_rate_cps;
+  }
+  samurai_pacing_reconfigure(&pace_state, &pace_cfg);
+  return true;
+}
+
+#if SAMURAI_HAS_TELEMETRY_SINK
+inline bool HandleSetTelemetryFrame(
+    const std::uint8_t* payload,
+    std::size_t payload_len,
+    TelemetrySink& sink,
+    std::uint64_t now_ns = 0) {
+  if (!payload || payload_len < sizeof(samurai::wire::TelemetryConfigV1)) {
+    return false;
+  }
+  samurai::wire::TelemetryConfigV1 cfg{};
+  std::memcpy(&cfg, payload, sizeof(cfg));
+  sink.ApplyWireConfig(cfg, now_ns);
+  return true;
+}
+
+inline bool HandleCommonIdleMessage(
+    void* push,
+    samurai::wire::WorkerKind kind,
+    const samurai::wire::DecodedWireFrame& frame,
+    TelemetrySink& telemetry,
+    bool& running) {
+  const auto msg_type = static_cast<samurai::wire::MessageType>(frame.msg_type);
+  if (msg_type == samurai::wire::MessageType::PING ||
+      msg_type == samurai::wire::MessageType::STOP_JOB ||
+      msg_type == samurai::wire::MessageType::ABORT ||
+      msg_type == samurai::wire::MessageType::RECONFIGURE_JOB) {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK),
+                    frame.correlation_id, kind, frame.job_id);
+    return true;
+  }
+  if (msg_type == samurai::wire::MessageType::SHUTDOWN) {
+    (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK),
+                    frame.correlation_id, kind, frame.job_id);
+    running = false;
+    return true;
+  }
+  if (msg_type == samurai::wire::MessageType::SET_TELEMETRY) {
+    if (HandleSetTelemetryFrame(frame.payload_ptr, frame.actual_payload_len, telemetry,
+                                samurai_pacing_monotonic_now_ns())) {
+      (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK),
+                      frame.correlation_id, kind, frame.job_id);
+    } else {
+      (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                      frame.correlation_id, kind, frame.job_id,
+                      JsonError("telemetry_config_size_mismatch"));
+    }
+    return true;
+  }
+  return false;
+}
+
+// Overload for V1-header callers.
+inline bool HandleCommonIdleMessage(
+    void* push,
+    samurai::wire::WorkerKind kind,
+    const samurai::wire::SamuraiWireHeaderV1& header,
+    const std::string& job_id,
+    const std::uint8_t* payload_ptr,
+    std::size_t payload_len,
+    TelemetrySink& telemetry,
+    bool& running) {
+  samurai::wire::DecodedWireFrame frame{};
+  frame.version = header.version;
+  frame.msg_type = header.msg_type;
+  frame.worker_kind = header.worker_kind;
+  frame.flags = header.flags;
+  frame.payload_len = header.payload_len;
+  frame.correlation_id = header.correlation_id;
+  frame.job_id = job_id;
+  frame.payload_ptr = payload_ptr;
+  frame.actual_payload_len = payload_len;
+  frame.as_v1_header = header;
+  return HandleCommonIdleMessage(push, kind, frame, telemetry, running);
+}
+
+struct ControlPollState {
+  bool stop_job = false;
+  bool shutdown = false;
+  bool reconfigure = false;
+  samurai::wire::ReconfigureWindowV1 reconf{};
+};
+
+inline void PollControlNonBlocking(
+    void* pull,
+    void* push,
+    samurai::wire::WorkerKind kind,
+    TelemetrySink* telemetry,
+    ControlPollState& state) {
+  if (!pull) return;
+  zmq_msg_t cmsg;
+  zmq_msg_init(&cmsg);
+  while (zmq_msg_recv(&cmsg, pull, ZMQ_DONTWAIT) > 0) {
+    const std::size_t csz = static_cast<std::size_t>(zmq_msg_size(&cmsg));
+    samurai::wire::DecodedWireFrame cfrm{};
+    if (samurai::wire::DecodeWireFrame(zmq_msg_data(&cmsg), csz, cfrm)) {
+      const auto ctype = static_cast<samurai::wire::MessageType>(cfrm.msg_type);
+      const std::string& cjid = cfrm.job_id;
+      const std::size_t cplen = cfrm.actual_payload_len;
+      const std::uint8_t* cpdata = cfrm.payload_ptr;
+      if (ctype == samurai::wire::MessageType::PING) {
+        (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK),
+                        cfrm.correlation_id, kind, cjid);
+      } else if (ctype == samurai::wire::MessageType::SHUTDOWN) {
+        state.stop_job = true;
+        state.shutdown = true;
+        (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK),
+                        cfrm.correlation_id, kind, cjid);
+      } else if (ctype == samurai::wire::MessageType::STOP_JOB ||
+                 ctype == samurai::wire::MessageType::ABORT) {
+        state.stop_job = true;
+        (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK),
+                        cfrm.correlation_id, kind, cjid);
+      } else if (ctype == samurai::wire::MessageType::SET_TELEMETRY && telemetry) {
+        if (HandleSetTelemetryFrame(cpdata, cplen, *telemetry, samurai_pacing_monotonic_now_ns())) {
+          (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK),
+                          cfrm.correlation_id, kind, cjid);
+        } else {
+          (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                          cfrm.correlation_id, kind, cjid,
+                          JsonError("telemetry_config_size_mismatch"));
+        }
+      } else if (ctype == samurai::wire::MessageType::RECONFIGURE_JOB &&
+                 cplen >= sizeof(samurai::wire::ReconfigureWindowV1)) {
+        std::memcpy(&state.reconf, cpdata, sizeof(state.reconf));
+        state.reconfigure = true;
+        (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::ACK),
+                        cfrm.correlation_id, kind, cjid);
+      }
+    }
+    zmq_msg_close(&cmsg);
+    if (state.stop_job) return;
+    zmq_msg_init(&cmsg);
+  }
+  zmq_msg_close(&cmsg);
+}
+
+inline void RecordBatchToTelemetry(
+    TelemetrySink& sink,
+    const std::string& target_ip,
+    std::uint16_t target_port,
+    const std::string& proto_name,
+    std::uint64_t packets_count,
+    std::uint32_t avg_pkt_bytes,
+    std::uint64_t now_ns) noexcept {
+  if (__builtin_expect(!sink.Enabled() || packets_count == 0u, 1)) {
+    return;
+  }
+  const std::uint32_t src_be = htonl(0x0A000001u);
+  const std::uint32_t dst_be = TelemetrySink::ParseIpBe(target_ip);
+  const std::uint16_t dst_port_be = htons(target_port);
+  const std::uint8_t proto = TelemetrySink::ProtoFromName(proto_name);
+  const std::uint8_t flags = (proto == 6u) ? 0x02u : 0x00u;
+  const std::uint64_t limit = std::min<std::uint64_t>(packets_count, 1024u);
+  for (std::uint64_t k = 0; k < limit; ++k) {
+    sink.RecordPacketNet(src_be, dst_be, htons(static_cast<std::uint16_t>(1024u + (k & 0x3FFu))),
+                         dst_port_be, proto, avg_pkt_bytes, flags, 0, now_ns);
+  }
+}
+#endif  // SAMURAI_HAS_TELEMETRY_SINK
 
 }  // namespace samurai::daemon

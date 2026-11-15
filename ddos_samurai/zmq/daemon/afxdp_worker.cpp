@@ -169,6 +169,7 @@ struct alignas(64) XdpTxWorkerThread {
   std::atomic<std::uint64_t> bytes_sent{0};
   std::atomic<std::uint64_t> sleep_calls{0};
   std::atomic<bool> done{false};
+  std::atomic<bool>* stop_flag{nullptr};
 };
 
 void xdp_tx_thread_func(XdpTxWorkerThread* tw, xdp_native_api_v1* api,
@@ -189,6 +190,9 @@ void xdp_tx_thread_func(XdpTxWorkerThread* tw, xdp_native_api_v1* api,
   int i = start;
   char xdp_err[160];
   while (i < end) {
+    if (tw->stop_flag && tw->stop_flag->load(std::memory_order_relaxed)) {
+      break;
+    }
     samurai_pacing_wait_next(&st, &pace_cfg);
     int batch = std::min(effective_batch, end - i);
     const std::size_t off = static_cast<std::size_t>(i) * stride;
@@ -333,7 +337,9 @@ std::vector<std::uint8_t> JsonDone(
     double rate_accuracy_pct,
     int xdp_mode_effective,
     int xdp_queue_id,
-    int xdp_num_queues = 1) {
+    int xdp_num_queues = 1,
+    std::uint64_t ipfix_exported_packets = 0,
+    std::uint64_t ipfix_exported_records = 0) {
   const std::string json =
       "{\"status\":\"ok\",\"worker_kind\":\"afxdp\",\"correlation_id\":" +
       std::to_string(correlation_id) +
@@ -346,6 +352,8 @@ std::vector<std::uint8_t> JsonDone(
       ",\"xdp_mode_effective\":" + std::to_string(xdp_mode_effective) +
       ",\"xdp_queue_id\":" + std::to_string(xdp_queue_id) +
       ",\"xdp_num_queues\":" + std::to_string(xdp_num_queues) +
+      ",\"ipfix_exported_packets\":" + std::to_string(ipfix_exported_packets) +
+      ",\"ipfix_exported_records\":" + std::to_string(ipfix_exported_records) +
       ",\"note\":\"xdp_native_api+multi_queue+cpu_native+pacing_static\"}";
   return std::vector<std::uint8_t>(json.begin(), json.end());
 }
@@ -424,6 +432,7 @@ int main(int argc, char** argv) {
   }
 
   XdpNativeBridge xdp{};
+  samurai::daemon::TelemetrySink telemetry;
   bool running = true;
   while (running) {
     zmq_msg_t msg;
@@ -454,24 +463,10 @@ int main(int argc, char** argv) {
     const auto msg_type = static_cast<samurai::wire::MessageType>(header.msg_type);
     const std::string job_id = samurai::daemon::ReadJobId(header);
 
-    if (msg_type == samurai::wire::MessageType::SHUTDOWN) {
-      (void)SendAck(push, header.correlation_id, job_id);
-      running = false;
+    if (samurai::daemon::HandleCommonIdleMessage(
+            push, samurai::wire::WorkerKind::AF_XDP, header, job_id,
+            payload_ptr, payload_len, telemetry, running)) {
       zmq_msg_close(&msg);
-      continue;
-    }
-
-    if (msg_type == samurai::wire::MessageType::STOP_JOB) {
-      zmq_msg_close(&msg);
-      (void)SendAck(push, header.correlation_id, job_id);
-      const std::string stopped = "{\"status\":\"stopped\",\"worker_kind\":\"afxdp\"}";
-      (void)SendFrame(
-          push,
-          static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
-          header.correlation_id,
-          samurai::wire::WorkerKind::AF_XDP,
-          job_id,
-          std::vector<std::uint8_t>(stopped.begin(), stopped.end()));
       continue;
     }
 
@@ -603,14 +598,25 @@ int main(int argc, char** argv) {
         // Donanımsal RSS trafiği hangi kuyruğa atarsa atsın XdpMultiShim tüm kuyrukları
         // tarayarak dönüş SYN-ACK'lerini yakalar.
         if (samurai::daemon::IsStatefulFastpathJob(env)) {
+          telemetry.BeginJob();
           XdpMultiShim shim(xdp.api, handles);
           samurai::daemon::FastpathParams params =
               samurai::daemon::FastpathParamsFromEnvelope(env);
           params.backend = "af_xdp";
 
+          std::atomic<bool> stop{false};
+          samurai::daemon::ControlPollState ctrl{};
           samurai::daemon::StatefulFastpathDriver driver(shim);
           samurai::daemon::FastpathHooks hooks;
           hooks.emit_heartbeat = [&]() {
+            samurai::daemon::PollControlNonBlocking(
+                pull, push, samurai::wire::WorkerKind::AF_XDP, &telemetry, ctrl);
+            if (ctrl.stop_job) {
+              stop.store(true, std::memory_order_release);
+            }
+            if (ctrl.shutdown) {
+              running = false;
+            }
             (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
                             header.correlation_id, samurai::wire::WorkerKind::AF_XDP, job_id);
           };
@@ -620,7 +626,6 @@ int main(int argc, char** argv) {
                             SerializeSnapshotV2(snap));
           };
 
-          std::atomic<bool> stop{false};
           const bool l7 = samurai::daemon::JobWantsL7Fastpath(env);
           samurai::daemon::L7RunnerBundle l7b;
           samurai::daemon::FastpathResult res;
@@ -640,6 +645,12 @@ int main(int argc, char** argv) {
             res = driver.Run(params, {}, stop, hooks);
           }
 
+          const std::uint64_t done_ns = samurai_pacing_monotonic_now_ns();
+          samurai::daemon::RecordBatchToTelemetry(
+              telemetry, ReadFixed(env.target_ip, sizeof(env.target_ip)), env.target_port,
+              ReadFixed(env.protocol, sizeof(env.protocol)), res.tx_packets, env.packet_size, done_ns);
+          telemetry.FlushEnd(done_ns);
+
           samurai::core::json::Value done = samurai::core::json::Value::Object();
           done.set("status", samurai::core::json::Value::Str("ok"));
           done.set("mode", samurai::core::json::Value::Str(l7 ? "stateful_fastpath_l7" : "stateful_fastpath"));
@@ -653,12 +664,18 @@ int main(int argc, char** argv) {
           done.set("retransmit_exhausted", samurai::core::json::Value::Int(static_cast<int64_t>(res.retransmit_exhausted)));
           done.set("connect_timeout", samurai::core::json::Value::Int(static_cast<int64_t>(res.connect_timeout)));
           done.set("rx_available", samurai::core::json::Value::Bool(res.rx_available));
+          done.set("ipfix_exported_packets",
+                   samurai::core::json::Value::Int(static_cast<int64_t>(telemetry.JobExportedPackets())));
+          done.set("ipfix_exported_records",
+                   samurai::core::json::Value::Int(static_cast<int64_t>(telemetry.JobExportedRecords())));
           const std::string done_str = done.dump();
           (void)SendFrame(push, static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
                           header.correlation_id, samurai::wire::WorkerKind::AF_XDP, job_id,
                           std::vector<std::uint8_t>(done_str.begin(), done_str.end()));
           continue;
         }
+
+        telemetry.BeginJob();
 
         PacketConfig cfg = ConfigFromEnvelope(env);
         const auto pool = ddos_samurai::cpu_native::generate_packet_pool_view(cfg, packet_count, true, true);
@@ -699,6 +716,8 @@ int main(int argc, char** argv) {
                 std::max<std::uint32_t>(1u, thread_pace.burst_size / static_cast<std::uint32_t>(num_queues));
           }
 
+          std::atomic<bool> stop_threads{false};
+          samurai::daemon::ControlPollState ctrl{};
           std::deque<XdpTxWorkerThread> workers;
           const int base_packets = packet_count / num_queues;
           const int remainder = packet_count % num_queues;
@@ -709,6 +728,7 @@ int main(int argc, char** argv) {
             tw.queue_id = q;
             tw.cpu_core = base_core >= 0 ? base_core + q : -1;
             tw.handle = handles[q];
+            tw.stop_flag = &stop_threads;
             const int cnt = base_packets + (q < remainder ? 1 : 0);
             const int seg_start = cursor;
             const int seg_end = cursor + cnt;
@@ -718,6 +738,14 @@ int main(int argc, char** argv) {
           }
 
           while (true) {
+            samurai::daemon::PollControlNonBlocking(
+                pull, push, samurai::wire::WorkerKind::AF_XDP, &telemetry, ctrl);
+            if (ctrl.stop_job) {
+              stop_threads.store(true, std::memory_order_release);
+            }
+            if (ctrl.shutdown) {
+              running = false;
+            }
             bool all_done = true;
             for (const auto& w : workers) {
               if (!w.done.load(std::memory_order_acquire)) {
@@ -760,8 +788,23 @@ int main(int argc, char** argv) {
         } else {
           // Tekil kuyruk yolu (handles[0])
           const int active_handle = handles[0];
+          samurai::daemon::ControlPollState ctrl{};
           int offset = 0;
           while (offset < packet_count) {
+            samurai::daemon::PollControlNonBlocking(
+                pull, push, samurai::wire::WorkerKind::AF_XDP, &telemetry, ctrl);
+            if (ctrl.shutdown) {
+              running = false;
+            }
+            if (ctrl.stop_job) {
+              break;
+            }
+            if (ctrl.reconfigure) {
+              (void)samurai::daemon::ApplyReconfigureWindow(
+                  reinterpret_cast<const std::uint8_t*>(&ctrl.reconf),
+                  sizeof(ctrl.reconf), pace_cfg, pace_state);
+              ctrl.reconfigure = false;
+            }
             const int batch = std::min(cli_batch_size, packet_count - offset);
             for (int i = 0; i < batch; ++i) {
               samurai_pacing_wait_next(&pace_state, &pace_cfg);
@@ -898,6 +941,11 @@ int main(int argc, char** argv) {
         }
 
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
+        samurai::daemon::RecordBatchToTelemetry(
+            telemetry, ReadFixed(env.target_ip, sizeof(env.target_ip)), env.target_port,
+            ReadFixed(env.protocol, sizeof(env.protocol)), packets_sent,
+            static_cast<std::uint32_t>(stride), end_ns);
+        telemetry.FlushEnd(end_ns);
         const samurai::wire::MetricSnapshotV1 snap = BuildSnapshot(
             end_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
         (void)SendFrame(
@@ -918,7 +966,9 @@ int main(int argc, char** argv) {
             snap.rate_accuracy_pct,
             native_stats.mode,
             native_stats.queue_id,
-            num_queues);
+            num_queues,
+            telemetry.JobExportedPackets(),
+            telemetry.JobExportedRecords());
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),

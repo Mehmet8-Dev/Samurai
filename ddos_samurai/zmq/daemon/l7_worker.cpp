@@ -68,7 +68,9 @@ std::vector<std::uint8_t> JsonDone(
     std::uint64_t bytes_recv,
     std::uint64_t scenario_payload_bytes,
     double actual_rps,
-    double rate_accuracy_pct) {
+    double rate_accuracy_pct,
+    std::uint64_t ipfix_exported_packets = 0,
+    std::uint64_t ipfix_exported_records = 0) {
   std::ostringstream oss;
   oss
       << "{\"status\":\"ok\",\"worker_kind\":\"l7\""
@@ -82,6 +84,8 @@ std::vector<std::uint8_t> JsonDone(
       << ",\"scenario_payload_bytes\":" << scenario_payload_bytes
       << ",\"actual_rps\":" << actual_rps
       << ",\"rate_accuracy_pct\":" << rate_accuracy_pct
+      << ",\"ipfix_exported_packets\":" << ipfix_exported_packets
+      << ",\"ipfix_exported_records\":" << ipfix_exported_records
       << ",\"note\":\"l7_tcp_native+pacing_static\"}";
   const std::string s = oss.str();
   return std::vector<std::uint8_t>(s.begin(), s.end());
@@ -91,13 +95,17 @@ std::vector<std::uint8_t> JsonDoneEmu(
     std::uint64_t correlation_id,
     const std::string& job_id,
     const std::string& protocol,
-    const std::string& result_json) {
+    const std::string& result_json,
+    std::uint64_t ipfix_exported_packets = 0,
+    std::uint64_t ipfix_exported_records = 0) {
   std::ostringstream oss;
   oss << "{\"status\":\"ok\",\"worker_kind\":\"l7\""
       << ",\"correlation_id\":" << correlation_id
       << ",\"job_id\":\"" << job_id << "\""
       << ",\"l7_protocol\":\"" << protocol << "\""
       << ",\"engine\":\"l7_emu_native_bridge\""
+      << ",\"ipfix_exported_packets\":" << ipfix_exported_packets
+      << ",\"ipfix_exported_records\":" << ipfix_exported_records
       << ",\"engine_result\":" << result_json << "}";
   const std::string s = oss.str();
   return std::vector<std::uint8_t>(s.begin(), s.end());
@@ -234,6 +242,34 @@ L7JobParams ParseL7Job(
   p.has_payload = env.has_payload != 0u;
   p.packet_count = env.packet_count;
   return p;
+}
+
+L7JobParams ParseL7JobFrame(
+    const samurai::wire::DecodedWireFrame& frame,
+    samurai::daemon::TelemetrySink& telemetry,
+    std::string& err) {
+  if (frame.version == samurai::wire::kVersionV3) {
+    samurai::wire::JobV3Payload v3{};
+    if (!samurai::wire::ParseJobV3Payload(
+            frame.payload_ptr, frame.actual_payload_len, frame.ext_count, v3)) {
+      err = "l7_envelope_v3_size_mismatch";
+      return L7JobParams{};
+    }
+    if (v3.has_telemetry) {
+      samurai::daemon::ApplyTelemetrySectionV3(v3.telemetry, &telemetry);
+    }
+    if (v3.has_l7) {
+      samurai::wire::JobEnvelopeV2 env2 = samurai::wire::ToJobEnvelopeV2(v3.base, v3.l7);
+      samurai::wire::SamuraiWireHeaderV1 h2 = frame.as_v1_header;
+      h2.version = samurai::wire::kVersionV2;
+      return ParseL7Job(h2, reinterpret_cast<const std::uint8_t*>(&env2), sizeof(env2), err);
+    }
+    samurai::wire::JobEnvelopeV1 env1 = samurai::wire::ToJobEnvelopeV1(v3.base);
+    samurai::wire::SamuraiWireHeaderV1 h1 = frame.as_v1_header;
+    h1.version = samurai::wire::kVersionV1;
+    return ParseL7Job(h1, reinterpret_cast<const std::uint8_t*>(&env1), sizeof(env1), err);
+  }
+  return ParseL7Job(frame.as_v1_header, frame.payload_ptr, frame.actual_payload_len, err);
 }
 
 // Maps the raw protocol label onto the emu-engine dispatch set. Plain "tcp"
@@ -405,6 +441,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  samurai::daemon::TelemetrySink telemetry;
   bool running = true;
   while (running) {
     zmq_msg_t msg;
@@ -416,61 +453,40 @@ int main(int argc, char** argv) {
     }
 
     const std::size_t sz = static_cast<std::size_t>(zmq_msg_size(&msg));
-    if (sz < sizeof(samurai::wire::SamuraiWireHeaderV1)) {
+    samurai::wire::DecodedWireFrame frame{};
+    if (!samurai::wire::DecodeWireFrame(zmq_msg_data(&msg), sz, frame)) {
       zmq_msg_close(&msg);
       continue;
     }
 
-    const auto* raw = static_cast<const std::uint8_t*>(zmq_msg_data(&msg));
-    samurai::wire::SamuraiWireHeaderV1 header{};
-    std::memcpy(&header, raw, sizeof(header));
-    const std::size_t payload_len = sz - sizeof(header);
-    const std::uint8_t* payload_ptr = raw + sizeof(header);
+    const auto msg_type = static_cast<samurai::wire::MessageType>(frame.msg_type);
+    const std::string& job_id = frame.job_id;
+    const auto header = frame.as_v1_header;
+    const std::uint8_t* payload_ptr = frame.payload_ptr;
+    const std::size_t payload_len = frame.actual_payload_len;
 
-    if (!samurai::wire::IsHeaderV1Compatible(header)) {
+    if (samurai::daemon::HandleCommonIdleMessage(
+            push, samurai::wire::WorkerKind::L7, frame, telemetry, running)) {
       zmq_msg_close(&msg);
-      continue;
-    }
-
-    const auto msg_type = static_cast<samurai::wire::MessageType>(header.msg_type);
-    const std::string job_id = samurai::daemon::ReadJobId(header);
-
-    if (msg_type == samurai::wire::MessageType::SHUTDOWN) {
-      (void)SendAck(push, header.correlation_id, job_id);
-      running = false;
-      zmq_msg_close(&msg);
-      continue;
-    }
-
-    if (msg_type == samurai::wire::MessageType::STOP_JOB) {
-      zmq_msg_close(&msg);
-      (void)SendAck(push, header.correlation_id, job_id);
-      const std::string stopped = "{\"status\":\"stopped\",\"worker_kind\":\"l7\"}";
-      (void)SendFrame(
-          push,
-          static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
-          header.correlation_id,
-          samurai::wire::WorkerKind::L7,
-          job_id,
-          std::vector<std::uint8_t>(stopped.begin(), stopped.end()));
       continue;
     }
 
     if (msg_type == samurai::wire::MessageType::START_JOB) {
+      telemetry.BeginJob();
       std::string envelope_err;
-      const L7JobParams params = ParseL7Job(header, payload_ptr, payload_len, envelope_err);
+      L7JobParams params = ParseL7JobFrame(frame, telemetry, envelope_err);
       if (!envelope_err.empty()) {
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
-            header.correlation_id,
+            frame.correlation_id,
             samurai::wire::WorkerKind::L7,
             job_id,
             JsonError(envelope_err));
         zmq_msg_close(&msg);
         continue;
       }
-      (void)SendAck(push, header.correlation_id, job_id);
+      (void)SendAck(push, frame.correlation_id, job_id);
       zmq_msg_close(&msg);
 
       try {
@@ -698,6 +714,14 @@ int main(int argc, char** argv) {
             emu_snap.hot_path_zero_copy_tx_bytes = read_u64("hot_path_zero_copy_tx_bytes");
             emu_snap.hot_path_zero_copy_rx_bytes = read_u64("hot_path_zero_copy_rx_bytes");
 
+            const std::uint32_t avg_req_bytes = emu_sent > 0
+                ? static_cast<std::uint32_t>(std::max<std::uint64_t>(64u, emu_tx_bytes / emu_sent))
+                : 128u;
+            samurai::daemon::RecordBatchToTelemetry(
+                telemetry, target, static_cast<std::uint16_t>(port),
+                dispatch_protocol, emu_sent, avg_req_bytes, emu_end_ns);
+            telemetry.FlushEnd(emu_end_ns);
+
             (void)SendFrame(
                 push,
                 static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
@@ -711,7 +735,8 @@ int main(int argc, char** argv) {
                 header.correlation_id,
                 samurai::wire::WorkerKind::L7,
                 job_id,
-                JsonDoneEmu(header.correlation_id, job_id, dispatch_protocol, emu_result.dump()));
+                JsonDoneEmu(header.correlation_id, job_id, dispatch_protocol, emu_result.dump(),
+                            telemetry.JobExportedPackets(), telemetry.JobExportedRecords()));
             continue;
           } catch (const std::exception& exc) {
             (void)SendFrame(
@@ -740,8 +765,24 @@ int main(int argc, char** argv) {
 
         samurai::l7::SessionContext session_ctx;
         int persistent_fd = -1;
+        samurai::daemon::ControlPollState ctrl{};
+        const std::uint32_t src_ip_be = htonl(0x0A000001u);
+        const std::uint32_t dst_ip_be = samurai::daemon::TelemetrySink::ParseIpBe(target);
+        const std::uint16_t dst_port_be = htons(static_cast<std::uint16_t>(port));
+        const std::uint8_t flow_proto = samurai::daemon::TelemetrySink::ProtoFromName(raw_protocol_lc);
 
         for (int i = 0; i < request_count; ++i) {
+          samurai::daemon::PollControlNonBlocking(
+              pull, push, samurai::wire::WorkerKind::L7, &telemetry, ctrl);
+          if (ctrl.shutdown) running = false;
+          if (ctrl.stop_job) break;
+          if (ctrl.reconfigure) {
+            (void)samurai::daemon::ApplyReconfigureWindow(
+                reinterpret_cast<const std::uint8_t*>(&ctrl.reconf),
+                sizeof(ctrl.reconf), pace_cfg, pace_state,
+                &params.request_mix, &params.source_rotation);
+            ctrl.reconfigure = false;
+          }
           samurai_pacing_wait_next(&pace_state, &pace_cfg);
 
           int fd = persistent_fd;
@@ -770,6 +811,12 @@ int main(int argc, char** argv) {
           } else {
             packets_sent += 1u;
             bytes_sent += static_cast<std::uint64_t>(current_payload.size());
+            if (__builtin_expect(telemetry.Enabled(), 0)) {
+              telemetry.RecordPacketNet(
+                  src_ip_be, dst_ip_be, htons(static_cast<std::uint16_t>(10000 + (i & 0x1FFF))),
+                  dst_port_be, flow_proto, static_cast<std::uint32_t>(current_payload.size()),
+                  0x18u, 0, samurai_pacing_monotonic_now_ns());
+            }
 
             std::array<char, 4096> resp_buf{};
             const ssize_t nr = recv(fd, resp_buf.data(), resp_buf.size() - 1, 0);
@@ -791,6 +838,7 @@ int main(int argc, char** argv) {
           }
 
           const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
+          telemetry.TickExport(now_ns);
           if (now_ns - last_hb_ns >= 1'000'000'000ull) {
             (void)SendFrame(
                 push,
@@ -820,6 +868,7 @@ int main(int argc, char** argv) {
         }
 
         const std::uint64_t end_ns = samurai_pacing_monotonic_now_ns();
+        telemetry.FlushEnd(end_ns);
         const samurai::wire::MetricSnapshotV1 snap =
             BuildSnapshot(end_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
         (void)SendFrame(
@@ -840,7 +889,9 @@ int main(int argc, char** argv) {
             bytes_recv,
             scenario_payload_bytes,
             snap.actual_rps,
-            snap.rate_accuracy_pct);
+            snap.rate_accuracy_pct,
+            telemetry.JobExportedPackets(),
+            telemetry.JobExportedRecords());
         (void)SendFrame(
             push,
             static_cast<std::uint8_t>(samurai::wire::MessageType::JOB_DONE),
