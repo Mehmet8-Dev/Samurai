@@ -86,18 +86,17 @@ Modern infrastructure teams face a gap between low-level stateless packet blaste
 # Install dependencies (Ubuntu/Debian)
 sudo apt update && sudo apt install -y build-essential cmake pkg-config libzmq3-dev libssl-dev
 
-# Clone repository and create build directory
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+# Configure and build all native targets from repository root
+cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
 ```
 
 The build produces the following native binaries under `build/`:
-- `build/samurai/cli/samurai` (Primary CLI tool)
-- `build/samurai/control/daemon/samurai_master` (Distributed Master daemon)
-- `build/samurai/control/daemon/samurai_slave` (Distributed Worker node daemon)
-- `build/samurai/zmq/daemon/samurai_*_worker` (All native dataplane worker engines)
-- `build/samurai/*_selftest` (Unit test and self-test verification suites)
+- `build/cli/samurai` (Primary CLI tool)
+- `build/control/daemon/samurai_master` (Distributed Master daemon)
+- `build/control/daemon/samurai_slave` (Distributed Worker node daemon)
+- `build/zmq/samurai_*_worker` (All native dataplane worker engines)
+- `build/control/samurai_control_selftest`, `build/l7_emu_native/test_*`, `build/l4/test_*` (Native unit and self-test verification suites)
 
 ---
 
@@ -107,7 +106,7 @@ The build produces the following native binaries under `build/`:
 
 ```bash
 # High-speed UDP packet test via CPU engine
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker cpu \
   --target 192.168.1.100 \
   --port 80 \
@@ -116,7 +115,7 @@ The build produces the following native binaries under `build/`:
   --confirm
 
 # AF_XDP Kernel-Bypass zero-copy line-rate test
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker afxdp \
   --target 10.0.0.1 \
   --interface eth0 \
@@ -125,7 +124,7 @@ The build produces the following native binaries under `build/`:
   --confirm
 
 # Stateful HTTP/2 simulation test
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker l7 \
   --target 10.0.0.50 \
   --port 443 \
@@ -134,7 +133,7 @@ The build produces the following native binaries under `build/`:
   --confirm
 
 # Multi-step stateful user scenario execution
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker scenario \
   --scenario-file docs/scenario_web_mobile.yaml \
   --confirm
@@ -146,7 +145,7 @@ Scale workloads horizontally across multiple baremetal servers:
 
 #### **Master Node (`samurai_master`):**
 ```bash
-./build/samurai/control/daemon/samurai_master \
+./build/control/daemon/samurai_master \
   --control-listen tcp://0.0.0.0:5099 \
   --api-listen 0.0.0.0:8089 \
   --target 10.0.0.50 \
@@ -159,7 +158,7 @@ Scale workloads horizontally across multiple baremetal servers:
 #### **Worker Node (`samurai_slave`):**
 Run on each agent/generator machine:
 ```bash
-./build/samurai/control/daemon/samurai_slave \
+./build/control/daemon/samurai_slave \
   --control-endpoints tcp://<MASTER_IP>:5099 \
   --worker afxdp \
   --interface eth0
@@ -178,12 +177,14 @@ docker-compose -f docker-compose.distributed.yml up -d
 | Worker Name (`--worker`) | Native Binary | Capabilities & Acceleration Path |
 | :--- | :--- | :--- |
 | `cpu` | `samurai_cpu_worker` | Raw sockets, memory ring buffer, dynamic header spoofing |
+| `afpacket` | `samurai_afpacket_worker` | Linux AF_PACKET `TPACKET_V3` memory-mapped TX rings |
 | `afxdp` | `samurai_afxdp_worker` | Linux XSK / UMEM zero-copy kernel bypass |
 | `dpdk` | `samurai_dpdk_worker` | DPDK PMD hardware ring buffers and hugepages |
-| `gpu` | `samurai_gpu_worker` | NVIDIA CUDA warp-parallel packet synthesis |
+| `gpu` | `samurai_gpu_worker` | NVIDIA CUDA warp-parallel packet synthesis & GeForce BAR1 P2P |
 | `doca` | `samurai_doca_worker` | NVIDIA BlueField DPU & GPUNetIO direct VRAM streaming |
 | `l7` | `samurai_l7_worker` | Stateful HTTP/1.1, HTTP/2 (nghttp2), QUIC / HTTP/3 (ngtcp2) |
 | `scenario` | `samurai_scenario_worker` | Persona-based multi-step user workflows and SLA tracking |
+| `telco` | `samurai_telco_worker` | 4G/5G CUPS, PFCP N4, GTP-U, SCTP, Diameter, SIP/RTP/SRTP |
 | `defense` | `samurai_defense_worker` | Variational Autoencoder (VAE) resilience evaluation |
 
 ---
@@ -194,13 +195,14 @@ Run the built-in C++ validation binaries to verify subsystems in isolated enviro
 
 ```bash
 # Verify Distributed Control Plane and RPC wire protocol
-./build/samurai/control/samurai_control_selftest
+./build/control/samurai_control_selftest
 
-# Verify Stateful L7 Engine and Protocol Bridges
-./build/samurai/l7_emu_native/samurai_l7_selftest
+# Verify L2/L3/ASTF and Stateful L7 Engines
+./build/l7_emu_native/test_l2l3_astf
+./build/l7_emu_native/test_kernel_threaded_l7
 
-# Verify Scenario Engine and SLA Verification
-./build/samurai/scenario_engine_native/samurai_scenario_engine_selftest
+# Verify L4 Userspace TCP Sliding Window & SACK Recovery
+./build/l4/test_tcp_sliding_window
 ```
 
 ---
@@ -228,7 +230,6 @@ For coordinated vulnerability disclosure, supported versions, and secure-by-defa
 ## Community
 
 - **GitHub Discussions:** Join architecture discussions, Q&A, RFC reviews, and benchmark sharing at [GitHub Discussions](https://github.com/Mehmet8-Dev/Samurai/discussions).
-- **Discord:** Connect with systems, kernel-bypass, and telecom contributors on Discord (add your server invite link in `README.md` when ready).
 - **Issues & Proposals:** Use the structured templates in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) for bug reports, feature requests, and new PR proposals.
 
 ---
@@ -246,10 +247,10 @@ Contributions are welcome under our [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). 
 
 ---
 
-## License & Commercial Support
+## License & Support
 
-Samurai is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see [`LICENSE`](LICENSE) for the full text.
+Samurai is 100% open-source software licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see [`LICENSE`](LICENSE) for the full text.
 
-Under AGPL-3.0, any modified version deployed or operated over a network (including managed services and SaaS platforms) must disclose its complete source code under the same license.
+Under AGPL-3.0, all features remain open and any modified version deployed or operated over a network (including managed services and SaaS platforms) must disclose its complete source code under the same license.
 
-For organizations requiring **commercial dual-licensing**, proprietary integration rights, or dedicated **SLA / SLO support agreements**, please contact the author directly via GitHub ([@Mehmet8-Dev](https://github.com/Mehmet8-Dev)).
+For **commercial support, dedicated SLA / SLO agreements, custom integration engineering, or project sponsorship**, please contact the author directly via GitHub ([@Mehmet8-Dev](https://github.com/Mehmet8-Dev)) or `mehmetokur756@gmail.com`.

@@ -19,13 +19,13 @@ Samurai enforces strict safety boundaries (`samurai/core/target_safety.cpp` and 
 
 ```bash
 # Allow tests only against an explicitly defined lab subnet
-./build/samurai/cli/samurai --allow-target 192.168.10.0/24 ...
+./build/cli/samurai --allow-target 192.168.10.0/24 ...
 
 # Explicitly ban a production management subnet
-./build/samurai/cli/samurai --safety-global-deny-target 10.0.0.0/24 ...
+./build/cli/samurai --safety-global-deny-target 10.0.0.0/24 ...
 
 # Authorized public target testing
-./build/samurai/cli/samurai --allow-public-target --target 203.0.113.10 ...
+./build/cli/samurai --allow-public-target --target 203.0.113.10 ...
 ```
 
 ---
@@ -36,8 +36,8 @@ To verify the mathematical and structural correctness of synthesized packet head
 
 ```bash
 # Verify compliant RFC packet structures
-./build/samurai/cli/samurai --rfc-suite positive
+./build/cli/samurai --rfc-suite positive
 
 # Verify packet filters and anomaly rejection
-./build/samurai/cli/samurai --rfc-suite negative
+./build/cli/samurai --rfc-suite negative
 ```

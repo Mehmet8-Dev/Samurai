@@ -42,8 +42,8 @@ Optional hardware acceleration backends compile conditionally according to toolc
 The lightest operational configuration; allows non-root execution by granting specific capabilities to compiled worker binaries:
 
 ```bash
-sudo setcap cap_net_raw,cap_net_admin,cap_sys_nice+ep ./build/samurai/cli/samurai_afxdp_worker
-sudo setcap cap_net_raw,cap_net_admin+ep            ./build/samurai/cli/samurai_cpu_worker
+sudo setcap cap_net_raw,cap_net_admin,cap_sys_nice+ep ./build/zmq/samurai_afxdp_worker
+sudo setcap cap_net_raw,cap_net_admin+ep            ./build/zmq/samurai_cpu_worker
 
 # AF_XDP interface and hardware queue configuration:
 export SAMURAI_XDP_INTERFACE=enp2s0     # Dedicated test NIC (see docs/08-config.md)
@@ -102,7 +102,7 @@ mkdir -p reports/runs/$(date +%Y-%m)/baseline
 OUT=reports/runs/$(date +%Y-%m)/baseline
 
 # Execute full RFC benchmark suite (RFC 2544 throughput/latency/loss, RFC 3511 firewall, RFC 8219 IPv6)
-sudo -E ./build/samurai/cli/samurai \
+sudo -E ./build/cli/samurai \
   --run-rfc-suite all \
   --rfc-report-out $OUT/rfc_all.html \
   --target 10.0.0.5 --port 80 \

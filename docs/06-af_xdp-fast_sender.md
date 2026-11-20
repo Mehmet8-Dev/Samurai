@@ -32,7 +32,7 @@ AF_XDP (XSK - eXpress Data Path Sockets) is Linux's high-performance kernel-bypa
 
 ```bash
 # Run with root privileges for raw network namespace access
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --worker afxdp \
   --target 10.0.0.50 \
   --port 80 \

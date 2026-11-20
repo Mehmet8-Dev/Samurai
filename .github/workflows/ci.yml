@@ -14,7 +14,7 @@ concurrency:
 jobs:
   semver-guard:
     name: SemVer Guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -87,7 +87,7 @@ jobs:
   native-build-and-selftest:
     name: Native C++ Build & E2E Selftests
     needs: semver-guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -163,7 +163,7 @@ jobs:
   python-tests:
     name: Python Test Suite (101 Tests)
     needs: native-build-and-selftest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -204,7 +204,7 @@ jobs:
   docker-and-helm-smoke:
     name: Docker & Helm Deployment Smoke
     needs: semver-guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout

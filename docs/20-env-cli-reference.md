@@ -2,7 +2,7 @@
 
 ![Samurai CLI Execution & Worker Lifecycle](assets/diagrams/samurai_cli_lifecycle.svg)
 
-This document provides a consolidated reference for all CLI command-line flags and all `SAMURAI_*` environment variables used in the Samurai Network Resilience Platform (`./build/samurai/cli/samurai`).
+This document provides a consolidated reference for all CLI command-line flags and all `SAMURAI_*` environment variables used in the Samurai Network Resilience Platform (`./build/cli/samurai`).
 
 Scope:
 - Total CLI options: `394`
@@ -13,63 +13,63 @@ Scope:
 Primary entrypoint:
 
 ```bash
-./build/samurai/cli/samurai [FLAGS]
+./build/cli/samurai [FLAGS]
 ```
 
 Common command examples:
 
 ```bash
 # Display profiles
-./build/samurai/cli/samurai --list-profiles
+./build/cli/samurai --list-profiles
 
 # Dry-run / safe parser and configuration check
-./build/samurai/cli/samurai --dry-run -t 10.0.0.10 -p 443 --attack-vector http
+./build/cli/samurai --dry-run -t 10.0.0.10 -p 443 --attack-vector http
 
 # Self-test suite execution
-./build/samurai/cli/samurai --self-test
+./build/cli/samurai --self-test
 
 # Standalone live benchmark execution
-./build/samurai/cli/samurai --role standalone -t 10.0.0.10 -p 443 --attack-vector http --workers 4
+./build/cli/samurai --role standalone -t 10.0.0.10 -p 443 --attack-vector http --workers 4
 
 # Master node initialization
-./build/samurai/cli/samurai --role master --control-listen 0.0.0.0:5099 --management-api-enable
+./build/cli/samurai --role master --control-listen 0.0.0.0:5099 --management-api-enable
 
 # Slave / Worker node connection
-./build/samurai/cli/samurai --role slave --control-endpoints 10.0.0.5:5099 --cluster-secret xxxx
+./build/cli/samurai --role slave --control-endpoints 10.0.0.5:5099 --cluster-secret xxxx
 ```
 
 Command catalog by workload profile:
 
 ```bash
 # Layer 4 basic stateful/stateless stream
-./build/samurai/cli/samurai --attack-vector basic -t 10.0.0.10 -p 443 --protocol tcp --count 100000
+./build/cli/samurai --attack-vector basic -t 10.0.0.10 -p 443 --protocol tcp --count 100000
 
 # HTTP/1.1 workload
-./build/samurai/cli/samurai --attack-vector http -t 10.0.0.10 -p 443 --http-scheme https --http-concurrency 200
+./build/cli/samurai --attack-vector http -t 10.0.0.10 -p 443 --http-scheme https --http-concurrency 200
 
 # HTTP/2 multiplexed stream
-./build/samurai/cli/samurai --attack-vector http2 -t 10.0.0.10 -p 443 --http2-concurrency 200
+./build/cli/samurai --attack-vector http2 -t 10.0.0.10 -p 443 --http2-concurrency 200
 
 # WebSocket persistent connection
-./build/samurai/cli/samurai --attack-vector websocket -t 10.0.0.10 -p 443 --ws-concurrency 100
+./build/cli/samurai --attack-vector websocket -t 10.0.0.10 -p 443 --ws-concurrency 100
 
 # QUIC / HTTP/3 native session
-./build/samurai/cli/samurai --attack-vector quic -t 10.0.0.10 -p 443 --quic-concurrency 100
+./build/cli/samurai --attack-vector quic -t 10.0.0.10 -p 443 --quic-concurrency 100
 
 # DNS query storm
-./build/samurai/cli/samurai --attack-vector dns -t 10.0.0.53 -p 53 --dns-name example.com --dns-qtype A AAAA
+./build/cli/samurai --attack-vector dns -t 10.0.0.53 -p 53 --dns-name example.com --dns-qtype A AAAA
 
 # Amplification resilience evaluation
-./build/samurai/cli/samurai --attack-vector dns-amp -t 10.0.0.53 -p 53 --reflector-file reflectors.txt
+./build/cli/samurai --attack-vector dns-amp -t 10.0.0.53 -p 53 --reflector-file reflectors.txt
 
 # Anomaly inspection suite
-./build/samurai/cli/samurai --attack-vector anomaly -t 10.0.0.10 -p 443 --anomaly-suite
+./build/cli/samurai --attack-vector anomaly -t 10.0.0.10 -p 443 --anomaly-suite
 
 # PCAP replay engine
-./build/samurai/cli/samurai --attack-vector pcap-replay --pcap-file sample.pcap --pcap-timing topspeed
+./build/cli/samurai --attack-vector pcap-replay --pcap-file sample.pcap --pcap-timing topspeed
 
 # Run report generation
-./build/samurai/cli/samurai -t 10.0.0.10 -p 443 --run-report --run-report-format both --run-report-dir reports
+./build/cli/samurai -t 10.0.0.10 -p 443 --run-report --run-report-format both --run-report-dir reports
 ```
 
 ## 2) All CLI Flags

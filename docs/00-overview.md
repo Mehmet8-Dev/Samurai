@@ -52,8 +52,8 @@ Samurai is an enterprise-grade, high-performance network resilience and line-rat
 
 ### 1. Standalone Local Execution
 ```bash
-./build/samurai/cli/samurai \
-  --worker <cpu|afxdp|dpdk|gpu|doca|l7|scenario> \
+./build/cli/samurai \
+  --worker <cpu|afxdp|dpdk|gpu|doca|l7|telco|scenario> \
   --target <TARGET_IP> \
   --port 80 \
   --count 1000000 \
@@ -63,19 +63,20 @@ Samurai is an enterprise-grade, high-performance network resilience and line-rat
 ### 2. Distributed Multi-Node Cluster
 - **Master Node:**
   ```bash
-  ./build/samurai/control/daemon/samurai_master \
+  ./build/control/daemon/samurai_master \
     --control-listen tcp://0.0.0.0:5099 \
     --count 100000000 \
     --target 10.0.0.50
   ```
 - **Slave Node:**
   ```bash
-  ./build/samurai/control/daemon/samurai_slave \
+  ./build/control/daemon/samurai_slave \
     --control-endpoints <MASTER_IP>:5099 \
     --worker afxdp
   ```
 
 ### 3. Integrated Self-Test Suites
-- `./build/samurai/control/samurai_control_selftest`
-- `./build/samurai/l7_emu_native/samurai_l7_selftest`
-- `./build/samurai/scenario_engine_native/samurai_scenario_engine_selftest`
+- `./build/control/samurai_control_selftest`
+- `./build/l7_emu_native/test_l2l3_astf`
+- `./build/l7_emu_native/test_kernel_threaded_l7`
+- `./build/l4/test_tcp_sliding_window`

@@ -76,13 +76,14 @@ GRUB_CMDLINE_LINUX_DEFAULT="... default_hugepagesz=1G hugepagesz=1G hugepages=4 
 
 Re-run CMake to detect `libdpdk`:
 ```bash
-cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
+cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
 ```
 
 Execute line-rate stress benchmarks via the native CLI:
 ```bash
 # Run samurai with the hardware DPDK PMD worker
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --worker dpdk \
   --target 10.0.0.50 \
   --port 443 \

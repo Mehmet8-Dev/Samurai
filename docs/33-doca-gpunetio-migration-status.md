@@ -88,7 +88,7 @@ Run on a bare-metal server equipped with an NVIDIA GPU and BlueField DPU:
 
 ```bash
 # Run samurai native DOCA GPUNetIO worker
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --worker doca \
   --target 10.0.0.50 \
   --port 80 \

@@ -105,7 +105,7 @@ cat /sys/class/net/eth0/device/numa_node
 
 # Run samurai native AF_XDP worker pinned to NUMA Node 0 cores
 numactl --cpunodebind=0 --membind=0 \
-  ./build/samurai/cli/samurai \
+  ./build/cli/samurai \
     --worker afxdp \
     --target 10.0.0.50 \
     --port 80 \
@@ -119,7 +119,7 @@ With hugepages pre-allocated (`default_hugepagesz=1G hugepagesz=1G hugepages=8`)
 
 ```bash
 # Run samurai native DPDK worker with hardware PMD rings
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --worker dpdk \
   --target 10.0.0.50 \
   --port 443 \
@@ -130,7 +130,7 @@ sudo ./build/samurai/cli/samurai \
 
 ### C) CPU Native Raw Socket Stress Test
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker cpu \
   --target 127.0.0.1 \
   --port 8080 \

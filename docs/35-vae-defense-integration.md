@@ -28,7 +28,7 @@ The defense evaluation layer is engineered to:
 
 ```bash
 # Execute defense resilience validation
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker defense \
   --target 10.0.0.50 \
   --port 80 \

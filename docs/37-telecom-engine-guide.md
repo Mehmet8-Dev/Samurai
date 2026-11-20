@@ -264,7 +264,7 @@ Samurai CLI (`samurai/cli/options.hpp`, `args.cpp`, `profiles.cpp`) incorporates
 
 ```bash
 # Executing preconfigured carrier profile via Samurai CLI
-./build/samurai/cli/samurai --profile telco-full-carrier --duration 120 --interface eth1 --confirm
+./build/cli/samurai --profile telco-full-carrier --duration 120 --interface eth1 --confirm
 ```
 
 ---

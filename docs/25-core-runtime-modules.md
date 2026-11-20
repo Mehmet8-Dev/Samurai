@@ -27,7 +27,6 @@ This document maps the core libraries, native C++ subsystems, and operational bo
 All modules build hermetically using modern CMake:
 
 ```bash
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
 ```

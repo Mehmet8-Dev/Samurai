@@ -7,31 +7,29 @@ Samurai development, continuous integration, and validation workflows utilize a 
 ## 1. Building the Project
 
 ```bash
-# 1. Create build directory
-mkdir -p build && cd build
+# Configure with CMake from repository root (Release mode recommended for line-rate performance)
+cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
 
-# 2. Configure with CMake (Release mode recommended for line-rate performance)
-cmake .. -DCMAKE_BUILD_TYPE=Release
-
-# 3. Compile all targets in parallel
-make -j$(nproc)
+# Compile all targets in parallel
+cmake --build build -j"$(nproc)"
 ```
 
 ---
 
 ## 2. Running Native C++ Test Suites
 
-Each major architectural layer includes a standalone native validation harness:
+Each major architectural layer includes standalone native validation binaries:
 
 ```bash
 # 1. Control Plane, Shard Engine, and RPC Wire Tests
-./build/samurai/control/samurai_control_selftest
+./build/control/samurai_control_selftest
 
 # 2. L7 Stateful Transport, QUIC, and Custom TCP Tests
-./build/samurai/l7_emu_native/samurai_l7_selftest
+./build/l7_emu_native/test_l2l3_astf
+./build/l7_emu_native/test_kernel_threaded_l7
 
-# 3. Scenario Engine (DSL, Compiler, and SLA Gates)
-./build/samurai/scenario_engine_native/samurai_scenario_engine_selftest
+# 3. L4 Userspace TCP Sliding Window & SACK Recovery
+./build/l4/test_tcp_sliding_window
 ```
 
 ---

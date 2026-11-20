@@ -4,7 +4,7 @@
 
 ## Purpose
 
-This handbook provides an operational framework for planning and executing enterprise-grade network resilience, capacity, and defense validation evaluations using the Samurai Network Resilience Platform (`./build/samurai/cli/samurai`).
+This handbook provides an operational framework for planning and executing enterprise-grade network resilience, capacity, and defense validation evaluations using the Samurai Network Resilience Platform (`./build/cli/samurai`).
 
 Goals:
 
@@ -257,7 +257,7 @@ log: artifacts/logs/ecommerce_preprod_baseline.log
 #### Step 1: Preflight Dry-Run
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/ecommerce_preprod_baseline.yaml \
   --dry-run \
   --confirm
@@ -271,7 +271,7 @@ Validation objectives:
 #### Step 2: Reference Baseline Run
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/ecommerce_preprod_baseline.yaml \
   --confirm
 ```
@@ -286,7 +286,7 @@ Post-run validation:
 Gradually increase load to projected peak volumes:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/ecommerce_preprod_baseline.yaml \
   --rps 2600 \
   --count 120000 \
@@ -346,7 +346,7 @@ log: artifacts/logs/ecommerce_gpu_browse.log
 Dry-run validation:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/ecommerce_gpu_browse_baseline.yaml \
   --dry-run \
   --confirm
@@ -355,7 +355,7 @@ Dry-run validation:
 Live baseline run:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/ecommerce_gpu_browse_baseline.yaml \
   --confirm
 ```
@@ -365,7 +365,7 @@ Live baseline run:
 Evaluates whether CDN edges and ingress load balancers can handle sudden traffic surges without cache thrashing.
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.20.30.40 \
   --port 443 \
   --protocol tcp \
@@ -390,7 +390,7 @@ Evaluates whether CDN edges and ingress load balancers can handle sudden traffic
 Validates host DMA memory and GPU ring stability under sustained 1-hour generation:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.20.30.40 \
   --port 443 \
   --protocol tcp \
@@ -425,7 +425,7 @@ Determines whether GPU offloading delivers measurable efficiency gains over CPU 
 CPU Reference:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.20.30.40 \
   --port 443 \
   --protocol tcp \
@@ -441,7 +441,7 @@ CPU Reference:
 GPU Accelerated Counterpart:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.20.30.40 \
   --port 443 \
   --protocol tcp \
@@ -540,7 +540,7 @@ log: artifacts/logs/defense_validation_http2.log
 #### Step 1: Preflight Verification
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/defense_validation_http2.yaml \
   --dry-run \
   --confirm
@@ -549,7 +549,7 @@ log: artifacts/logs/defense_validation_http2.log
 #### Step 2: Live Defense Validation Run
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/defense_validation_http2.yaml \
   --confirm
 ```
@@ -565,7 +565,7 @@ During execution, the security team simultaneously tracks:
 Re-execute with modified concurrency to evaluate whether defense triggers depend on instantaneous burst rate or aggregate volume:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/defense_validation_http2.yaml \
   --http2-concurrency 120 \
   --count 30000 \

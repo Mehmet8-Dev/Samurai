@@ -2,7 +2,7 @@
 
 Samurai **v3.0.0** is a full native C++17 architectural overhaul. The platform has moved off legacy Python runtime loops and CPython extensions onto a unified CMake-built microservice architecture spanning kernel-bypass L4, stateful L7 (`io_uring` / kTLS / HTTP/2 / QUIC-H3), carrier-grade telecom protocols, consumer and enterprise GPU P2P dataplanes, DPU ARM CUPS offloading, and an RL-driven closed-loop distributed control plane.
 
-> **Licensing:** Samurai v3.0.0 is released under the **GNU Affero General Public License v3.0 (AGPL-3.0)** ([`LICENSE`](LICENSE)). Commercial dual-licensing and dedicated SLA/SLO support agreements are available via [@Mehmet8-Dev](https://github.com/Mehmet8-Dev).
+> **Licensing:** Samurai v3.0.0 is 100% open source under the **GNU Affero General Public License v3.0 (AGPL-3.0)** ([`LICENSE`](LICENSE)). Commercial support, dedicated SLA/SLO agreements, sponsorship, and engineering integration partnerships are available via [@Mehmet8-Dev](https://github.com/Mehmet8-Dev) (`mehmetokur756@gmail.com`).
 
 ---
 

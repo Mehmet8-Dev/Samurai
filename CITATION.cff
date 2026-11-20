@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+title: "Samurai: High-Performance C++17 Network Resilience, Telecom & GPU P2P Dataplane Platform"
+message: "If you use Samurai in academic research, benchmarks, or systems engineering publications, please cite it using this metadata."
+type: software
+authors:
+  - given-names: "Mehmet"
+    family-names: "Okur"
+    email: "mehmetokur756@gmail.com"
+    alias: "Mehmet8-Dev"
+repository-code: "https://github.com/Mehmet8-Dev/Samurai"
+url: "https://github.com/Mehmet8-Dev/Samurai"
+license: AGPL-3.0
+version: "3.0.0"
+date-released: "2026-11-20"
+keywords:
+  - network-testing
+  - dpdk
+  - af-xdp
+  - cuda
+  - gpu-p2p
+  - quic
+  - http3
+  - io-uring
+  - telecom
+  - 5g-cups
+  - cpp17

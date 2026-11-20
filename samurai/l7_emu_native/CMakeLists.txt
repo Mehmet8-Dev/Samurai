@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+include(CheckCXXSourceCompiles)
+
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   pkg_check_modules(OPENSSL QUIET openssl)
@@ -137,7 +139,63 @@ if(NGTCP2_FOUND AND GNUTLS_FOUND)
   target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_WITH_NGTCP2_GNUTLS=1)
 endif()
 if(SAMURAI_QUIC_BACKENDS)
+  target_include_directories(samurai_l7emu PUBLIC
+    ${NGTCP2_INCLUDE_DIRS}
+    ${NGTCP2_GNUTLS_INCLUDE_DIRS}
+    ${NGHTTP3_INCLUDE_DIRS}
+    ${GNUTLS_INCLUDE_DIRS})
   target_link_libraries(samurai_l7emu PUBLIC ${NGTCP2_LIBRARIES} ${NGTCP2_GNUTLS_LIBRARIES} ${NGHTTP3_LIBRARIES} ${GNUTLS_LIBRARIES})
+endif()
+
+if(NGTCP2_FOUND AND NGHTTP3_FOUND)
+  set(_saved_req_includes "${CMAKE_REQUIRED_INCLUDES}")
+  set(_saved_req_libraries "${CMAKE_REQUIRED_LIBRARIES}")
+  set(CMAKE_REQUIRED_INCLUDES ${NGTCP2_INCLUDE_DIRS} ${NGHTTP3_INCLUDE_DIRS})
+  set(CMAKE_REQUIRED_LIBRARIES ${NGTCP2_LIBRARIES} ${NGHTTP3_LIBRARIES})
+
+  check_cxx_source_compiles("
+    #include <ngtcp2/ngtcp2.h>
+    int main() { return ngtcp2_conn_shutdown_stream_read(nullptr, 0, 0, 0); }
+  " SAMURAI_NGTCP2_SHUTDOWN_READ_HAS_FLAGS)
+
+  check_cxx_source_compiles("
+    #include <ngtcp2/ngtcp2.h>
+    int main() { return ngtcp2_conn_shutdown_stream_write(nullptr, 0, 0, 0); }
+  " SAMURAI_NGTCP2_SHUTDOWN_WRITE_HAS_FLAGS)
+
+  check_cxx_source_compiles("
+    #include <nghttp3/nghttp3.h>
+    int main() { return nghttp3_conn_is_remote_qpack_encoder_stream(nullptr, 0); }
+  " SAMURAI_HAVE_NGHTTP3_IS_REMOTE_QPACK_ENCODER_STREAM)
+
+  check_cxx_source_compiles("
+    #include <nghttp3/nghttp3.h>
+    int main() { nghttp3_pri p{}; return nghttp3_conn_set_stream_priority(nullptr, 0, &p); }
+  " SAMURAI_HAVE_NGHTTP3_SET_STREAM_PRIORITY)
+
+  check_cxx_source_compiles("
+    #include <nghttp3/nghttp3.h>
+    int main() { return nghttp3_conn_set_client_stream_priority(nullptr, 0, nullptr, 0); }
+  " SAMURAI_HAVE_NGHTTP3_SET_CLIENT_STREAM_PRIORITY)
+
+  set(CMAKE_REQUIRED_INCLUDES "${_saved_req_includes}")
+  set(CMAKE_REQUIRED_LIBRARIES "${_saved_req_libraries}")
+
+  if(SAMURAI_NGTCP2_SHUTDOWN_READ_HAS_FLAGS)
+    target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_NGTCP2_SHUTDOWN_READ_HAS_FLAGS=1)
+  endif()
+  if(SAMURAI_NGTCP2_SHUTDOWN_WRITE_HAS_FLAGS)
+    target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_NGTCP2_SHUTDOWN_WRITE_HAS_FLAGS=1)
+  endif()
+  if(SAMURAI_HAVE_NGHTTP3_IS_REMOTE_QPACK_ENCODER_STREAM)
+    target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_HAVE_NGHTTP3_IS_REMOTE_QPACK_ENCODER_STREAM=1)
+  endif()
+  if(SAMURAI_HAVE_NGHTTP3_SET_STREAM_PRIORITY)
+    target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_HAVE_NGHTTP3_SET_STREAM_PRIORITY=1)
+  endif()
+  if(SAMURAI_HAVE_NGHTTP3_SET_CLIENT_STREAM_PRIORITY)
+    target_compile_definitions(samurai_l7emu PUBLIC SAMURAI_HAVE_NGHTTP3_SET_CLIENT_STREAM_PRIORITY=1)
+  endif()
 endif()
 
 if(URING_FOUND)

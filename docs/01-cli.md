@@ -9,7 +9,7 @@
 ## 1. Syntax & Core Parameters
 
 ```bash
-./build/samurai/cli/samurai --worker <cpu|gpu|dpdk|afxdp|doca|l7|defense|scenario> [options]
+./build/cli/samurai --worker <cpu|gpu|dpdk|afxdp|doca|l7|defense|scenario> [options]
 ```
 
 ### Essential Parameters
@@ -27,7 +27,7 @@
 
 ### A) CPU Raw Socket UDP Stress Test
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker cpu \
   --target 127.0.0.1 \
   --port 8080 \
@@ -39,7 +39,7 @@
 
 ### B) Kernel-Bypass AF_XDP Line-Rate Packet Generation
 ```bash
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --worker afxdp \
   --target 10.0.0.50 \
   --port 80 \
@@ -50,7 +50,7 @@ sudo ./build/samurai/cli/samurai \
 
 ### C) Hardware-Offloaded DPDK PMD Ring Burst
 ```bash
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --worker dpdk \
   --target 10.0.0.50 \
   --port 443 \
@@ -61,7 +61,7 @@ sudo ./build/samurai/cli/samurai \
 
 ### D) Stateful L7 HTTP/2 Multiplexed Load
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker l7 \
   --target 10.0.0.50 \
   --port 443 \
@@ -75,7 +75,7 @@ sudo ./build/samurai/cli/samurai \
 
 ### E) GPU CUDA Persistent Dataplane Egress
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker gpu \
   --target 10.0.0.50 \
   --port 80 \

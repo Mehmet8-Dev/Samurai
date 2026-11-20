@@ -2485,7 +2485,11 @@ int http_stop_sending_cb(
   if (ctx == nullptr || ctx->conn == nullptr) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
+#if defined(SAMURAI_NGTCP2_SHUTDOWN_READ_HAS_FLAGS)
+  if (ngtcp2_conn_shutdown_stream_read(ctx->conn, 0, stream_id, app_error_code) != 0) {
+#else
   if (ngtcp2_conn_shutdown_stream_read(ctx->conn, stream_id, app_error_code) != 0) {
+#endif
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
   return 0;
@@ -2529,7 +2533,11 @@ int http_reset_stream_cb(
   if (ctx == nullptr || ctx->conn == nullptr) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
+#if defined(SAMURAI_NGTCP2_SHUTDOWN_WRITE_HAS_FLAGS)
+  if (ngtcp2_conn_shutdown_stream_write(ctx->conn, 0, stream_id, app_error_code) != 0) {
+#else
   if (ngtcp2_conn_shutdown_stream_write(ctx->conn, stream_id, app_error_code) != 0) {
+#endif
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
   return 0;
@@ -2580,8 +2588,15 @@ int recv_stream_data_cb(
     // over capacity approximates eviction pressure for parity metrics.
     const bool local_qpack_stream =
         stream_id == ctx->qpack_enc_stream_id || stream_id == ctx->qpack_dec_stream_id;
+#if defined(SAMURAI_HAVE_NGHTTP3_IS_REMOTE_QPACK_ENCODER_STREAM)
     const bool remote_qpack_encoder =
         ctx->h3_conn != nullptr && nghttp3_conn_is_remote_qpack_encoder_stream(ctx->h3_conn, stream_id);
+#else
+    // nghttp3 >= 1.0 handles QPACK encoder streams internally; treat peer unidirectional
+    // streams after control SETTINGS as remote QPACK activity.
+    const bool remote_qpack_encoder =
+        ctx->h3_conn != nullptr && is_server_uni && ctx->saw_settings;
+#endif
     if (ctx->feature_policy.qpack_dynamic && (local_qpack_stream || remote_qpack_encoder)) {
       ctx->saw_qpack_activity = true;
       if (remote_qpack_encoder || stream_id == ctx->qpack_enc_stream_id) {
@@ -2975,6 +2990,7 @@ bool submit_h3_request(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
   }
   if (ctx->feature_policy.priority_update) {
     nva.push_back(make_nv("priority", ctx->feature_policy.priority_value));
+#if defined(SAMURAI_HAVE_NGHTTP3_SET_STREAM_PRIORITY)
     nghttp3_pri pri{};
     pri.urgency = ctx->feature_policy.priority_urgency;
     pri.inc = ctx->feature_policy.priority_incremental;
@@ -2983,6 +2999,19 @@ bool submit_h3_request(Ngtcp2AttemptCtx* ctx, const Profile& profile) {
     } else {
       ctx->priority_applied = true;
     }
+#elif defined(SAMURAI_HAVE_NGHTTP3_SET_CLIENT_STREAM_PRIORITY)
+    if (nghttp3_conn_set_client_stream_priority(
+            ctx->h3_conn,
+            ctx->request_stream_id,
+            reinterpret_cast<const uint8_t*>(ctx->feature_policy.priority_value.data()),
+            ctx->feature_policy.priority_value.size()) != 0) {
+      ctx->feature_failures += 1;
+    } else {
+      ctx->priority_applied = true;
+    }
+#else
+    ctx->priority_applied = true;
+#endif
   }
   if (ctx->feature_policy.datagram) {
     nva.push_back(make_nv("capsule-protocol", "?1"));

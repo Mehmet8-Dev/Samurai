@@ -4,7 +4,7 @@
 
 ## Purpose
 
-This document provides an end-to-end operational playbook for the Samurai Network Resilience Platform (`./build/samurai/cli/samurai`), presenting structured operational workflows for testing, benchmarking, and resilience verification.
+This document provides an end-to-end operational playbook for the Samurai Network Resilience Platform (`./build/cli/samurai`), presenting structured operational workflows for testing, benchmarking, and resilience verification.
 
 Goals:
 
@@ -77,14 +77,14 @@ mkdir -p artifacts/reports artifacts/pcaps artifacts/logs artifacts/configs
 Verify binary and dependencies:
 
 ```bash
-./build/samurai/cli/samurai --self-test
+./build/cli/samurai --self-test
 ```
 
 Inspect available profiles and command flags:
 
 ```bash
-./build/samurai/cli/samurai --help
-./build/samurai/cli/samurai --list-profiles
+./build/cli/samurai --help
+./build/cli/samurai --list-profiles
 ```
 
 ## Tier 1: Parse and Preflight Validation
@@ -94,7 +94,7 @@ Preflight operations transmit zero packets over the wire. This step acts as the 
 ### Example 1: Basic TCP Dry-Run
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.10.20.15 \
   --port 443 \
   --protocol tcp \
@@ -115,7 +115,7 @@ Validation objectives:
 ### Example 2: HTTP/2 Preflight Check
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.10.30.25 \
   --port 443 \
   --attack-vector http2 \
@@ -171,7 +171,7 @@ log: artifacts/logs/web_stress_dev.log
 Execute dry-run from configuration file:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/web_stress_dev.yaml \
   --dry-run \
   --confirm
@@ -180,7 +180,7 @@ Execute dry-run from configuration file:
 Execute live run from configuration file:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --config artifacts/configs/web_stress_dev.yaml \
   --confirm
 ```
@@ -198,7 +198,7 @@ Application-layer baselines evaluate target HTTP/S services under controlled con
 ### Flow A: HTTP Service Baseline
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.10.50.20 \
   --port 8443 \
   --attack-vector http \
@@ -227,7 +227,7 @@ Key measurements delivered:
 ### Flow B: Web Application Firewall and CDN Resilience Evaluation
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.10.50.30 \
   --port 443 \
   --attack-vector http2 \
@@ -262,7 +262,7 @@ Note:
 ### Flow A: HTTP/2 Stateful Profile with Custom TCP Stack
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.10.60.15 \
   --port 443 \
   --attack-vector http2 \
@@ -284,7 +284,7 @@ Note:
 ### Flow B: Native QUIC Strict Capability Gate
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.10.70.40 \
   --port 443 \
   --attack-vector quic \
@@ -317,7 +317,7 @@ These operations require elevated Linux capabilities (`CAP_NET_RAW`, `CAP_NET_AD
 ### Flow A: TX_RING Controlled Dataplane Benchmark
 
 ```bash
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --target 10.20.10.50 \
   --port 443 \
   --protocol tcp \
@@ -352,7 +352,7 @@ Application context:
 ### Flow B: AF_XDP Zero-Copy Benchmark
 
 ```bash
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --target 10.20.20.60 \
   --port 53 \
   --protocol udp \
@@ -396,7 +396,7 @@ Dry-Run -> Short Smoke Run -> Baseline -> Parameter Tuning -> Longevity Soak -> 
 ### Flow A: GPU Readiness Dry-Run
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.21.10.10 \
   --port 443 \
   --protocol tcp \
@@ -426,7 +426,7 @@ Validation objectives:
 Verifies end-to-end functionality of the GPU pipeline in a live transmission cycle.
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.21.10.10 \
   --port 443 \
   --protocol tcp \
@@ -459,7 +459,7 @@ Applicable scenarios:
 Establishes initial reference throughput under default GPU tuning.
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.21.20.20 \
   --port 53 \
   --protocol udp \
@@ -491,7 +491,7 @@ Evaluation objectives:
 High-throughput performance measurement under optimized GPU pipeline settings.
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.21.30.30 \
   --port 443 \
   --protocol tcp \
@@ -526,7 +526,7 @@ Methodological safeguards:
 Evaluates GPU generation throughput coupled with kernel-bypass TX_RING transmission.
 
 ```bash
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --target 10.21.40.40 \
   --port 443 \
   --protocol tcp \
@@ -567,7 +567,7 @@ Diagnostic insights:
 Monitors memory footprint and packet rate stability under extended GPU generation.
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.21.50.50 \
   --port 443 \
   --protocol tcp \
@@ -607,7 +607,7 @@ Critical telemetry metrics:
 ### Flow G: GPU Fault-Injection Longevity Soak
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.21.60.60 \
   --port 443 \
   --protocol tcp \
@@ -644,7 +644,7 @@ To guarantee statistical validity, keep target IP, worker counts, packet totals,
 CPU Baseline Reference:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.21.70.70 \
   --port 53 \
   --protocol udp \
@@ -661,7 +661,7 @@ CPU Baseline Reference:
 GPU Accelerated Counterpart:
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.21.70.70 \
   --port 53 \
   --protocol udp \
@@ -705,7 +705,7 @@ Soak runs evaluate system stability, memory leaks, and performance drift over ex
 ### Flow A: 1-Hour Application Layer Soak
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.30.10.70 \
   --port 443 \
   --attack-vector http \
@@ -736,7 +736,7 @@ Soak runs evaluate system stability, memory leaks, and performance drift over ex
 ### Flow B: Soak with Fault-Injection
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.30.20.80 \
   --port 443 \
   --attack-vector http2 \
@@ -769,7 +769,7 @@ This workflow does not transmit packets over physical interfaces; it synthesizes
 ### Flow A: Short Synthetic PCAP Generation
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --gpu-pcap \
   --gpu-pcap-duration 10 \
   --gpu-pcap-pps 50000 \
@@ -784,7 +784,7 @@ This workflow does not transmit packets over physical interfaces; it synthesizes
 ### Flow B: Realistic Dataset Artifact with Realism Scoring
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --gpu-pcap \
   --gpu-pcap-duration 30 \
   --gpu-pcap-pps 75000 \
@@ -814,7 +814,7 @@ Target use cases:
 ### Flow A: Inspect Capture Metadata
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --pcap-file artifacts/pcaps/gpu_realistic_mix.pcap \
   --pcap-info
 ```
@@ -822,7 +822,7 @@ Target use cases:
 ### Flow B: Timing-Aware Replay
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.50.10.90 \
   --port 443 \
   --attack-vector pcap-replay \
@@ -843,7 +843,7 @@ Target use cases:
 ### Flow C: Layer 2 Replay via TX_RING
 
 ```bash
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --target 10.50.20.91 \
   --port 443 \
   --attack-vector pcap-replay \
@@ -866,7 +866,7 @@ Because runtime traffic model integration is constrained, initial validation sho
 ### Flow A: Traffic Planner Model Validation
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --traffic-model mamba2 \
   --traffic-model-checkpoint artifacts/models/mamba2_lab.ckpt \
   --traffic-model-config artifacts/models/mamba2_lab.yaml \
@@ -884,7 +884,7 @@ Because runtime traffic model integration is constrained, initial validation sho
 ### Flow B: Controlled Live Run with Dataset Capture
 
 ```bash
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --target 10.60.10.100 \
   --port 443 \
   --attack-vector http \

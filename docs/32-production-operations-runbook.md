@@ -21,7 +21,7 @@ This runbook establishes standard operating procedures, baseline deployment conf
 Start the distributed Master daemon with High Availability (HA) and RBAC enabled:
 
 ```bash
-./build/samurai/control/daemon/samurai_master \
+./build/control/daemon/samurai_master \
   --control-listen tcp://0.0.0.0:5099 \
   --api-listen 0.0.0.0:8089 \
   --ha-mode static \
@@ -38,7 +38,7 @@ Start the distributed Master daemon with High Availability (HA) and RBAC enabled
 Start distributed worker daemons across compute nodes:
 
 ```bash
-./build/samurai/control/daemon/samurai_slave \
+./build/control/daemon/samurai_slave \
   --control-endpoints tcp://<MASTER_IP>:5099 \
   --worker afxdp \
   --interface eth0 \

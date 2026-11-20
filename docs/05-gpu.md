@@ -28,7 +28,7 @@ CUDA and DOCA acceleration flags are automatically discovered during CMake confi
 
 ```bash
 # Execute native GPU CUDA worker
-./build/samurai/cli/samurai \
+./build/cli/samurai \
   --worker gpu \
   --target 10.0.0.50 \
   --port 80 \
@@ -37,7 +37,7 @@ CUDA and DOCA acceleration flags are automatically discovered during CMake confi
   --confirm
 
 # Execute DOCA GPUNetIO hardware pipeline
-sudo ./build/samurai/cli/samurai \
+sudo ./build/cli/samurai \
   --worker doca \
   --target 10.0.0.50 \
   --port 80 \
