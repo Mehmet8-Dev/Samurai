@@ -26,14 +26,39 @@ import subprocess
 import unittest
 from pathlib import Path
 
+import pytest
 
+
+@pytest.mark.gpu
 class TestGpuArchitecture(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        profile = os.environ.get("SAMURAI_TEST_PROFILE", "ci_safe").strip().lower() or "ci_safe"
+        if profile != "full":
+            raise unittest.SkipTest("SAMURAI_TEST_PROFILE=ci_safe: skipping gpu test")
+
         cls.repo_root = Path(__file__).resolve().parents[1]
         cls.binary_path = cls.repo_root / "tests" / "native_gpu" / "test_gpu_architecture"
         cls.source_path = cls.repo_root / "tests" / "native_gpu" / "test_gpu_architecture.cpp"
         cls.json_output = cls.repo_root / "docs" / "gpu_architecture_benchmark_results.json"
+
+        cuda_roots = [
+            os.environ.get("CUDA_HOME", ""),
+            os.environ.get("CUDA_PATH", ""),
+            "/usr/local/cuda",
+            "/usr",
+        ]
+        cuda_inc = next(
+            (Path(r) / "include" for r in cuda_roots if r and (Path(r) / "include" / "cuda_runtime.h").exists()),
+            None,
+        )
+        if cuda_inc is None:
+            raise unittest.SkipTest("CUDA toolkit (cuda_runtime.h) not found on this host")
+
+        cuda_lib = cuda_inc.parent / "lib64"
+        build_root = cls.repo_root / "build"
+        if not build_root.exists():
+            build_root = cls.repo_root / "samurai" / "build"
 
         # Build native binary if not yet compiled or source modified
         if not cls.binary_path.exists() or cls.source_path.stat().st_mtime > cls.binary_path.stat().st_mtime:
@@ -45,10 +70,12 @@ class TestGpuArchitecture(unittest.TestCase):
                 f"-I{cls.repo_root}/samurai/core",
                 f"-I{cls.repo_root}/samurai/l4",
                 f"-I{cls.repo_root}/samurai",
-                f"-L{cls.repo_root}/samurai/build/l7_emu_native",
-                f"-L{cls.repo_root}/samurai/build/l4",
-                f"-L{cls.repo_root}/samurai/build/core",
-                f"-L{cls.repo_root}/samurai/build/af_packet",
+                f"-I{cuda_inc}",
+                f"-L{build_root}/l7_emu_native",
+                f"-L{build_root}/l4",
+                f"-L{build_root}/core",
+                f"-L{build_root}/af_packet",
+                *(["-L" + str(cuda_lib)] if cuda_lib.exists() else []),
                 "-Wl,--whole-archive", "-lsamurai_l7emu", "-Wl,--no-whole-archive",
                 "-lsamurai_l4", "-lsamurai_core", "-laf_packet_static",
                 "-lssl", "-lcrypto", "-lpthread", "-ldl", "-lcudart",
