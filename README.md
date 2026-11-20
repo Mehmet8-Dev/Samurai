@@ -241,9 +241,8 @@ Contributions are welcome under our [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). 
 
 ## Contributors
 
-- **Mehmet Okur** ([@Mehmet8-Dev](https://github.com/Mehmet8-Dev)) — Creator & Lead Architect
-- **Sefa** (`sefakocyigit10@gmail.com`) — Contributor
-- **0x4nyroot** ([@0x4nyroot](https://github.com/0x4nyroot)) — Contributor
+- **Mehmet Okur** ([@Mehmet8-Dev](https://github.com/Mehmet8-Dev) · `mehmetokur756@gmail.com`) — Creator & Lead Architect
+- **0x4nyroot** ([@0x4nyroot](https://github.com/0x4nyroot) · `sefakocyigit10@gmail.com`) — Contributor
 
 ---
 
