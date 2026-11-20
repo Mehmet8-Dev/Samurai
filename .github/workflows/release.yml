@@ -68,7 +68,6 @@ jobs:
       - name: Certify Release via Selftests
         run: |
           ./build/control/samurai_control_selftest
-          ./build/licensing/samurai_license_selftest
           ./build/l4/test_tcp_sliding_window
           ./build/l7_emu_native/test_kernel_threaded_l7
           ./build/l7_emu_native/test_l2l3_astf

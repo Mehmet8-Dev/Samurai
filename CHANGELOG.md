@@ -16,12 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - 
 
-## [3.0.0] - 2026-11-15
+## [3.0.0] - 2026-11-20
 
 ### Added
-- **Native C++ CLI, Core & Licensing (`samurai`, `samurai_core`, `samurai_license`)**:
-  - Replaced legacy Python CLI/utils entrypoints with native C++17 `samurai` CLI and `samurai_core` library.
-  - Added offline and HTTP-backed `samurai_license` engine, fail-closed license gating, `--license-key` / `--license-file` flags, and anti-tamper self-integrity checks in CLI and `samurai_master`.
+- **Native C++ CLI & Core (`samurai`, `samurai_core`)**:
+  - Replaced legacy Python CLI/utils entrypoints with native C++17 `samurai` CLI and `samurai_core` library (`target_safety.cpp`, fast JSON parser, structured logging, KPI gates, RFC 2544/3511/8219 compliance suites).
+- **Open Governance, Security & Licensing (`AGPL-3.0`)**:
+  - Licensed under GNU Affero General Public License v3.0 (`LICENSE`), with `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, GitHub Issue/PR templates, Dependabot (`.github/dependabot.yml`), and automated Gitleaks/CodeQL security scanning (`.github/workflows/security.yml`).
 - **Distributed Control Plane, Federation & Clustering (`samurai_master`, `samurai_slave`)**:
   - Multi-master region federation, native Redis/Kubernetes/file-lease leadership election, autoscale controller, management API rate limiting, and in-memory blob cache.
   - Live ZMQ shard reconfigure RPC, dynamic worker chaos failover rebalancing (`TASK-TEST-L5-01`), and native SSH agent push provisioner with `POST /v1/cluster/provision`.

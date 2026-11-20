@@ -70,12 +70,6 @@ Command catalog by workload profile:
 
 # Run report generation
 ./build/samurai/cli/samurai -t 10.0.0.10 -p 443 --run-report --run-report-format both --run-report-dir reports
-
-# License information
-./build/samurai/cli/samurai --license-info
-
-# License activation
-./build/samurai/cli/samurai --license-activate --license-key SAM-XXXX-XXXX-XXXX-XXXX
 ```
 
 ## 2) All CLI Flags
@@ -531,18 +525,6 @@ Notes:
 | `--fault-after-s` | `0.0` | `-` | - | Delay in seconds before triggering fault injection (0: disabled). |
 | `--fault-duration-s` | `2.0` | `-` | - | Duration of simulated fault condition in seconds. |
 
-### License Management
-
-| Flag | Default | Choices | ENV | Description |
-|---|---|---|---|---|
-| `--license-key` | `-` | `-` | `SAMURAI_LICENSE_KEY` | License activation key string (SAM-XXXX-XXXX-XXXX-XXXX). |
-| `--license-file` | `-` | `-` | - | Path to file containing product license key string. |
-| `--license-info` | `False` | `-` | - | Display current license entitlement details and exit. |
-| `--license-deactivate` | `False` | `-` | - | Deactivate active license on current node and exit. |
-| `--license-activate` | `False` | `-` | - | Activate node entitlement using provided license key and exit. |
-| `--license-account` | `False` | `-` | - | Display enterprise account status, allocated nodes, and subscription term. |
-| `--license-trial` | `False` | `-` | - | Initialize 14-day evaluation license on current node. |
-
 ## 3) All CLI Environment Variables (`SAMURAI_*`)
 
 This table catalogs all environment variables recognized by the runtime architecture across `samurai/cli/*.py` and native components:
@@ -623,7 +605,6 @@ This table catalogs all environment variables recognized by the runtime architec
 | `SAMURAI_L7_QUIC_ENGINE` | `--l7-quic-engine` | `samurai/cli/args.py:1133`<br>`samurai/cli/env.py:130` |
 | `SAMURAI_L7_QUIC_REQUIRE_NATIVE` | `--l7-quic-require-native` | `samurai/cli/args.py:1139`<br>`samurai/cli/env.py:131` |
 | `SAMURAI_LAB_PROFILE` | `--lab-profile` | `samurai/cli/args.py:957`<br>`samurai/cli/env.py:113` |
-| `SAMURAI_LICENSE_KEY` | `--license-key` | `samurai/cli/app.py:32`<br>`samurai/cli/app.py:165`<br>`samurai/cli/app.py:182`<br>`samurai/cli/args.py:1813` |
 | `SAMURAI_LOSS_FAIL_PCT` | - | `samurai/cli/env.py:24` |
 | `SAMURAI_LOSS_IFACE` | - | `samurai/cli/env.py:27`<br>`samurai/cli/env.py:29` |
 | `SAMURAI_LOSS_REPORT_OUT` | - | `samurai/cli/env.py:32`<br>`samurai/cli/env.py:34` |
@@ -667,9 +648,6 @@ General evaluation hierarchy (highest to lowest):
 1. Command-line flag argument
 2. YAML configuration file entry (`--config`)
 3. Environment variable or parser default
-
-License evaluation hierarchy:
-`--license-key` > `SAMURAI_LICENSE_KEY` > `~/.samurai/license.key`.
 
 Control plane security note:
 Sensitive token credentials and secrets should be injected via environment variables rather than command-line arguments to prevent exposure in process listing tables (e.g., `SAMURAI_CLUSTER_SECRET`, `SAMURAI_MANAGEMENT_API_*`).

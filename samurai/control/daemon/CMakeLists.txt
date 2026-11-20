@@ -3,9 +3,7 @@
 # supervisor to execute dispatched shards against the native worker binaries.
 
 add_executable(samurai_master master_main.cpp)
-target_include_directories(samurai_master PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../../licensing)
-target_link_libraries(samurai_master PRIVATE samurai_control samurai_license)
+target_link_libraries(samurai_master PRIVATE samurai_control)
 
 add_executable(samurai_slave
   slave_main.cpp

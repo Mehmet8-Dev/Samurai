@@ -19,7 +19,6 @@ This document maps the core libraries, native C++ subsystems, and operational bo
 | **`samurai/l7_emu_native/`**| `samurai_l7emu` | Stateful HTTP/1.1, HTTP/2 (nghttp2), QUIC/H3 (ngtcp2), DNS emulation engines, and L2/L3 protocol stack (ARP, DHCP, IGMP, ND). |
 | **`samurai/scenario_engine_native/`** | `samurai_scenario_engine` | Web/Mobile persona DSL compiler (`compiler.cpp`), event-loop scheduler (`scheduler.cpp`), microsecond SLA compliance engine (`sla.cpp`). |
 | **`samurai/cpu_native/`** | `cpu_native_static` | Optimized CPU raw socket and packet ring generators, dynamic spoofing pools, and amplification vectors. |
-| **`samurai/licensing/`** | `samurai_licensing` | Hardware ID (HWID) hashing, cryptographically signed license verification, and enterprise feature gates (`gates.cpp`). |
 
 ---
 

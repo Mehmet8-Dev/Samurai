@@ -35,9 +35,8 @@ target_include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../orchestrator
   ${CMAKE_CURRENT_SOURCE_DIR}/../zmq/daemon
-  ${CMAKE_CURRENT_SOURCE_DIR}/../licensing
   ${LIBZMQ_INCLUDE_DIRS})
 target_link_directories(samurai PRIVATE ${LIBZMQ_LIBRARY_DIRS})
 find_package(OpenSSL REQUIRED)
-target_link_libraries(samurai PRIVATE samurai_core samurai_license ${LIBZMQ_LIBRARIES} pthread OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(samurai PRIVATE samurai_core ${LIBZMQ_LIBRARIES} pthread OpenSSL::SSL OpenSSL::Crypto)
 target_compile_options(samurai PRIVATE ${LIBZMQ_CFLAGS_OTHER})

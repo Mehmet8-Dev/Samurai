@@ -158,6 +158,6 @@ sudo ./build/samurai/cli/samurai \
 - [00-overview.md](00-overview.md) — Master System Overview & Subsystem Map
 - [01-cli.md](01-cli.md) — Native C++ CLI Reference
 - [06-af_xdp-fast_sender.md](06-af_xdp-fast_sender.md) — AF_XDP Zero-Copy Implementation
-- [34-dpdk-kurulum-ve-hazirlik-rehberi.md](34-dpdk-kurulum-ve-hazirlik-rehberi.md) — DPDK Environment Setup & PMD Configuration
+- [34-dpdk-environment-setup-guide.md](34-dpdk-environment-setup-guide.md) — DPDK Environment Setup & PMD Configuration
 - [40-distributed-control-plane-handbook.md](40-distributed-control-plane-handbook.md) — Multi-Node Distributed Cluster Architecture
 - [45-commodity-gpu-nic-p2p-packet-engine-report.md](45-commodity-gpu-nic-p2p-packet-engine-report.md) — GPU-NIC P2P Zero-Copy Dataplane Report

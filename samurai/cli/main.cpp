@@ -6,21 +6,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <fstream>
-#include <sstream>
 #include <string>
 
 #include <unistd.h>
 
-#include "anti_tamper.hpp"
 #include "args.hpp"
-#include "cache.hpp"
-#include "client.hpp"
-#include "constants.hpp"
-#include "gates.hpp"
-#include "hwid.hpp"
 #include "kpi_gate.hpp"
-#include "license_types.hpp"
 #include "options.hpp"
 #include "profiles.hpp"
 #include "reporting.hpp"
@@ -48,13 +39,6 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  // 1. Anti-tamper & binary self-integrity verification (after diagnostic flags)
-  const licensing::IntegrityResult integrity = licensing::VerifySelfIntegrity();
-  if (!integrity.ok) {
-    std::fprintf(stderr, "samurai security violation: %s\n", integrity.reason.c_str());
-    return 126;
-  }
-
   const bool is_rfc_run = !opt.run_rfc_suite.empty();
   if (is_rfc_run) {
     if (opt.worker_name.empty()) {
@@ -70,105 +54,12 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  // 2. License resolution and feature-gate enforcement
-  std::string license_key = opt.license_key;
-  if (license_key.empty() && !opt.license_file.empty()) {
-    std::ifstream f(opt.license_file);
-    if (f) {
-      std::stringstream ss;
-      ss << f.rdbuf();
-      license_key = ss.str();
-      const auto first = license_key.find_first_not_of(" \t\r\n");
-      const auto last = license_key.find_last_not_of(" \t\r\n");
-      license_key = (first == std::string::npos) ? "" : license_key.substr(first, last - first + 1);
-    }
-  }
-  if (license_key.empty()) {
-    license_key = licensing::EnvOr("SAMURAI_LICENSE_KEY", "");
-  }
-  if (license_key.empty()) {
-    std::ifstream f(licensing::LicenseKeyFile());
-    if (f) {
-      std::stringstream ss;
-      ss << f.rdbuf();
-      license_key = ss.str();
-      const auto first = license_key.find_first_not_of(" \t\r\n");
-      const auto last = license_key.find_last_not_of(" \t\r\n");
-      license_key = (first == std::string::npos) ? "" : license_key.substr(first, last - first + 1);
-    }
-  }
-
-  const std::string hwid = licensing::GetHardwareId();
-  licensing::LicenseResult lr;
-  licensing::HttpLicenseClient license_client(licensing::LicenseServerUrl(), licensing::RequestTimeoutS());
-
-  if (licensing::IsDevMode()) {
-    lr.valid = true;
-    lr.tier = licensing::Tier::kEnterprise;
-    lr.features = licensing::TierFeatures(licensing::Tier::kEnterprise);
-  } else if (!license_key.empty()) {
-    lr = license_client.Validate(license_key, hwid);
-    if (lr.valid) {
-      licensing::SaveCache(lr, hwid);
-    } else {
-      licensing::LicenseResult cached;
-      if (licensing::LoadCache(hwid, cached) && cached.valid) {
-        lr = cached;
-      } else {
-        std::fprintf(stderr, "samurai license error: license validation failed: %s\n",
-                     lr.reason.empty() ? "invalid license key" : lr.reason.c_str());
-        return 2;
-      }
-    }
-  } else {
-    if (!licensing::LoadCache(hwid, lr) || !lr.valid) {
-      lr.valid = true;
-      lr.tier = licensing::Tier::kCommunity;
-      lr.features = licensing::TierFeatures(licensing::Tier::kCommunity);
-      lr.limits = licensing::TierLimitsFor(licensing::Tier::kCommunity);
-    }
-  }
-
-  licensing::GateInput gate_in;
-  gate_in.attack_vector = opt.job.attack_vector.empty() ? opt.job.protocol : opt.job.attack_vector;
-  gate_in.compute_backend = opt.worker_name;
-  gate_in.spoof = opt.job.spoof;
-  gate_in.rps = opt.job.target_rps;
-  if (opt.job.target_rps > 0.0 && opt.job.packet_count > 0) {
-    gate_in.duration = static_cast<long>(opt.job.packet_count / opt.job.target_rps);
-  } else if (opt.job.packet_count > 0) {
-    gate_in.duration = 1;
-  }
-  gate_in.license_key = license_key;
-  gate_in.license_file = opt.license_file;
-
-  licensing::GateResult gate_res = licensing::EnforceFeatureGates(gate_in, lr, &license_client);
-  if (!gate_res.ok) {
-    std::fprintf(stderr, "samurai license error: %s\n%s\n", gate_res.error.c_str(), gate_res.upgrade_hint.c_str());
-    return 2;
-  }
-  for (const auto& w : gate_res.warnings) {
-    std::fprintf(stderr, "samurai license warning: %s\n", w.c_str());
-  }
-  if (gate_res.rps > 0.0 && (opt.job.target_rps <= 0.0 || opt.job.target_rps > gate_res.rps)) {
-    opt.job.target_rps = gate_res.rps;
-  }
-  if (gate_res.duration > 0 && gate_in.duration > gate_res.duration && opt.job.target_rps > 0.0) {
-    opt.job.packet_count = static_cast<uint32_t>(gate_res.duration * opt.job.target_rps);
-  }
-
   if (is_rfc_run) {
     cli::Rfc2544Config c2544;
     cli::Rfc3511Config c3511;
     cli::Rfc8219Config c8219;
     if (opt.job.packet_size > 0) {
       c2544.packet_size_bytes = opt.job.packet_size;
-    }
-    if (gate_res.rps > 0.0) {
-      c2544.max_rate_rps = std::min(c2544.max_rate_rps, gate_res.rps);
-      c2544.min_rate_rps = std::min(c2544.min_rate_rps, std::max(1.0, c2544.max_rate_rps * 0.1));
-      c2544.resolution_rps = std::min(c2544.resolution_rps, std::max(1.0, c2544.max_rate_rps * 0.05));
-      c3511.target_cps = std::min(c3511.target_cps, gate_res.rps);
     }
 
     bool live_dataplane = opt.confirm && !opt.job.target_ip.empty();

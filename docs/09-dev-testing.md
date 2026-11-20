@@ -32,9 +32,6 @@ Each major architectural layer includes a standalone native validation harness:
 
 # 3. Scenario Engine (DSL, Compiler, and SLA Gates)
 ./build/samurai/scenario_engine_native/samurai_scenario_engine_selftest
-
-# 4. Licensing, HMAC, and Access Token Tests
-./build/samurai/licensing/samurai_licensing_selftest
 ```
 
 ---

@@ -52,7 +52,7 @@ export SAMURAI_XDP_QUEUE_ID=0
 
 ### Option B: DPDK Driver (Kernel-Bypass, Line-Rate PPS)
 
-Refer to [`docs/34-dpdk-kurulum-ve-hazirlik-rehberi.md`](34-dpdk-kurulum-ve-hazirlik-rehberi.md).
+Refer to [`docs/34-dpdk-environment-setup-guide.md`](34-dpdk-environment-setup-guide.md).
 
 ```bash
 # 1) Validate DPDK host environment

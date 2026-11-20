@@ -1,51 +1,51 @@
-# Tüketici Sınıfı GPU (GeForce) Otonom Bare-Metal PMD ve GPU-Initiated Doorbell Mimarisi
+# Consumer-Grade GPU (GeForce) Autonomous Bare-Metal PMD & GPU-Initiated Doorbell Architecture
 
-**Proje:** Samurai Yüksek Başarımlı Paket Motoru (Autonomous Bare-Metal GPU PMD)  
-**Yazar:** Antigravity Sistem Araştırma ve Çekirdek Mühendisliği  
-**Tarih:** 31 Ekim 2026  
-**Hedef Donanım:** Tüketici Sınıfı NVIDIA GeForce GPU (GTX 1650 / RTX Serisi) + Standart PCIe NIC (Realtek / Intel / Mellanox)  
-**Doküman Kodu:** `DOC-SAMURAI-GPU-PMD-46`
+**Project:** Samurai High-Performance Packet Engine (Autonomous Bare-Metal GPU PMD)  
+**Author:** Antigravity Systems Research & Core Engineering  
+**Date:** October 31, 2026  
+**Target Hardware:** Consumer-Grade NVIDIA GeForce GPU (GTX 1650 / RTX Series) + Standard PCIe NIC (Realtek / Intel / Mellanox)  
+**Document Code:** `DOC-SAMURAI-GPU-PMD-46`
 
 ---
 
 ![Samurai Autonomous Bare-Metal DPU/GPU Doorbell & Flow Dataplane](assets/diagrams/samurai_doca_dpu_architecture.svg)
 
-## 1. Yönetici Özeti ve Problem Tanımı
+## 1. Executive Summary and Problem Statement
 
-Yüksek hızlı paket üretiminde ve telekom/DDoS stres testlerinde modern GPU'lar (CUDA çekirdekleri), GDDR6/HBM bellek bant genişliğini kullanarak saniyede **50 ila 300+ milyon paket (Mpps)** üretebilme potansiyeline sahiptir. Ancak geleneksel paket motorlarında ve hatta standart DPDK yapılarında bu potansiyel **CPU Doorbell Darboğazı** (CPU Doorbell Bottleneck) nedeniyle fiziksel olarak kısıtlanmaktadır:
+In high-speed packet generation and telecom/resilience stress testing, modern GPUs (CUDA cores) can synthesize **50 to 300+ million packets per second (Mpps)** using GDDR6/HBM memory bandwidth. However, in traditional packet engines—and even standard DPDK designs—this potential is physically capped by the **CPU Doorbell Bottleneck**:
 
 ```
-[GELENEKSEL DPDK DARBOĞAZI]
+[TRADITIONAL DPDK BOTTLENECK]
 CUDA GPU (GDDR6)           CPU lcore (DRAM / L3)               PCIe NIC (MMIO)
 ┌──────────────┐           ┌──────────────────┐               ┌──────────────┐
 │ 100+ Mpps    │           │ rte_eth_tx_burst │  MMIO MWr TLP │ HW TX Queue  │
-│ Paket Üretimi│──[BAR1]──>│ Descriptor Yazma │──────────────>│ Doorbell     │
+│ Packet Synth │──[BAR1]──>│ Write Descriptor │──────────────>│ Doorbell     │
 │ GDDR6        │           │ (15-25 Mpps Cap) │               │ Kick         │
 └──────────────┘           └──────────────────┘               └──────────────┘
                                   ▲
-                       [SİSTEM DARBOĞAZI: CPU]
+                       [SYSTEM BOTTLENECK: CPU]
 ```
 
-### CPU Doorbell Darboğazının Matematiksel Kökü
-1. Tek bir modern x86_64 CPU çekirdeği (lcore), DPDK poll-mode driver (PMD) döngüsünde bellek kopyalaması yapmasa dahi (sıfır kopyalı BAR1 IOVA durumunda bile) descriptor formatlama, halka göstergelerini güncelleme ve PCIe MMIO yazmaçına `writel()` (doorbell kick) tıklama işlemlerinde saniyede en fazla **15–25 Mpps** işleyebilir.
-2. 40 Gbps / 100 Gbps hat hızlarında 64 baytlık paket akışını doyurmak için gereken 60–148 Mpps paket oranı, 4 ila 8 adet izole CPU çekirdeğini (lcore) tamamen tüketir.
-3. Kurumsal dünyada NVIDIA, bu sorunu **DOCA GPUNetIO** adını verdiği donanımsal mekanizma ile çözmektedir; ancak DOCA GPUNetIO, kurumsal BlueField DPU ve ConnectX ağ kartları ile A100/H100 kurumsal GPU'larına yazılımsal ve donanımsal lisans anahtarlarıyla kilitlenmiştir. Tüketici sınıfı GeForce GTX/RTX kartlarda çalıştırılamaz.
+### Mathematical Root of the CPU Doorbell Bottleneck
+1. A single modern x86_64 CPU core (`lcore`) inside a DPDK poll-mode driver (PMD) loop—even with zero memory copies (zero-copy BAR1 IOVA)—tops out at **15–25 Mpps** due to descriptor formatting, ring index updates, and PCIe MMIO `writel()` doorbell kicks.
+2. Sustaining the 60–148 Mpps rate required for 40 Gbps / 100 Gbps links with 64-byte frames completely saturates 4 to 8 isolated CPU cores.
+3. Enterprise deployments solve this with **NVIDIA DOCA GPUNetIO**, which is hardware- and license-gated to BlueField DPUs, ConnectX NICs, and A100/H100 enterprise GPUs, making it unusable on consumer GeForce GTX/RTX cards.
 
-### Samurai Çözümü: Bare-Metal GPU PMD ve GPU-Initiated Doorbell
-Samurai, harici bir CPU DPDK işlemcisine veya kurumsal DOCA kütüphanesine ihtiyaç duymadan;
-* Tüketici sınıfı GeForce GPU'ların doğrudan ağ kartı fiziksel PCIe MMIO BAR yazmaçlarına erişmesini sağlar (`cudaHostRegisterIoMemory`).
-* Donanım TX descriptor'larını GPU warp iş parçacıklarının doğrudan oluşturmasını sağlar.
-* Doorbell tıklamasını (`TPPoll`, `TDT`, `BlueFlame`) GPU içinden tek bir PCIe `Memory Write (MWr)` TLP paketi olarak ağ kartına basar.
-* Tamamlanan paketleri GPU tarafında otonom olarak temizleyen bir **Completion Reaper** çalıştırır.
+### Samurai Solution: Bare-Metal GPU PMD & GPU-Initiated Doorbell
+Without requiring an external CPU DPDK forwarder or enterprise DOCA libraries, Samurai enables:
+* Direct mapping of NIC physical PCIe MMIO BAR registers into consumer GeForce GPU address space (`cudaHostRegisterIoMemory`).
+* Direct construction of hardware TX descriptors by GPU warp threads.
+* Autonomous GPU-initiated doorbell kicks (`TPPoll`, `TDT`, `BlueFlame`) emitted directly from the GPU as a PCIe `Memory Write (MWr)` TLP.
+* An autonomous GPU-side **Completion Reaper** that reclaims completed descriptor slots.
 
 ---
 
-## 2. PCIe Katmanı ve Doğrudan MMIO Eşleme (`cudaHostRegisterIoMemory`)
+## 2. PCIe Layer & Direct MMIO Mapping (`cudaHostRegisterIoMemory`)
 
-PCIe spesifikasyonuna (PCI-SIG) göre ağ kartlarının kontrol yazmaçları (Control & Status Registers - CSR) ve iletim tetikleyicileri (TX Doorbells), cihazın PCIe BAR (Base Address Register) adres aralığında yer alır.
+Per the PCIe specification (PCI-SIG), NIC Control & Status Registers (CSRs) and transmit triggers (TX Doorbells) reside within the device's PCIe Base Address Register (BAR) memory windows.
 
-### A. Donanım Yazmaçlarının CUDA Cihaz Adres Alanına Eşlenmesi
-Tüketici sınıfı GeForce sürücülerinde ve Linux çekirdeğinde sysfs üzerindeki fiziksel PCI kaynakları `/sys/bus/pci/devices/<BDF>/resource<BAR>` dosya yolu üzerinden açılabilir.
+### A. Mapping Hardware Registers into CUDA Device Address Space
+On consumer GeForce drivers and Linux kernels, physical PCI resources exposed via sysfs can be opened from `/sys/bus/pci/devices/<BDF>/resource<BAR>`:
 
 ```
        /sys/bus/pci/devices/0000:02:00.0/resource2 (Realtek MMIO BAR2)
@@ -54,20 +54,20 @@ Tüketici sınıfı GeForce sürücülerinde ve Linux çekirdeğinde sysfs üzer
                                  │
                             mmap(MAP_SHARED)
                                  ▼
-                     Host Sanal Bellek (Host VA)
+                     Host Virtual Memory (Host VA)
                                  │
        cudaHostRegister(cudaHostRegisterIoMemory | cudaHostRegisterMapped)
                                  ▼
-                    CUDA Cihaz Adres Alanı (Dev Ptr)
-             volatile uint8_t* dev_nic_mmio_base (GPU Erişilebilir)
+                    CUDA Device Address Space (Dev Ptr)
+             volatile uint8_t* dev_nic_mmio_base (GPU Accessible)
 ```
 
-Bu sayede GPU çekirdeği (CUDA kernel), `dev_nic_mmio_base + offset` adresine doğrudan bir `st.global.u32` (veya `st.global.u8`) talimatı vererek PCIe köprüsü üzerinden ağ kartının yazmaçına `Memory Write (MWr)` TLP paketi gönderebilir.
+This allows a CUDA kernel to execute `st.global.u32` (or `st.global.u8`) directly against `dev_nic_mmio_base + offset`, sending a `Memory Write (MWr)` TLP across the PCIe switch directly into the NIC register:
 
 ```cpp
 // samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh
 __device__ inline void device_mmio_write8(volatile uint8_t* addr, uint8_t val) {
-  __threadfence_system(); // Sistem genelinde (PCIe Root Complex) bellek çiti
+  __threadfence_system(); // System-wide (PCIe Root Complex) memory fence
   *addr = val;
 }
 
@@ -79,21 +79,21 @@ __device__ inline void device_mmio_write32(volatile uint32_t* addr, uint32_t val
 
 ---
 
-## 3. Çoklu Satıcı (Multi-Vendor) TX Descriptor Mimarisi
+## 3. Multi-Vendor TX Descriptor Architecture
 
-Farklı ağ kartı üreticileri (Realtek, Intel, Mellanox) DMA iletimi için bellekte 16 baytlık veya 64 baytlık özel tanımlayıcı (descriptor) halkaları kullanır. Samurai Bare-Metal GPU PMD, bu yapıları doğrudan GPU bellek modelinde tanımlamıştır:
+Different NIC vendors (Realtek, Intel, Mellanox) use 16-byte or 64-byte hardware descriptor rings for DMA transmission. Samurai's Bare-Metal GPU PMD defines these hardware layouts directly inside the GPU memory model:
 
 ### 1. Realtek RTL8168/RTL8169/RTL8411 (`Rtl8169TxDesc`)
-16 baytlık donanım TX tanımlayıcısı:
+16-byte hardware TX descriptor:
 ```
 Byte:   0           3 4           7 8          11 12         15
        ┌─────────────┬─────────────┬─────────────┬─────────────┐
        │    opts1    │    opts2    │   addr_lo   │   addr_hi   │
        └─────────────┴─────────────┴─────────────┴─────────────┘
 ```
-* **`opts1`:** `DescOwn (bit 31)`: Donanım sahipliği (1 = Ağ kartı okuyor, 0 = GPU serbest bıraktı). `RingEnd (bit 30)`: Halka sonu biti. `FirstSegment (bit 29)` + `LastSegment (bit 28)`. Düşük 16 bit: Paket uzunluğu.
-* **`addr_lo / addr_hi`:** Paketin Vulkan BAR1 GDDR6 fiziksel veri yolu adresi (IOMMU IOVA).
-* **Doorbell Yazmacı:** `TPPoll` (Transmit Priority Poll, Ofset `0x38`). GPU bu adrese `0x40` (`NPQ - Normal Priority Queue poll`) yazdığında ağ kartı DMA motoru derhal BAR1'den paketi okumaya başlar.
+* **`opts1`:** `DescOwn (bit 31)`: Hardware ownership (1 = NIC reading, 0 = released to GPU). `RingEnd (bit 30)`: End-of-ring wrap bit. `FirstSegment (bit 29)` + `LastSegment (bit 28)`. Low 16 bits: packet length.
+* **`addr_lo / addr_hi`:** Packet physical PCIe bus address in Vulkan BAR1 GDDR6 (IOMMU IOVA).
+* **Doorbell Register:** `TPPoll` (Transmit Priority Poll, Offset `0x38`). When the GPU writes `0x40` (`NPQ - Normal Priority Queue poll`), the NIC DMA engine immediately begins fetching descriptors from BAR1.
 
 ### 2. Intel e1000e (1GbE 82574L / I219) (`E1000eTxDesc`)
 ```
@@ -103,32 +103,32 @@ Byte:   0           7 8           9 10    11 12         15
        └─────────────┴─────────────┴────────┴─────────────┘
 ```
 * **Registers:** `TDBAL` (`0x3800`), `TDLEN` (`0x3808`), `TXDCTL` (`0x3828`), `TDT` (`0x3818 - Transmit Descriptor Tail`).
-* **Doorbell:** GPU, kuyruk kuyruk göstergesini (`TDT`) yeni indeks değerine set ederek iletimi başlatır.
+* **Doorbell:** The GPU updates the Transmit Descriptor Tail (`TDT`) index to trigger DMA egress.
 
 ### 3. Intel ixgbe (10GbE 82599 / X520 / X540 / X550) (`IxgbeAdvTxDesc`)
-Gelişmiş 16 baytlık iletim tanımlayıcısı:
+Advanced 16-byte transmit descriptor:
 * **Registers:** `IXGBE_TDBAL(q)` (`0x6000 + 0x40*q`), `IXGBE_TDT(q)` (`0x6018 + 0x40*q`).
-* **Doorbell:** GPU, `IXGBE_TDT(q) = (head + burst_count) % ring_size` yazarak 10G hızında DMA isteği tetikler.
+* **Doorbell:** The GPU writes `IXGBE_TDT(q) = (head + burst_count) % ring_size` to trigger 10G wire-rate DMA reads.
 
 ### 4. Mellanox ConnectX mlx5 (`Mlx5TxWqe`)
-64 baytlık Work Queue Element (WQE):
-* **Control Segment (16B):** Opcode, WQE index, qp_num, ds.
-* **Data Segment (16B):** Byte count, lkey (MKey), BAR1 GDDR6 IOVA.
-* **Doorbell:** UAR (User Access Region) sayfası veya BlueFlame register'ına 64-bit atomic write.
+64-byte Work Queue Element (WQE):
+* **Control Segment (16B):** Opcode, WQE index, `qp_num`, `ds`.
+* **Data Segment (16B):** Byte count, `lkey` (`MKey`), BAR1 GDDR6 IOVA.
+* **Doorbell:** 64-bit atomic write to the UAR (User Access Region) page or BlueFlame register.
 
 ---
 
-## 4. GPU-Side Completion Reaper & Backpressure Mekanizması
+## 4. GPU-Side Completion Reaper & Backpressure Mechanism
 
-Halka yapısında paket iletimi gerçekleştikçe ağ kartı DMA işlemi tamamlanan descriptor'ların sahiplik bitini (`DescOwn` veya `DD - Descriptor Done`) temizler. Geleneksel sistemlerde bunu CPU yoklar (polling). Samurai Bare-Metal GPU PMD'de ise bu işlem **tamamen GPU warp seviyesinde** otonom yapılır:
+As packets transmit over the ring, the NIC DMA engine clears the descriptor ownership bit (`DescOwn` or `DD - Descriptor Done`). Traditional drivers poll this from the CPU; Samurai's Bare-Metal GPU PMD handles reaping **autonomously at GPU warp level**:
 
 ```cpp
 // samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh
 __device__ inline uint32_t device_reap_nic_tx_descriptor(
     GeforceP2pGpuDeviceTxq* txq,
     uint32_t max_to_reap) {
-  // NIC donanımının paketi tele basıp bitirip bitirmediğini GPU doğrudan VRAM'den okur
-  // Realtek r8169 için opts1 içerisindeki DescOwn (bit 31) 0'a düşmüşse iletim bitmiştir.
+  // GPU reads VRAM directly to check whether NIC hardware finished wire egress
+  // For Realtek r8169, DescOwn (bit 31) in opts1 == 0 means transmission completed.
   ...
   txq->clean_head = (clean_head + reaped) & (txq->ring_size - 1u);
   atomicAdd(&txq->stats.reaped_completions, reaped);
@@ -136,25 +136,25 @@ __device__ inline uint32_t device_reap_nic_tx_descriptor(
 }
 ```
 
-### Sıfır Paket Kaybı Garantisi (Hardware Backpressure)
-Eğer GPU ağ kartının tel hızından daha hızlı descriptor üretirse, halka başa sardığında (`ring wrap`) henüz ağ kartı tarafından okunmamış tanımlayıcılar ezilmez:
-* `device_p2p_txq_try_enqueue()` fonksiyonu `occupied = (write_tail - clean_head)` farkını hesaplar.
-* Kapasite dolduğunda GPU otomatik olarak `device_reap_nic_tx_descriptor()` çalıştırarak yer açar.
-* Eğer hat fiziksel olarak tıkalıysa (kablo takılı değil veya PHY doluysa), `backpressure_drops` atomik sayacı artırılır ve mevcut paketler donanım onaylayana kadar bekletilir.
+### Zero-Overwrite Guarantee (Hardware Backpressure)
+If the GPU generates descriptors faster than the NIC line rate, ring wraparound will not overwrite descriptors still owned by the NIC:
+* `device_p2p_txq_try_enqueue()` computes `occupied = (write_tail - clean_head)`.
+* When capacity fills, the GPU invokes `device_reap_nic_tx_descriptor()` to reclaim completed slots.
+* If the physical link is congested or disconnected, `backpressure_drops` increments atomically and active packets wait safely until hardware acknowledges completion.
 
 ---
 
-## 5. Başarım Özeti ve Doğrulama
+## 5. Verification Summary
 
-Live sistemde (AMD Ryzen 5 5600H + NVIDIA GeForce GTX 1650 + Realtek Gigabit RTL8111/8168) yapılan `test_gpu_architecture` Section 2C ve 2D testleri ile kanıtlanan sonuçlar:
+Results verified on live hardware (AMD Ryzen 5 5600H + NVIDIA GeForce GTX 1650 + Realtek Gigabit RTL8111/8168) via `test_gpu_architecture` Sections 2C and 2D:
 
-| Bileşen | Ölçülen Durum | Doğrulama Çıktısı |
+| Component | Measured Status | Verification Output |
 | :--- | :--- | :--- |
-| **Vulkan BAR1 GDDR6 Fiziksel IOVA** | Doğrulandı | `0xfcc02e0000` |
-| **PCIe MMIO BAR2 Mapping (`cudaHostRegisterIoMemory`)** | Doğrulandı | `dev_ptr = 0x7a621be3e000` |
-| **GPU-Initiated Descriptor Burst** | 32 Tanımlayıcı | Realtek `opts1 = 0xf000005f` |
-| **GPU-Initiated Doorbell Kick** | 2 Kick | `TPPoll (0x38) = 0x40` |
-| **Ring-Wrap Otonom Reaping** | 32 Tamamlanma | `gpu_reaped_completions == 32u`, 0 Backpressure Drop |
-| **CPU Müdahalesi** | %0 (Sıfır Thread) | CPU çekirdekleri tamamen boştadır |
+| **Vulkan BAR1 GDDR6 Physical IOVA** | Verified | `0xfcc02e0000` |
+| **PCIe MMIO BAR2 Mapping (`cudaHostRegisterIoMemory`)** | Verified | `dev_ptr = 0x7a621be3e000` |
+| **GPU-Initiated Descriptor Burst** | 32 Descriptors | Realtek `opts1 = 0xf000005f` |
+| **GPU-Initiated Doorbell Kick** | 2 Kicks | `TPPoll (0x38) = 0x40` |
+| **Ring-Wrap Autonomous Reaping** | 32 Completions | `gpu_reaped_completions == 32u`, 0 Backpressure Drops |
+| **CPU Intervention** | 0% (Zero Threads) | Host CPU cores remain completely idle |
 
-Bu mimari ile Samurai, kurumsal Mellanox DOCA lisanslarına ihtiyaç kalmaksızın tüketici sınıfı donanımlarda telekom ve yük testi yapabilecek tam otonom bir veri düzlemine kavuşmuştur.
+With this architecture, Samurai achieves a fully autonomous dataplane capable of telecom and stress testing on commodity hardware without enterprise Mellanox DOCA licenses.

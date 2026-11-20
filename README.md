@@ -1,8 +1,21 @@
 # Samurai Network Resilience & Line-Rate Stress Platform
 
-Samurai (Release 3.0.0) is an enterprise-grade, high-performance network resilience and line-rate stress testing platform designed strictly for authorized lab and infrastructure validation environments.
+Samurai (Release 3.0.0) is a high-performance network resilience, carrier-telecom emulation, and line-rate stress testing platform designed strictly for authorized lab and infrastructure validation environments.
 
-The platform is engineered in modern **C++ (C++17)** with zero runtime Python latency, featuring a **ZeroMQ (ZMQ) binary IPC wire protocol**, **Kernel-Bypass (AF_XDP, DPDK)** drivers, **NVIDIA CUDA & DOCA GPUNetIO packet synthesis**, and a **64-shard Userspace TCP/L7 engine**.
+The platform is engineered in modern **C++ (C++17)** with zero runtime Python latency, featuring a **ZeroMQ (ZMQ) binary IPC wire protocol (ABI v3)**, **Kernel-Bypass (`AF_XDP`, `DPDK`)** drivers, **NVIDIA CUDA (including GeForce BAR1 P2P & GPU-initiated doorbell) & DOCA GPUNetIO packet synthesis**, **DPU ARM/GPU CUPS offloading**, and a **64-shard Userspace TCP/L7 engine**.
+
+---
+
+## Why Samurai?
+
+Modern infrastructure teams face a gap between low-level stateless packet blasters and high-level application load tools:
+
+- **The Problem:** Traditional Python/scripting load testers hit GIL, memory-allocation, and syscall bottlenecks long before saturating 10G–100G links; conversely, raw packet generators lack stateful TCP loss recovery, HTTP/2–QUIC/H3 state machines, multi-step persona modeling, carrier-telecom signaling (PFCP/GTP-U/SCTP/Diameter/SIP), or adaptive feedback loops. Many GPU/DPU-accelerated dataplanes also lock developers behind expensive datacenter-only licenses.
+- **How Samurai Differs:**
+  - **Zero Python Dataplane Overhead:** Pure C++17 native daemons and worker binaries (`samurai_master`, `samurai_slave`, `samurai_*_worker`), keeping Python strictly for offline test harnesses and RL training scripts.
+  - **Full-Stack L2–L7 + Carrier Telecom in One Runtime:** Combines RFC 6675 SACK userspace TCP, `io_uring`/kTLS HTTP/2 & QUIC/H3, stateful persona scenarios, and 4G/5G telecom protocols (`GTP-U`, `PFCP`, `SCTP`, `Diameter`, `SIP/RTP/SRTP`) with live IPFIX/NetFlow v9/v10 telemetry.
+  - **Commodity & Enterprise Hardware Acceleration:** Supports consumer GeForce BAR1 P2P DMA + autonomous GPU-initiated doorbells alongside enterprise `AF_XDP`, `DPDK`, and BlueField `DOCA GPUNetIO` + `aarch64` DPU CUPS Seqlock shared memory.
+  - **Closed-Loop Resilience & Safety Gates:** Built-in RL (`Mahoraga`) / AIMD autopilot, VAE anomaly defense verification, and fail-closed `ValidateTargetSafety` gates (private/loopback by default, explicit allowlist/denylist enforcement).
 
 ---
 
@@ -192,12 +205,52 @@ Run the built-in C++ validation binaries to verify subsystems in isolated enviro
 
 ---
 
+## Documentation
+
+| Area | Key Guides |
+| :--- | :--- |
+| **Architecture** | [System Overview](docs/00-overview.md) · [Core Runtime Modules](docs/25-core-runtime-modules.md) · [ZMQ Worker & ABI](docs/36-zmq-worker-architecture.md) · [DPU-GPU CUPS Telecom](docs/49-telecom-gpu-dpu-cups-dataplane-architecture.md) · [GeForce P2P & Doorbell](docs/46-gpu-initiated-doorbell-and-baremetal-pmd.md) |
+| **Installation & Setup** | [Prerequisites & Compilation](#prerequisites--compilation) · [DPDK Environment Setup](docs/34-dpdk-environment-setup-guide.md) · [NUMA & DMA Tuning](docs/21-numa-tx-rx-afxdp-dpdk-dma-guide.md) · [Environment & CLI Reference](docs/20-env-cli-reference.md) |
+| **Deployment** | [Docker & Containers](docs/11-docker.md) · [Distributed Control Plane](docs/40-distributed-control-plane-handbook.md) · [Production Operations Runbook](docs/32-production-operations-runbook.md) · [Monitoring & Dashboards](docs/12-dashboard.md) · [Helm Chart](deploy/helm/samurai) |
+| **Benchmarking** | [Benchmark Profiles](docs/19-benchmark-profiles.md) · [Benchmark Acceptance Handbook](docs/23-benchmark-acceptance-handbook.md) · [RFC Baseline Runbook](docs/39-rfc-benchmark-baseline-runbook.md) · [L4 1M Flows Report](docs/benchmarks/43-tcpdp-1m-flows-benchmark-report.md) · [L7 Stateful Report](docs/benchmarks/44-l7-stateful-userspace-benchmark-report.md) |
+| **Developer Guides** | [CMake Build & Native Testing](docs/09-dev-testing.md) · [Native Worker API](docs/39-native-architecture-and-worker-api.md) · [CLI Deep Map](docs/26-cli-package-deep-map.md) · [Target Safety Policy](docs/07-safety.md) · [Full Docs Index](docs/README.md) |
+
+---
+
 ## Security & Authorized Use Policy
 
 This software is strictly intended for network administrators, security researchers, and systems engineers conducting authorized resilience, scalability, and stress assessments on infrastructure they own or hold explicit written permission to test. Unauthorized generation of hostile traffic is illegal under international computer misuse statutes. The end user assumes all legal liability.
 
+For coordinated vulnerability disclosure, supported versions, and secure-by-default controls (target allowlists/denylists, ZMQ CURVE, HMAC-SHA256 JWT RBAC, SHA-256 audit log chains), see [`SECURITY.md`](SECURITY.md).
+
 ---
 
-## Technical Documentation Index
+## Community
 
-For exhaustive architectural specifications and subsystem deep-dives, see [`docs/README.md`](docs/README.md).
+- **GitHub Discussions:** Join architecture discussions, Q&A, RFC reviews, and benchmark sharing at [GitHub Discussions](https://github.com/Mehmet8-Dev/Samurai/discussions).
+- **Discord:** Connect with systems, kernel-bypass, and telecom contributors on Discord (add your server invite link in `README.md` when ready).
+- **Issues & Proposals:** Use the structured templates in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) for bug reports, feature requests, and new PR proposals.
+
+---
+
+## Contributing
+
+Contributions are welcome under our [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). See [`CONTRIBUTING.md`](CONTRIBUTING.md) for build instructions, open PR proposals for incoming developers, and [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) for the PR checklist.
+
+---
+
+## Contributors
+
+- **Mehmet Okur** ([@Mehmet8-Dev](https://github.com/Mehmet8-Dev)) — Creator & Lead Architect
+- **Sefa** (`sefakocyigit10@gmail.com`) — Contributor
+- **0x4nyroot** ([@0x4nyroot](https://github.com/0x4nyroot)) — Contributor
+
+---
+
+## License & Commercial Support
+
+Samurai is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see [`LICENSE`](LICENSE) for the full text.
+
+Under AGPL-3.0, any modified version deployed or operated over a network (including managed services and SaaS platforms) must disclose its complete source code under the same license.
+
+For organizations requiring **commercial dual-licensing**, proprietary integration rights, or dedicated **SLA / SLO support agreements**, please contact the author directly via GitHub ([@Mehmet8-Dev](https://github.com/Mehmet8-Dev)).

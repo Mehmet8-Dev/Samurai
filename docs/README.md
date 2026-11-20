@@ -30,14 +30,14 @@ This directory serves as the centralized technical index for the Samurai network
 - [18 - AF_PACKET & Hugepage Memory Management Policy](./18-afpacket-hugepage-policy.md)
 - [19 - Benchmark Profiles & Workload Definitions](./19-benchmark-profiles.md)
 - [20 - Environment Variables & CLI Options Reference](./20-env-cli-reference.md)
-- [21 - NUMA Architecture, TX/RX Scaling & AF_XDP/DPDK DMA Guide](./21-numa-tx-rx-afxdp-dpdk-dma-ders-notu.md)
+- [21 - NUMA Architecture, TX/RX Scaling & AF_XDP/DPDK DMA Guide](./21-numa-tx-rx-afxdp-dpdk-dma-guide.md)
 - [22 - CLI Operational Playbook](./22-cli-operational-playbook.md)
 - [23 - Benchmark Acceptance & Throughput Handbook](./23-benchmark-acceptance-handbook.md)
 - [24 - Enterprise Stress Scenarios Handbook](./24-enterprise-test-scenarios-handbook.md)
 - [25 - Core Runtime Modules Deep Dive](./25-core-runtime-modules.md)
 - [26 - CLI Package Deep Architectural Map](./26-cli-package-deep-map.md)
 - [28 - Scenario Engine (Web & Mobile Persona Modeling)](./28-scenario-engine-web-mobile-persona.md)
-- [34 - DPDK Environment Setup & PMD Preparation Guide](./34-dpdk-kurulum-ve-hazirlik-rehberi.md)
+- [34 - DPDK Environment Setup & PMD Preparation Guide](./34-dpdk-environment-setup-guide.md)
 - [37 - Carrier-Grade Telecom Engine Architecture Guide](./37-telecom-engine-guide.md)
 - [45 - Commodity GeForce GPU & NIC P2P Packet Engine Report](./45-commodity-gpu-nic-p2p-packet-engine-report.md)
 - [46 - GPU-Initiated NIC MMIO Doorbell & Baremetal PMD](./46-gpu-initiated-doorbell-and-baremetal-pmd.md)
@@ -51,10 +51,9 @@ This directory serves as the centralized technical index for the Samurai network
 
 ---
 
-## 3. Distributed Cluster & Enterprise Architecture
+## 3. Distributed Cluster & Operations Architecture
 
 - [29 - Distributed Control Plane & Shard Orchestration](./29-distributed-control-plane.md)
-- [30 - Licensing & Commercialization Architecture](./30-licensing-and-commercialization.md)
 - [31 - Security & Release Gate Validation](./31-security-release-gates.md)
 - [32 - Production Operations Runbook](./32-production-operations-runbook.md)
 - [33 - DOCA GPUNetIO & DPU-GPU Dataplane Architecture](./33-doca-gpunetio-migration-status.md)

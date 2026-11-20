@@ -103,7 +103,7 @@ sudo ./build/samurai/cli/samurai \
 
 - [00-overview.md](./00-overview.md) — Main Architecture Overview
 - [05-gpu.md](./05-gpu.md) — GPU CUDA & Accelerator Dataplane
-- [21-numa-tx-rx-afxdp-dpdk-dma-ders-notu.md](./21-numa-tx-rx-afxdp-dpdk-dma-ders-notu.md) — NUMA & Kernel-Bypass Memory Guide
+- [21-numa-tx-rx-afxdp-dpdk-dma-guide.md](./21-numa-tx-rx-afxdp-dpdk-dma-guide.md) — NUMA & Kernel-Bypass Memory Guide
 - [36-zmq-worker-architecture.md](./36-zmq-worker-architecture.md) — ZMQ IPC Architecture
 - [37-dpu-gpu-dataplane-architecture.md](./37-dpu-gpu-dataplane-architecture.md) — DPU/GPU Dataplane Contract Specification
 - [45-commodity-gpu-nic-p2p-packet-engine-report.md](./45-commodity-gpu-nic-p2p-packet-engine-report.md) — GPU-NIC P2P Zero-Copy Dataplane Report

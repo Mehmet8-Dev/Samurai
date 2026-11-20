@@ -1,48 +1,48 @@
-# Tüketici Donanımı (Commodity) Zorunlu Geçici Çözümleri (Workarounds) ve Kurumsal Donanım Geçiş/Refactor Planı
+# Commodity Hardware Workarounds & Enterprise Hardware Migration/Refactor Plan
 
-**Proje:** Samurai Yüksek Başarımlı Paket Motoru  
-**Yazar:** Antigravity Sistem Araştırma ve Çekirdek Mühendisliği  
-**Tarih:** 31 Ekim 2026  
-**Doküman Kodu:** `DOC-SAMURAI-COMMODITY-WORKAROUNDS-48`  
-**Referans Test Platformu:** NVIDIA GeForce GTX 1650 (Turing TU117, CC 7.5, 4 GB GDDR6) + AMD Ryzen 5 5600H (Cezanne PCIe Gen3 x8) + Realtek RTL8168 Gigabit Ethernet (`r8169.ko`, 1000BASE-T)  
-**Hedef Kurumsal Platform:** NVIDIA ConnectX-6 Dx / ConnectX-7 (100G/200G/400G, DOCA GPUNetIO, DevX) veya Intel X710 / E810 (10G/40G/100G, DPDK PMD, native VFIO) + NVIDIA Ampere/Hopper/Blackwell Enterprise GPU + AMD EPYC / Intel Xeon PCIe Gen4/Gen5 Fabric  
-
----
-
-## 1. Giriş ve Belgenin Amacı
-
-Samurai, düşük maliyetli ve her geliştiricide bulunan son kullanıcı donanımlarında (Commodity Hardware) bare-metal GPU P2P paket çıkışını ve sıfır-CPU bağımlı persistent kernel mimarisini kanıtlamak üzere tasarlanmıştır.
-
-Ancak kurumsal sunucu donanımlarının (Mellanox CX serisi, Intel kurumsal NIC'ler, Tesla/A100/H100 GPU'lar) yerel olarak sunduğu donanımsal yeteneklerin tüketici sınıfı donanımlarda bulunmaması nedeniyle, kod tabanına birtakım **zorunlu ara çözümler (workarounds / hardware shims)** eklenmiştir.
-
-Bu dokümanın amacı:
-1. Donanım eksiklikleri nedeniyle yazılmak zorunda kalınan tüm geçici mantıkları, fonksiyonları ve mimari yamaları açıkça belgelemek.
-2. İleride kurumsal donanım temin edildiğinde, hangi kod bloklarının silineceğini, hangi yerel kütüphanelerin devreye alınacağını ve kodun nasıl sadeleştirileceğini somut bir refactor planı olarak sunmaktır.
+**Project:** Samurai High-Performance Packet Engine  
+**Author:** Antigravity Systems Research & Core Engineering  
+**Date:** October 31, 2026  
+**Document Code:** `DOC-SAMURAI-COMMODITY-WORKAROUNDS-48`  
+**Reference Testbed:** NVIDIA GeForce GTX 1650 (Turing TU117, CC 7.5, 4 GB GDDR6) + AMD Ryzen 5 5600H (Cezanne PCIe Gen3 x8) + Realtek RTL8168 Gigabit Ethernet (`r8169.ko`, 1000BASE-T)  
+**Target Enterprise Platform:** NVIDIA ConnectX-6 Dx / ConnectX-7 (100G/200G/400G, DOCA GPUNetIO, DevX) or Intel X710 / E810 (10G/40G/100G, DPDK PMD, native VFIO) + NVIDIA Ampere/Hopper/Blackwell Enterprise GPU + AMD EPYC / Intel Xeon PCIe Gen4/Gen5 Fabric  
 
 ---
 
-## 2. Neden Bu Kodları Yazmak Zorunda Kaldık? (Donanım Kısıtları Matrisi)
+## 1. Introduction and Document Scope
 
-| Mimari Katman | Test Ortamı Kısıtı (GeForce + RTL8168 + Cezanne) | Kurumsal Donanım Karşılığı (Mellanox CX-6/7 + Intel E810 + A100/H100) | Kod Seviyesinde Yazılan Geçici Çözüm (Workaround) |
+Samurai was designed to prove bare-metal GPU P2P packet egress and a zero-CPU persistent kernel architecture on low-cost, readily available developer hardware (commodity hardware).
+
+Because consumer platforms lack several hardware capabilities native to enterprise server equipment (Mellanox ConnectX series, Intel enterprise NICs, Tesla/A100/H100 GPUs), a set of **hardware shims and workarounds** was implemented in the codebase.
+
+This document aims to:
+1. Explicitly catalog every temporary shim, function, and architectural workaround required by commodity hardware constraints.
+2. Provide a concrete refactor plan specifying which blocks can be removed and which native APIs take over when deploying on enterprise server hardware.
+
+---
+
+## 2. Hardware Constraint Matrix
+
+| Architectural Layer | Testbed Constraint (GeForce + RTL8168 + Cezanne) | Enterprise Hardware Equivalent (Mellanox CX-6/7 + Intel E810 + A100/H100) | Code-Level Workaround |
 | :--- | :--- | :--- | :--- |
-| **Katman 1: Kuyruk & Çekirdek Paralelliği** | Realtek RTL8168'de **tek bir normal TX halkası** (`TNPDS`, 1024 slot) vardır. 1024 CUDA thread'i tek halkaya hücum eder. | **Multi-Queue / RSS** (64 ila 1024 bağımsız donanım TX kuyruğu). Her warp'a veya SM'e özel kuyruk atanır. | `reserve_stream_tokens()` içinde atomic CAS tabanlı DRR deficit yönetimi ve tek halka kilit açma mantığı. |
-| **Katman 2: PCIe Root Complex & Senkronizasyon** | AMD Cezanne (Ryzen 5000 APU) kök kompleksi harici GPU'dan gelen **PCIe 3.0 AtomicOps (FetchAdd, Swap) yönlendirmesini desteklemez**. Host belleğinde atomik işlem yapmak veri yolunu kilitler. | **PCIe Gen5 / CXL / NVLink** tam önbellek tutarlılığı (cache coherency) ve donanımsal AtomicOp desteği. | `run_flag_dev` GDDR6 VRAM (`cudaMalloc`) içine çekildi. Host kontrolü için bağımsız `control_stream` (`cudaStreamNonBlocking`) köprüsü kuruldu. |
-| **Katman 3: PMD & MMIO Doorbell** | Realtek kartta **modern dairesel `TDT` yazmacı yoktur**. `0x38 TPPoll` yazmacına `0x40` biti yazılarak kart DMA taramasına zorlanır. Kart kernel sürücüsünden (`r8169`) ayrılırsa güç yönetimi (ASPM) kartı `D3hot` modunda kapatır. | **UAR (User Access Region) / BlueFlame** (Mellanox) veya **`TDT` Circular Ring** (Intel). Tam **`vfio-pci`** userspace yalıtımı. | Kernel sürücüsü aktifken BAR2 MMIO üzerinden `TNPDS` ve `Command TxEnb` yazmaçları GPU BAR1 adresine zorla saptırıldı (`resolve_bar1_allocation_phys_addr`). |
-| **Katman 4: VRAM / P2P DMA Aperture** | GeForce GTX 1650'de **GPUDirect RDMA ve `nvidia_peermem` sürücü seviyesinde kilitlidir**. VRAM doğrudan üçüncü parti PCIe cihazlarına DMA adresini ifşa etmez. | **Resmi NVIDIA GPUDirect RDMA** ve `nvidia-peermem.ko` yerel desteği. | Vulkan `VkDeviceMemory` (`HOST_VISIBLE`) üzerinden 256 MB BAR1 açıldı; fiziksel bus adresini bulmak için özel `/dev/nv_p2p` Linux kernel modülü yazıldı. |
-| **Katman 5: Fiziksel Tel Kapasitesi** | 1000BASE-T Gigabit hattın fiziksel tavanı **1.488 Mpps**'dir (64B frame için). GPU ise VRAM içinde **28.93 Mpps** üretir. Tel %5 kapasitede kaldığı için halka anında taşar. | **100 Gbps (148.8 Mpps) / 200 Gbps (297.6 Mpps)** tam tel hızı. Donanım FIFO'su GPU üretimini doğrudan tel hızında tahliye eder. | Halka dolduğunda (`Ring Full`) kernelin panikle kapanmasını önleyen kontrollü slot geri kazanımı (`state = 0`) ve `ring_drop_events` sayacı eklendi. |
+| **Layer 1: Queue & Core Parallelism** | Realtek RTL8168 exposes a **single normal TX ring** (`TNPDS`, 1024 slots). Up to 1024 CUDA threads contend for one ring. | **Multi-Queue / RSS** (64 to 1024 independent hardware TX queues). Dedicated queues per warp or SM. | Atomic CAS-based DRR deficit management and single-ring contention logic in `reserve_stream_tokens()`. |
+| **Layer 2: PCIe Root Complex & Sync** | AMD Cezanne (Ryzen 5000 APU) Root Complex does **not support PCIe 3.0 AtomicOps (FetchAdd, Swap)** from discrete GPUs; host-memory atomics stall the bus. | **PCIe Gen5 / CXL / NVLink** with full cache coherency and hardware AtomicOp routing. | `run_flag_dev` moved into GDDR6 VRAM (`cudaMalloc`); dedicated `control_stream` (`cudaStreamNonBlocking`) bridge for host stop signaling. |
+| **Layer 3: PMD & MMIO Doorbell** | Realtek lacks a **modern circular `TDT` register**; requires writing `0x40` to `0x38 TPPoll`. Unbinding from `r8169` triggers `D3hot` power-down via ASPM. | **UAR (User Access Region) / BlueFlame** (Mellanox) or **`TDT` Circular Ring** (Intel) with full **`vfio-pci`** userspace isolation. | Repointed BAR2 MMIO `TNPDS` and `Command TxEnb` registers to GPU BAR1 while keeping the kernel driver bound (`resolve_bar1_allocation_phys_addr`). |
+| **Layer 4: VRAM / P2P DMA Aperture** | GeForce GTX 1650 **locks out GPUDirect RDMA and `nvidia_peermem` in the driver**. VRAM does not expose DMA addresses to third-party PCIe devices natively. | **Official NVIDIA GPUDirect RDMA** with native `nvidia-peermem.ko` support. | Allocated 256 MB BAR1 aperture via Vulkan `VkDeviceMemory` (`HOST_VISIBLE`); resolved bus address via custom `/dev/nv_p2p` Linux kernel module. |
+| **Layer 5: Physical Wire Ceiling** | 1000BASE-T Gigabit physical ceiling is **1.488 Mpps** (64B frames), while the GPU generates **28.93 Mpps** in VRAM—overflowing the ring at 5% utilization. | **100 Gbps (148.8 Mpps) / 200 Gbps (297.6 Mpps)** full line rate; hardware FIFO drains GPU output directly onto the wire. | Added controlled slot reclamation (`state = 0`) and `ring_drop_events` accounting on `Ring Full` to avoid kernel panics. |
 
 ---
 
-## 3. Katman Katman Geçici Kodların Detaylı İncelemesi
+## 3. Layer-by-Layer Breakdown of Temporary Shims
 
-### 3.1. Katman 1: Tek Kuyruğu Paylaşma Kısıtı (DRR Deficit & Atomic CAS)
+### 3.1. Layer 1: Single-Ring Contention (DRR Deficit & Atomic CAS)
 
-* **Etkilenen Dosya:** `samurai/gpu_packet_cuda/host_api.cuh`
-* **İlgili Fonksiyon:** `reserve_stream_tokens(...)` (Satır 4270-4320)
-* **Yazılmak Zorunda Kalınan Kod:**
+* **Affected File:** `samurai/gpu_packet_cuda/host_api.cuh`
+* **Function:** `reserve_stream_tokens(...)` (Lines 4270–4320)
+* **Current Workaround Code:**
   ```cuda
-  // Realtek tek bir donanım TX halkasına sahip olduğu için yüzlerce GPU thread'i 
-  // aynı halka için yarışır. Warp'lar arası kilitlenmeyi önlemek için lock-free atomic CAS:
+  // Because Realtek only has a single hardware TX ring, hundreds of GPU threads
+  // compete for the same ring. Lock-free atomic CAS prevents inter-warp deadlock:
   while (true) {
     const uint32_t quota_now = u32_load(&sv->quota_left);
     if (quota_now == 0u) return 0u;
@@ -57,24 +57,24 @@ Bu dokümanın amacı:
     }
   }
   ```
-* **Kurumsal Donanımda Refactor:**
-  Mellanox CX-6 veya Intel E810 kartlarda 64 ila 1024 bağımsız TX kuyruğu bulunur. Her CUDA warp'ına veya Streaming Multiprocessor'a (SM) sabit bir `queue_id` (`qid = blockIdx.x % queue_count`) atanır. Bu sayede thread'ler atomik yarışa girmeden, doğrudan kendi donanım halkasına yazar. Bu fonksiyon tamamen sadeleşerek tek satırlık halka imleci ilerletmesine dönecektir.
+* **Enterprise Hardware Refactor:**
+  Mellanox CX-6 and Intel E810 NICs provide 64 to 1024 independent TX queues. Each CUDA warp or SM is pinned to its own `queue_id` (`qid = blockIdx.x % queue_count`), writing without atomic contention and simplifying reservation to a single-line ring cursor advance.
 
 ---
 
-### 3.2. Katman 2: AMD Cezanne PCIe 3.0 Uyumsuzluğu & Non-Blocking Asenkron Durdurma
+### 3.2. Layer 2: AMD Cezanne PCIe 3.0 Workaround & Non-Blocking Async Stop
 
-* **Etkilenen Dosya:** `samurai/gpu_packet_cuda/host_api.cuh`
-* **İlgili Yapılar:** `PersistentRuntime::control_stream`, `PersistentRuntime::run_flag_dev`, `persistent_launch_kernel()`, `persistent_stop_kernel()`
-* **Yazılmak Zorunda Kalınan Kod:**
-  1. `run_flag_dev` göstergesinin `cudaHostAlloc` ile CPU RAM'inde tutulması yerine GDDR6 VRAM'de (`cudaMalloc`) ayrılması.
-  2. Persistent kernel GPU'da `while (*run_flag_dev == 1)` ile dönerken varsayılan Stream 0'ın kilitlenmesini aşmak için bağımsız `control_stream` (`cudaStreamNonBlocking`) oluşturulması:
+* **Affected File:** `samurai/gpu_packet_cuda/host_api.cuh`
+* **Symbols:** `PersistentRuntime::control_stream`, `PersistentRuntime::run_flag_dev`, `persistent_launch_kernel()`, `persistent_stop_kernel()`
+* **Current Workaround Code:**
+  1. Placed `run_flag_dev` in GDDR6 VRAM (`cudaMalloc`) rather than CPU RAM (`cudaHostAlloc`).
+  2. Created an independent `control_stream` (`cudaStreamNonBlocking`) so stop signals do not block behind Stream 0 while `while (*run_flag_dev == 1)` spins:
   ```cpp
   // host_api.cuh: persistent_stop_kernel()
   rt.ctrl->run = 0;
   if (rt.run_flag_dev && rt.control_stream) {
     const int32_t run_off = 0;
-    // Default stream yerine dedicated non-blocking stream üzerinden GDDR6'ya asenkron yazım:
+    // Async write to GDDR6 over dedicated non-blocking stream instead of default stream:
     (void)cudaMemcpyAsync(rt.run_flag_dev, &run_off, sizeof(run_off), cudaMemcpyHostToDevice, rt.control_stream);
     (void)cudaStreamSynchronize(rt.control_stream);
   }
@@ -82,19 +82,19 @@ Bu dokümanın amacı:
     (void)cudaStreamSynchronize(rt.kernel_stream);
   }
   ```
-* **Kurumsal Donanımda Refactor:**
-  Kurumsal sunucularda (Intel Xeon / AMD EPYC) PCIe AtomicOps kök komplekste yerel olarak desteklenir. Ayrıca DOCA GPUNetIO ortamında kernel durdurma işlemleri DOCA'nın dahili `doca_gpu_dev_eth_txq` durum bayrakları ve event mekanizmaları üzerinden yönetilir. Manuel `control_stream` tahsisi kalkar.
+* **Enterprise Hardware Refactor:**
+  Server platforms (Intel Xeon / AMD EPYC) support PCIe AtomicOps natively in the Root Complex, and DOCA GPUNetIO manages kernel shutdown via `doca_gpu_dev_eth_txq` state flags and native event mechanisms, removing the manual `control_stream`.
 
 ---
 
-### 3.3. Katman 3: Realtek RTL8168 Sürücü Çatışması & Gizli MMIO Ele Geçirme
+### 3.3. Layer 3: Realtek RTL8168 Driver Conflict & Direct MMIO Override
 
-* **Etkilenen Dosyalar:**
+* **Affected Files:**
   * `samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh`
   * `samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh`
-* **İlgili Fonksiyonlar:** `host_init_nic_pmd_tx_ring_mmio()`, `device_ring_nic_doorbell()`, `device_p2p_txq_try_commit_push()`
-* **Yazılmak Zorunda Kalınan Kod:**
-  Realtek kartı `r8169.ko` sürücüsünden unbind edemediğimiz için (kart uykuya geçmesin diye), BAR2 MMIO yazmaçları zorla GPU BAR1 adresine ayarlandı:
+* **Functions:** `host_init_nic_pmd_tx_ring_mmio()`, `device_ring_nic_doorbell()`, `device_p2p_txq_try_commit_push()`
+* **Current Workaround Code:**
+  Because unbinding the Realtek NIC from `r8169.ko` puts the device into sleep, BAR2 MMIO registers were repointed directly to the GPU BAR1 ring:
   ```cpp
   // geforce_p2p_runtime.cuh: host_init_nic_pmd_tx_ring_mmio()
   // 0x20: Transmit Normal Priority Descriptors Start (Low 32-bit)
@@ -104,7 +104,7 @@ Bu dokümanın amacı:
   writel_raw(mmio_base + 0x24, static_cast<uint32_t>((tx_ring_phys_iova >> 32u) & 0xFFFFFFFFULL));
   writeb_raw(mmio_base + 0x37, 0x04);
   ```
-  GPU'nun kapı zilini çalması için ise asenkron `TPPoll` yazmacına `0x40` basıldı:
+  GPU doorbell triggers write `0x40` to `TPPoll`:
   ```cuda
   // gpu_initiated_doorbell.cuh: device_ring_nic_doorbell()
   if (nic_driver == kNicRealtekR8169) {
@@ -112,40 +112,40 @@ Bu dokümanın amacı:
     *tppoll_reg = 0x40; // Transmit Normal Priority Polling Request
   }
   ```
-* **Kurumsal Donanımda Refactor:**
-  * **Mellanox ConnectX (`mlx5`):** Kart doğrudan DOCA GPUNetIO userspace sürücüsüne (`libdoca_gpunetio`) bağlanır. Doorbell, GPU'dan NIC'in 4KB'lık UAR sayfasına tek bir 64-byte WQE yazılması (`BlueFlame`) ile tetiklenir.
-  * **Intel (`ixgbe` / `i40e` / `ice`):** Kart `vfio-pci` ile kernelden tamamen izole edilir. GPU sadece dairesel `TDT` yazmacına yeni kuyruk indeksini yazar (`writel(new_tail, bar + IXGBE_TDT(qid))`). Kernel çatışması ve MMIO gaspı tamamen ortadan kalkar.
+* **Enterprise Hardware Refactor:**
+  * **Mellanox ConnectX (`mlx5`):** Binds directly to DOCA GPUNetIO (`libdoca_gpunetio`); doorbell is triggered by writing a 64-byte WQE to the NIC's 4 KB UAR page (`BlueFlame`).
+  * **Intel (`ixgbe` / `i40e` / `ice`):** Bound cleanly to `vfio-pci`; GPU writes only the circular tail index (`writel(new_tail, bar + IXGBE_TDT(qid))`), eliminating kernel driver contention.
 
 ---
 
-### 3.4. Katman 4: Vulkan BAR1 Export & `/dev/nv_p2p` Çekirdek Modülü
+### 3.4. Layer 4: Vulkan BAR1 Export & `/dev/nv_p2p` Kernel Module
 
-* **Etkilenen Dosyalar:**
+* **Affected Files:**
   * `samurai/gpu_packet_cuda/vulkan_bar1_allocator.cpp`
   * `samurai/kernel_modules/nv_p2p/nv_p2p.c`
   * `samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh:resolve_bar1_allocation_phys_addr()`
-* **Yazılmak Zorunda Kalınan Kod:**
-  GeForce sürücüsü resmi GPUDirect RDMA API'sini (`nvidia_p2p_get_pages`) kilitlediği için:
-  1. Vulkan ile GDDR6 bellekte `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT` bayraklarıyla bellek ayrıldı.
-  2. Özel geliştirilen `/dev/nv_p2p` kernel modülü ile bu belleğin GPU BAR1 fiziksel PCIe bus adresi (`0xfcc02e0000`) bulundu.
-  3. `dma_map_resource()` çağrısıyla ağ kartının IOMMU etki alanına (domain) eşlendi.
-* **Kurumsal Donanımda Refactor:**
-  NVIDIA Tesla / A100 / H100 / RTX 6000 Ada gibi kurumsal kartlarda resmi NVIDIA PeerDirect sürücüsü (`nvidia_peermem.ko`) bulunur. 
-  * `vulkan_bar1_allocator.cpp` tamamen silinecektir.
-  * `/dev/nv_p2p` çekirdek modülü tamamen silinecektir.
-  * Standart `cudaMalloc(&ptr, size)` veya `doca_gpu_mem_alloc(gpu_dev, size, &gpu_buf)` çağrısı doğrudan DMA özellikli bellek döndürür.
+* **Current Workaround Code:**
+  Because GeForce drivers block `nvidia_p2p_get_pages`:
+  1. Memory is allocated in GDDR6 via Vulkan with `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`.
+  2. The custom `/dev/nv_p2p` kernel module resolves the physical PCIe BAR1 bus address (`0xfcc02e0000`).
+  3. `dma_map_resource()` maps the BAR1 region into the NIC's IOMMU domain.
+* **Enterprise Hardware Refactor:**
+  Datacenter GPUs (Tesla / A100 / H100 / RTX 6000 Ada) ship with the official `nvidia_peermem.ko` PeerDirect driver:
+  * `vulkan_bar1_allocator.cpp` can be removed.
+  * `/dev/nv_p2p` kernel module can be removed.
+  * Standard `cudaMalloc(&ptr, size)` or `doca_gpu_mem_alloc(gpu_dev, size, &gpu_buf)` returns DMA-capable VRAM directly.
 
 ---
 
-### 3.5. Katman 5: 1 Gbps Tel Sınırı (1.488 Mpps) ve Backpressure Savunması
+### 3.5. Layer 5: 1 Gbps Wire Limit (1.488 Mpps) & Backpressure Defense
 
-* **Etkilenen Dosya:** `samurai/gpu_packet_cuda/host_api.cuh`
-* **İlgili Bölüm:** Satır 4905-4921 (Hardware PMD Backpressure Handling)
-* **Yazılmak Zorunda Kalınan Kod:**
-  1000BASE-T hattının 1.488 Mpps tavanı nedeniyle GPU'nun 28.93 Mpps'lik üretim patlaması 1024 slotluk Realtek TX FIFO'sunu anında doldurur. Eski kodda bu durum sistemi panikle düşürdüğü için, slotu geri dönüştüren ve tele inemeyen paketleri kontrollü şekilde düşüren mantık yazıldı:
+* **Affected File:** `samurai/gpu_packet_cuda/host_api.cuh`
+* **Section:** Lines 4905–4921 (Hardware PMD Backpressure Handling)
+* **Current Workaround Code:**
+  Due to the 1.488 Mpps ceiling of 1000BASE-T, the GPU's 28.93 Mpps synthesis rate immediately saturates the 1024-slot Realtek TX FIFO. Controlled slot recycling prevents kernel panic:
   ```cuda
   if (doca_gpu_txq_handles && doca_txq_mkeys_be) {
-    // Donanım halkası dolduğunda (Backpressure): Panik yapma, slotu sıfırla, jetonu iade et:
+    // Hardware ring full (Backpressure): do not panic; reset slot, refund token:
     if (slot.state == 1 || slot.state == 2) {
       (void)persistent_slot_transition(&slot, slot.state, 0, ctrl);
     } else {
@@ -157,59 +157,53 @@ Bu dokümanın amacı:
     continue;
   }
   ```
-* **Kurumsal Donanımda Refactor:**
-  100 Gbps veya 200 Gbps hatlarda fiziksel tavan 148.8 Mpps ila 297.6 Mpps'dir. GPU'nun ürettiği paketler doğrudan tele boşalacağı için bu geri tepme (backpressure) minimum seviyeye iner. Ancak savunma amaçlı olarak bu slot geri dönüşüm mekanizması mimaride korunmalıdır.
+* **Enterprise Hardware Refactor:**
+  On 100 Gbps / 200 Gbps links (148.8–297.6 Mpps), wire egress drains GPU production continuously, minimizing backpressure; however, retaining this defensive slot-recycling path protects stability under burst congestion.
 
 ---
 
-## 4. Kurumsal Donanıma Geçiş Refactor Matrisi
+## 4. Enterprise Hardware Refactor Matrix
 
-Aşağıdaki tablo, kurumsal donanım (örneğin Mellanox ConnectX-6 Dx + NVIDIA RTX 6000 Ada / A100) geldiğinde hangi dosyada ne yapılacağını özetler:
-
-| Dosya Yolu | Şu Anki Kod / Workaround | Kurumsal Donanım Geldiğinde Yapılacak İşlem | Hedef Yeni Kod / Kütüphane |
+| File Path | Current Shim / Workaround | Enterprise Hardware Action | Target API / Library |
 | :--- | :--- | :--- | :--- |
-| `samurai/gpu_packet_cuda/vulkan_bar1_allocator.cpp` | Vulkan API üzerinden BAR1 256MB VRAM ayrımı | **Dosya tamamen silinecek veya devredışı bırakılacak.** | `doca_gpu_mem_alloc()` veya `cudaMalloc()` |
-| `samurai/kernel_modules/nv_p2p/` | Özel `/dev/nv_p2p` Linux kernel modülü | **Dizin ve modül tamamen silinecek.** | Resmi `nvidia-peermem.ko` (NVIDIA OFED) |
-| `samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh` | `resolve_bar1_allocation_phys_addr()`, `host_init_nic_pmd_tx_ring_mmio()`, Realtek BAR2 TNPDS hack'i | Bu fonksiyonlar `#if SAMURAI_LEGACY_GEFORCE` bloğuna alınacak; varsayılanda devre dışı kalacak. | DPDK `rte_eth_tx_burst` veya DOCA GPUNetIO `doca_gpu_eth_txq` API |
-| `samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh` | Realtek `TPPoll (0x38)` ve tek kuyruklu `device_ring_nic_doorbell` | Mellanox DevX UAR BlueFlame veya Intel `IXGBE_TDT` register yazımı aktif edilecek. | `doca_gpu_dev_eth_txq_commit_strong()` & `doca_gpu_dev_eth_txq_push()` |
-| `samurai/gpu_packet_cuda/host_api.cuh` | `PersistentRuntime::control_stream`, `run_flag_dev`, Cezanne uyumlu tek kuyruklu `reserve_stream_tokens()` | Multi-Queue (RSS) desteği açılacak; her warp'a ayrı TX queue atanacak. Kilit ve atomikler kalkacak. | `warp_id`-indexed lock-free ring enqueue |
-| `tests/native_gpu/test_gpu_architecture.cpp` | Realtek BDF (`0000:02:00.0`) ve GeForce BDF tespiti | Kurumsal PCIe BDF (örn: `0000:af:00.0` CX-6) tespiti ve 100G wire-rate doğrulama testleri. | `TEST_CHECK(throughput_mpps >= 100.0)` |
+| `samurai/gpu_packet_cuda/vulkan_bar1_allocator.cpp` | 256 MB BAR1 VRAM allocation via Vulkan API | **Remove or disable.** | `doca_gpu_mem_alloc()` or `cudaMalloc()` |
+| `samurai/kernel_modules/nv_p2p/` | Custom `/dev/nv_p2p` Linux kernel module | **Remove directory and module.** | Official `nvidia-peermem.ko` (NVIDIA OFED) |
+| `samurai/gpu_packet_cuda/geforce_p2p_runtime.cuh` | `resolve_bar1_allocation_phys_addr()`, `host_init_nic_pmd_tx_ring_mmio()`, Realtek BAR2 TNPDS override | Gate under `#if SAMURAI_LEGACY_GEFORCE`; disabled by default. | DPDK `rte_eth_tx_burst` or DOCA GPUNetIO `doca_gpu_eth_txq` API |
+| `samurai/gpu_packet_cuda/gpu_initiated_doorbell.cuh` | Realtek `TPPoll (0x38)` and single-queue `device_ring_nic_doorbell` | Enable Mellanox DevX UAR BlueFlame or Intel `IXGBE_TDT` register writes. | `doca_gpu_dev_eth_txq_commit_strong()` & `doca_gpu_dev_eth_txq_push()` |
+| `samurai/gpu_packet_cuda/host_api.cuh` | `PersistentRuntime::control_stream`, `run_flag_dev`, single-queue `reserve_stream_tokens()` | Enable Multi-Queue (RSS); assign dedicated TX queue per warp. | `warp_id`-indexed lock-free ring enqueue |
+| `tests/native_gpu/test_gpu_architecture.cpp` | Realtek BDF (`0000:02:00.0`) and GeForce BDF probing | Probe enterprise PCIe BDF (e.g., `0000:af:00.0` CX-6) and 100G wire-rate assertions. | `TEST_CHECK(throughput_mpps >= 100.0)` |
 
 ---
 
-## 5. Adım Adım Kurumsal Göç ve Temizlik Kılavuzu (Migration Checklist)
+## 5. Step-by-Step Enterprise Migration Checklist
 
-Uygun donanıma geçildiğinde uygulanacak adımlar sırasıyla şunlardır:
+1. **BIOS & PCIe Configuration:**
+   * Enable `Above 4G Decoding` and `Resizable BAR (ReBAR)` in BIOS.
+   * Enable `SR-IOV` and `IOMMU (VT-d / AMD-Vi)`.
 
-1. **BIOS & PCIe Ayarları:**
-   * Anakart BIOS'unda `Above 4G Decoding` ve `Resizable BAR (ReBAR)` aktif edilir.
-   * `SR-IOV` ve `IOMMU (VT-d / AMD-Vi)` aktif edilir.
-
-2. **İşletim Sistemi & Sürücü Kurulumu:**
-   * NVIDIA Data Center GPU sürücüsü ve CUDA Toolkit kurulur.
-   * Mellanox OFED (MLNX_OFED) ve `nvidia-peermem` modülü yüklenir (`modprobe nvidia_peermem`).
-   * Ağ kartı userspace moduna alınır:
+2. **OS & Driver Stack:**
+   * Install NVIDIA Data Center GPU driver and CUDA Toolkit.
+   * Install Mellanox OFED (`MLNX_OFED`) and load `nvidia-peermem` (`modprobe nvidia_peermem`).
+   * Bind NIC to userspace / RDMA mode:
      ```bash
-     # Mellanox için (DevX / DOCA doğrudan çalışır):
+     # For Mellanox (DevX / DOCA direct):
      mst start && mlxconfig -d /dev/mst/mt4125_pciconf0 set REAL_TIME_CLOCK_ENABLE=1
-     # Intel için (VFIO-PCI):
+     # For Intel (VFIO-PCI):
      modprobe vfio-pci
      dpdk-devbind.py -b vfio-pci 0000:af:00.0
      ```
 
-3. **Derleme Bayraklarının Güncellenmesi:**
-   * `CMakeLists.txt` içinde kurumsal bayraklar aktif edilir:
+3. **CMake Build Flags:**
+   * Enable enterprise backends in `CMakeLists.txt`:
      ```bash
      cmake -B build -DSAMURAI_WITH_DOCA_GPUNETIO=ON -DSAMURAI_WITH_DPDK=ON -DSAMURAI_ENABLE_COMMODITY_SHIMS=OFF
      ```
 
-4. **Doğrulama:**
-   * `build/test_gpu_architecture` çalıştırılarak 100G/200G tel hızında 0 drop ve 100+ Mpps geçişi teyit edilir.
+4. **Verification:**
+   * Run `build/test_gpu_architecture` to validate 100G/200G line-rate throughput (100+ Mpps, 0 drops).
 
 ---
 
-## 6. Sonuç
+## 6. Conclusion
 
-GeForce GTX 1650 ve Realtek RTL8168 üzerinde geliştirilen çözümler, en kısıtlı ve "düşmanca" donanım mimarisinde bile sıfır-CPU bağımlı GPU paket üretiminin matematiksel ve elektriksel olarak çalıştığını kanıtlamıştır. 
-
-Yazılan tüm workarounds kodları temiz bir şekilde soyutlanmış (abstracted) olup, kurumsal donanıma geçişte mevcut veri düzlemi mantığını bozmadan tek bir derleme bayrağı ile kurumsal API'lere (DOCA / DPDK) devredilebilecek mimari esnekliğe sahiptir.
+The solutions developed on GeForce GTX 1650 and Realtek RTL8168 prove that zero-CPU GPU-initiated packet synthesis operates reliably even under severe commodity hardware constraints. All workarounds are cleanly isolated behind abstractions and can be switched to native enterprise APIs (DOCA / DPDK) via compile-time flags without altering the core dataplane contract.

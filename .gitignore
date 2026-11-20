@@ -10,6 +10,14 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 *.md
 !/README.md
 !/CHANGELOG.md
+!/CONTRIBUTING.md
+!/CODE_OF_CONDUCT.md
+!/SECURITY.md
+!/RELEASE_NOTES_v3.0.0.md
+!.github/PULL_REQUEST_TEMPLATE.md
+!.github/ISSUE_TEMPLATE/
+!.github/ISSUE_TEMPLATE/*.md
+!.github/ISSUE_TEMPLATE/*.yml
 !docs/*.md
 !docs/**/*.md
 !docs/PLAN_L7_NATIVE_CUSTOM_QUIC_H3_PARITY.md
@@ -23,7 +31,7 @@ PLAN_l7_CUSTOM_STACK_FULL.md
 !policies/TERMS_OF_USE.md
 !policies/AUP.md
 !policies/UNAUTHORIZED_USE_NOTICE.md
-!docs/34-dpdk-kurulum-ve-hazirlik-rehberi.md
+!docs/34-dpdk-environment-setup-guide.md
 !docs/35-vae-defense-integration.md
 !docs/38-architecture-refactor-plan.md
 !docs/40-distributed-control-plane-handbook.md

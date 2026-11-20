@@ -125,7 +125,6 @@ jobs:
       - name: Run Core & Control Selftests
         run: |
           ./build/control/samurai_control_selftest
-          ./build/licensing/samurai_license_selftest
 
       - name: Run L4 Sliding Window & Fastpath Tests
         run: |

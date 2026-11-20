@@ -8,7 +8,6 @@ This runbook establishes standard operating procedures, baseline deployment conf
 
 ## 1. Pre-Flight Deployment Checklist
 
-- [ ] Cryptographically signed license key and enterprise tier verified.
 - [ ] TLS certificates and mutual TLS (mTLS) keys installed with correct permissions.
 - [ ] Cluster shared secret and HMAC-SHA256 tokens configured.
 - [ ] Target IP allowlists and safety denylists defined (`target_safety.cpp`).
@@ -76,8 +75,7 @@ Start distributed worker daemons across compute nodes:
 
 ## 6. Disaster Recovery & Backup Procedures
 
-- **License and Audit Storage Backup:**
-  - Automated backups executed via `tools/backup_license_db.sh`.
+- **Audit Storage Backup:**
   - Monthly recovery drills validated using `tools/restore_drill_smoke.sh`.
 - **Orderly Cluster Teardown:**
   - Send SIGTERM to `samurai_master`; supervisor sends `STOP_JOB` to all active shards and drains worker ring buffers.
