@@ -164,7 +164,27 @@ Run on each agent/generator machine:
   --interface eth0
 ```
 
-### 3) Docker Compose Deployment
+### 3) Pre-Built Container Image (GHCR)
+
+Pull and run the pre-built multi-stage native runtime image from GitHub Container Registry without compiling locally:
+
+```bash
+# Pull the latest release image (or pin a version tag such as :v3.0.0)
+docker pull ghcr.io/mehmet8-dev/samurai:latest
+
+# Inspect CLI and distributed daemon options
+docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai --help
+docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_master --help
+
+# Run a stateful L7 test inside the container (workers live in /usr/local/bin)
+docker run --rm --network host ghcr.io/mehmet8-dev/samurai:latest \
+  samurai --worker l7 --worker-dir /usr/local/bin \
+  --target 127.0.0.1 --port 8080 --l7-protocol h2 --count 1000 --confirm
+```
+
+> **Note:** The container image ships `samurai`, `samurai_master`, `samurai_slave`, and commodity/telco workers (`cpu`, `afpacket`, `afxdp`, `l7`, `scenario`, `defense`, `telco`) under `/usr/local/bin`. For CUDA, DOCA GPUNetIO, or hardware DPDK PMD backends, compile natively from source on the target host.
+
+### 4) Docker Compose Deployment
 
 ```bash
 docker-compose -f docker-compose.distributed.yml up -d
