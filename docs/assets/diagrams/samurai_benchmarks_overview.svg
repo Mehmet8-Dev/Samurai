@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 320" width="1120" height="320" role="img" aria-label="Samurai Verified Benchmark Highlights">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b1020"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="accent1" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+    <linearGradient id="accent2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+    <linearGradient id="accent3" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#f97316"/>
+    </linearGradient>
+    <linearGradient id="accent4" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#f472b6"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1120" height="320" rx="16" fill="url(#bg)" stroke="#1f2937" stroke-width="1.5"/>
+
+  <!-- Header -->
+  <text x="32" y="38" fill="#94a3b8" font-family="DejaVu Sans Mono, ui-monospace, monospace" font-size="12" font-weight="700">SAMURAI v3.0.0 — EMPIRICAL BENCHMARK HIGHLIGHTS (COMMODITY LAPTOP: RYZEN 5 5600H + GTX 1650 MOBILE)</text>
+  <line x1="32" y1="54" x2="1088" y2="54" stroke="#1f2937" stroke-width="1"/>
+
+  <!-- Card 1: 63.3% RAM Reduction -->
+  <g transform="translate(32, 74)">
+    <rect width="248" height="202" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
+    <rect width="248" height="4" rx="2" fill="url(#accent1)"/>
+    <text x="18" y="34" fill="#94a3b8" font-family="DejaVu Sans, sans-serif" font-size="11" font-weight="700">1M STATEFUL TCP FLOWS</text>
+    <text x="18" y="78" fill="#f8fafc" font-family="DejaVu Sans, sans-serif" font-size="34" font-weight="700">605 B</text>
+    <text x="136" y="78" fill="#38bdf8" font-family="DejaVu Sans, sans-serif" font-size="14" font-weight="700">/flow</text>
+    <rect x="18" y="96" width="158" height="22" rx="6" fill="#0c4a6e"/>
+    <text x="26" y="111" fill="#7dd3fc" font-family="DejaVu Sans Mono, monospace" font-size="10.5" font-weight="700">-63.3% RAM REDUCTION</text>
+    <text x="18" y="144" fill="#cbd5e1" font-family="DejaVu Sans Mono, monospace" font-size="11">1,648 B &#x2192; 605 B/flow</text>
+    <text x="18" y="164" fill="#94a3b8" font-family="DejaVu Sans Mono, monospace" font-size="11">577.3 MiB RSS (1M flows)</text>
+    <text x="18" y="184" fill="#64748b" font-family="DejaVu Sans Mono, monospace" font-size="10">64-shard cache-aligned table</text>
+  </g>
+
+  <!-- Card 2: 2.71M CPS -->
+  <g transform="translate(300, 74)">
+    <rect width="248" height="202" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
+    <rect width="248" height="4" rx="2" fill="url(#accent2)"/>
+    <text x="18" y="34" fill="#94a3b8" font-family="DejaVu Sans, sans-serif" font-size="11" font-weight="700">USERSPACE TCP HANDSHAKES</text>
+    <text x="18" y="78" fill="#f8fafc" font-family="DejaVu Sans, sans-serif" font-size="34" font-weight="700">2.71M</text>
+    <text x="144" y="78" fill="#34d399" font-family="DejaVu Sans, sans-serif" font-size="14" font-weight="700">CPS</text>
+    <rect x="18" y="96" width="150" height="22" rx="6" fill="#064e3b"/>
+    <text x="26" y="111" fill="#6ee7b7" font-family="DejaVu Sans Mono, monospace" font-size="10.5" font-weight="700">8.13 Mpps (12 SMT)</text>
+    <text x="18" y="144" fill="#cbd5e1" font-family="DejaVu Sans Mono, monospace" font-size="11">In-mem: 369 ms / 1M</text>
+    <text x="18" y="164" fill="#94a3b8" font-family="DejaVu Sans Mono, monospace" font-size="11">Kernel veth: 133.5k CPS</text>
+    <text x="18" y="184" fill="#64748b" font-family="DejaVu Sans Mono, monospace" font-size="10">RFC 1071 + RFC 6675 SACK</text>
+  </g>
+
+  <!-- Card 3: L7 Shared-Nothing H2 -->
+  <g transform="translate(568, 74)">
+    <rect width="248" height="202" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
+    <rect width="248" height="4" rx="2" fill="url(#accent3)"/>
+    <text x="18" y="34" fill="#94a3b8" font-family="DejaVu Sans, sans-serif" font-size="11" font-weight="700">L7 STATEFUL HTTP/2 (1M)</text>
+    <text x="18" y="78" fill="#f8fafc" font-family="DejaVu Sans, sans-serif" font-size="34" font-weight="700">189.9k</text>
+    <text x="156" y="78" fill="#fbbf24" font-family="DejaVu Sans, sans-serif" font-size="14" font-weight="700">RPS</text>
+    <rect x="18" y="96" width="152" height="22" rx="6" fill="#78350f"/>
+    <text x="26" y="111" fill="#fde68a" font-family="DejaVu Sans Mono, monospace" font-size="10.5" font-weight="700">P99: 4.0 ms (100%)</text>
+    <text x="18" y="144" fill="#cbd5e1" font-family="DejaVu Sans Mono, monospace" font-size="11">H1 (1M): 182.5k RPS</text>
+    <text x="18" y="164" fill="#94a3b8" font-family="DejaVu Sans Mono, monospace" font-size="11">H3 QUIC: 7.9k RPS</text>
+    <text x="18" y="184" fill="#64748b" font-family="DejaVu Sans Mono, monospace" font-size="10">Shared-nothing nghttp2</text>
+  </g>
+
+  <!-- Card 4: CUDA QUIC & BAR1 P2P -->
+  <g transform="translate(836, 74)">
+    <rect width="252" height="202" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1.2"/>
+    <rect width="252" height="4" rx="2" fill="url(#accent4)"/>
+    <text x="18" y="34" fill="#94a3b8" font-family="DejaVu Sans, sans-serif" font-size="11" font-weight="700">CUDA QUIC CRYPTO OFFLOAD</text>
+    <text x="18" y="78" fill="#f8fafc" font-family="DejaVu Sans, sans-serif" font-size="34" font-weight="700">129.3M</text>
+    <text x="166" y="78" fill="#f472b6" font-family="DejaVu Sans, sans-serif" font-size="13" font-weight="700">masks/s</text>
+    <rect x="18" y="96" width="156" height="22" rx="6" fill="#581c87"/>
+    <text x="26" y="111" fill="#e9d5ff" font-family="DejaVu Sans Mono, monospace" font-size="10.5" font-weight="700">CONSUMER GTX 1650</text>
+    <text x="18" y="144" fill="#cbd5e1" font-family="DejaVu Sans Mono, monospace" font-size="11">HKDF Init: 11.76M/s</text>
+    <text x="18" y="164" fill="#94a3b8" font-family="DejaVu Sans Mono, monospace" font-size="11">AES-GCM: 738.9k PPS</text>
+    <text x="18" y="184" fill="#64748b" font-family="DejaVu Sans Mono, monospace" font-size="10">+ GeForce BAR1 P2P DMA</text>
+  </g>
+
+  <!-- Footer reproduction hint -->
+  <text x="32" y="302" fill="#64748b" font-family="DejaVu Sans Mono, ui-monospace, monospace" font-size="11">Reproduce in 10s:  docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp  |  ./scripts/reproduce-benchmarks.sh</text>
+</svg>
