@@ -17,12 +17,30 @@
 #include "reporting.hpp"
 #include "rfc_suite.hpp"
 #include "run_summary.hpp"
+#include "setup_tools.hpp"
 #include "supervisor.hpp"
 #include "validation.hpp"
 #include "worker_registry.hpp"
 
 int main(int argc, char** argv) {
   using namespace samurai;
+
+  if (argc >= 2 && std::string(argv[1]) == "mcp") {
+    if (argc >= 3 && std::string(argv[2]) == "doctor") {
+      return mcp::RunDoctorCli(argc - 3, argv + 3);
+    }
+    if (argc >= 3 && std::string(argv[2]) == "setup") {
+      return mcp::RunSetupCli(argc - 3, argv + 3);
+    }
+    std::printf(
+        "usage: %s mcp <doctor|setup> [options]\n"
+        "  samurai mcp doctor [--client <id>] [--json]\n"
+        "  samurai mcp setup  --client <id> [--dry-run] [--yes] [--docker] [--scope user|project] [--json]\n",
+        argv[0]);
+    return (argc == 2 || (argc >= 3 && (std::string(argv[2]) == "-h" || std::string(argv[2]) == "--help")))
+               ? 0
+               : 2;
+  }
 
   cli::CliOptions opt;
   const cli::ParseStatus status = cli::ParseArgs(argc, argv, opt);

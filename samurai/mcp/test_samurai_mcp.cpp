@@ -4,7 +4,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "autopilot_tools.hpp"
@@ -13,6 +16,7 @@
 #include "protocol.hpp"
 #include "runtime_tools.hpp"
 #include "safety.hpp"
+#include "setup_tools.hpp"
 #include "tool_registry.hpp"
 
 namespace {
@@ -421,6 +425,89 @@ int main() {
               has_prop("samurai_run_benchmark", "custom_tcp_iface") &&
               has_prop("samurai_run_benchmark", "custom_tcp_dst_mac"),
           "samurai_run_benchmark schema exposes custom_tcp/AF_XDP params");
+  }
+
+  // 8. MCP setup/doctor client diagnostics & safe JSON/TOML registration
+  {
+    namespace fs = std::filesystem;
+    const fs::path tmp_root = fs::temp_directory_path() / "samurai_mcp_setup_test";
+    std::error_code ec;
+    fs::remove_all(tmp_root, ec);
+    fs::create_directories(tmp_root / ".codex", ec);
+
+    // Seed an existing ~/.claude.json with another MCP server and verify dry-run + --yes preserve it + backup
+    {
+      std::ofstream out(tmp_root / ".claude.json");
+      out << "{\"mcpServers\":{\"other\":{\"command\":\"/bin/true\"}}}\n";
+    }
+    samurai::mcp::SetupOptions dry_opts;
+    dry_opts.client = "claude-code";
+    dry_opts.dry_run = true;
+    dry_opts.yes = false;
+    dry_opts.binary_override = "/usr/local/bin/samurai_mcp";
+    dry_opts.home_override = tmp_root.string();
+    dry_opts.project_override = tmp_root.string();
+    const auto dry_res = samurai::mcp::ExecuteSetup(dry_opts);
+    Check(dry_res.ok && dry_res.report.find("dry_run")->as_bool(false),
+          "setup without --yes runs in non-mutating dry-run mode");
+    Check(!fs::exists(tmp_root / ".claude.json.bak"), "dry-run does not create backup file");
+
+    samurai::mcp::SetupOptions apply_opts = dry_opts;
+    apply_opts.dry_run = false;
+    apply_opts.yes = true;
+    const auto apply_res = samurai::mcp::ExecuteSetup(apply_opts);
+    Check(apply_res.ok && apply_res.report.find("applied")->as_bool(false) &&
+              apply_res.report.find("backup_created")->as_bool(false),
+          "setup --yes applies config and creates .bak backup");
+    Check(fs::exists(tmp_root / ".claude.json.bak"), "backup file created for existing config");
+    {
+      std::ifstream in(tmp_root / ".claude.json");
+      std::ostringstream ss;
+      ss << in.rdbuf();
+      const auto parsed = Parse(ss.str());
+      Check(parsed.ok, "updated claude.json is valid JSON");
+      const Value* servers = parsed.value.find("mcpServers");
+      Check(servers && servers->find("other") != nullptr && servers->find("samurai") != nullptr,
+            "setup preserves sibling MCP servers while adding samurai");
+    }
+
+    // Verify Codex TOML upsert + Doctor detection
+    samurai::mcp::SetupOptions codex_opts;
+    codex_opts.client = "codex";
+    codex_opts.yes = true;
+    codex_opts.docker = true;
+    codex_opts.home_override = tmp_root.string();
+    codex_opts.project_override = tmp_root.string();
+    const auto codex_res = samurai::mcp::ExecuteSetup(codex_opts);
+    Check(codex_res.ok && codex_res.report.find("transport_mode")->as_string() == "docker",
+          "setup --docker configures docker transport for codex");
+
+    samurai::mcp::DoctorOptions doc_opts;
+    doc_opts.client = "codex";
+    doc_opts.home_override = tmp_root.string();
+    doc_opts.project_override = tmp_root.string();
+    const Value doc = samurai::mcp::BuildDoctorReport(doc_opts);
+    const Value* clients = doc.find("clients");
+    Check(clients && clients->is_array() && clients->elements().size() == 1 &&
+              clients->elements()[0].find("registered")->as_bool(false),
+          "doctor detects registered codex MCP entry");
+
+    // Verify malformed JSON is never overwritten
+    fs::create_directories(tmp_root / ".cursor", ec);
+    {
+      std::ofstream bad(tmp_root / ".cursor" / "mcp.json");
+      bad << "{not-valid-json";
+    }
+    samurai::mcp::SetupOptions bad_opts;
+    bad_opts.client = "cursor";
+    bad_opts.yes = true;
+    bad_opts.home_override = tmp_root.string();
+    bad_opts.project_override = tmp_root.string();
+    const auto bad_res = samurai::mcp::ExecuteSetup(bad_opts);
+    Check(!bad_res.ok && bad_res.exit_code == 2,
+          "setup refuses to overwrite malformed existing JSON config");
+
+    fs::remove_all(tmp_root, ec);
   }
 
   if (g_failures > 0) {

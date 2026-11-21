@@ -5,6 +5,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Lightweight MCP setup & doctor library (depends solely on samurai_core).
+add_library(
+  samurai_mcp_setup
+  STATIC
+  setup_tools.cpp
+)
+target_include_directories(samurai_mcp_setup PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(samurai_mcp_setup PUBLIC samurai_core)
+
 # Modular native C++17 MCP server library (zero Python, zero external MCP SDK).
 add_library(
   samurai_mcp_lib
@@ -18,7 +27,7 @@ add_library(
   tool_registry.cpp
 )
 target_include_directories(samurai_mcp_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(samurai_mcp_lib PUBLIC samurai_core samurai_control samurai_scenario)
+target_link_libraries(samurai_mcp_lib PUBLIC samurai_core samurai_control samurai_scenario samurai_mcp_setup)
 
 # Native stdio MCP server binary (`samurai_mcp`).
 add_executable(samurai_mcp main.cpp)

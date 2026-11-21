@@ -280,3 +280,43 @@ def test_cpp_mcp_skills_resources_and_cluster_planning() -> None:
 
     assert responses[4]["result"]["isError"] is True
     assert responses[5]["result"]["isError"] is True
+
+
+def test_cpp_mcp_doctor_and_setup_cli(tmp_path: Path) -> None:
+    if not MCP_BINARY.is_file():
+        pytest.skip(f"Native MCP binary not built at {MCP_BINARY}")
+
+    doc = subprocess.run(
+        [str(MCP_BINARY), "doctor", "--client", "cursor", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    doc_json = json.loads(doc.stdout)
+    assert "core_binaries" in doc_json
+    assert doc_json["clients"][0]["client"] == "cursor"
+
+    setup = subprocess.run(
+        [
+            str(MCP_BINARY),
+            "setup",
+            "--client",
+            "cursor",
+            "--scope",
+            "project",
+            "--dry-run",
+            "--json",
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    )
+    setup_json = json.loads(setup.stdout)
+    assert setup_json["ok"] is True
+    assert setup_json["dry_run"] is True
+    assert setup_json["applied"] is False
+    assert setup_json["config_path"] == str(tmp_path / ".cursor" / "mcp.json")
+    assert not (tmp_path / ".cursor" / "mcp.json").exists()

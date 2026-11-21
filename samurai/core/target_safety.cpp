@@ -72,30 +72,29 @@ TargetSafetyResult ValidateTargetSafety(const std::string& target_ip,
                                         const std::vector<std::string>& allow_targets,
                                         bool allow_public,
                                         const std::vector<std::string>& deny_targets) {
-  // IPv6 addresses parse as non-IPv4 here; distinguish "contains ':'" so the
-  // message matches the Python "yalnızca IPv4" branch.
+  // IPv6 addresses parse as non-IPv4 here; distinguish "contains ':'" for clarity.
   const auto ip = ParseIpv4(target_ip);
   if (!ip) {
     if (target_ip.find(':') != std::string::npos) {
-      return {false, "Şu an yalnızca IPv4 hedefleri destekleniyor."};
+      return {false, "Only IPv4 targets are currently supported."};
     }
-    return {false, "Geçersiz hedef IP: '" + target_ip + "'"};
+    return {false, "Invalid target IP: '" + target_ip + "'"};
   }
 
   if (IsMulticast(*ip) || *ip == 0u) {
-    return {false, "Geçersiz/tehlikeli hedef IP (multicast/unspecified)."};
+    return {false, "Invalid/unsafe target IP (multicast or unspecified)."};
   }
 
-  // Hard deny policy: blocked targets always win. Allowlist kontrolünden ÖNCE
-  // çalıştırılmalı; aksi halde allowlist eşleşmesi denylist'i bypass ederdi.
+  // Hard deny policy: blocked targets always win. Must run BEFORE allowlist
+  // matching so an allowlist match cannot bypass the denylist.
   for (const auto& entry : deny_targets) {
     if (entry.empty()) continue;
     const auto cidr = ParseCidr(entry);
     if (!cidr) {
-      return {false, "Geçersiz denylist girdisi: '" + entry + "'"};
+      return {false, "Invalid denylist entry: '" + entry + "'"};
     }
     if (InCidr(*ip, *cidr)) {
-      return {false, "Hedef IP global denylist içinde: " + entry};
+      return {false, "Target IP is blocked by global denylist: " + entry};
     }
   }
 
@@ -103,13 +102,13 @@ TargetSafetyResult ValidateTargetSafety(const std::string& target_ip,
     for (const auto& entry : allow_targets) {
       const auto cidr = ParseCidr(entry);
       if (!cidr) {
-        return {false, "Geçersiz allowlist girdisi: '" + entry + "'"};
+        return {false, "Invalid allowlist entry: '" + entry + "'"};
       }
       if (InCidr(*ip, *cidr)) {
         return {true, "ok"};
       }
     }
-    return {false, "Hedef IP allowlist içinde değil. (--allow-target ile izin ver)"};
+    return {false, "Target IP is not in allowlist. (Allow with --allow-target)"};
   }
 
   if (IsPrivateOrLoopback(*ip)) {
@@ -118,7 +117,7 @@ TargetSafetyResult ValidateTargetSafety(const std::string& target_ip,
   if (allow_public) {
     return {true, "ok"};
   }
-  return {false, "Public hedefler varsayılan olarak engellenir. (--allow-public-target ile override)"};
+  return {false, "Public targets are blocked by default. (Override with --allow-public-target)"};
 }
 
 }  // namespace samurai::core

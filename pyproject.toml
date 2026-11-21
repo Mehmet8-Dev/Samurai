@@ -1,3 +1,7 @@
+# Note: Samurai's production runtime, CLI, MCP server, and dataplane workers are
+# 100% native C++17 built via CMake (`cmake -B build -S samurai`).
+# This pyproject.toml is retained strictly for the Python test harness (`tests/`)
+# and offline Mahoraga RL training utilities (`samurai/models/`).
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -5,7 +9,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "samurai"
 version = "3.3.0"
-description = "Samurai - High Performance Layer 4-7 Traffic Generation and Admission Control Engine"
+description = "Samurai - Offline Python test & Mahoraga RL training harness for the native C++17 network resilience platform"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

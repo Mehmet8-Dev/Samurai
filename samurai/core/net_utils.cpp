@@ -122,24 +122,24 @@ std::string GetGatewayMac(const std::string& target_ip) {
   if (!target_ip.empty()) {
     const std::string direct = ArpLookup(target_ip);
     if (!direct.empty()) {
-      LogInfo("Gateway MAC bulundu: " + direct);
+      LogInfo("Gateway MAC found: " + direct);
       return direct;
     }
   }
 
   const std::string gw = DefaultGatewayIp();
   if (gw.empty()) {
-    LogWarning("Gateway IP bulunamadı, broadcast MAC kullanılacak.");
+    LogWarning("Gateway IP not found; falling back to broadcast MAC.");
     return kBroadcastMac;
   }
 
   const std::string mac = ArpLookup(gw);
   if (!mac.empty()) {
-    LogInfo("Gateway MAC bulundu: " + mac);
+    LogInfo("Gateway MAC found: " + mac);
     return mac;
   }
 
-  LogWarning("ARP yanıtı alınamadı, broadcast MAC kullanılacak.");
+  LogWarning("ARP reply not received; falling back to broadcast MAC.");
   return kBroadcastMac;
 }
 

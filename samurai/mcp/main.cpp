@@ -15,9 +15,20 @@
 #include "cluster_tools.hpp"
 #include "protocol.hpp"
 #include "safety.hpp"
+#include "setup_tools.hpp"
 #include "tool_registry.hpp"
 
 int main(int argc, char** argv) {
+  if (argc >= 2) {
+    const std::string subcmd = argv[1];
+    if (subcmd == "doctor") {
+      return samurai::mcp::RunDoctorCli(argc - 2, argv + 2);
+    }
+    if (subcmd == "setup") {
+      return samurai::mcp::RunSetupCli(argc - 2, argv + 2);
+    }
+  }
+
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "-h" || arg == "--help") {
@@ -26,6 +37,14 @@ int main(int argc, char** argv) {
           "\n"
           "Speaks newline-delimited JSON-RPC 2.0 over stdin/stdout for Claude Code,\n"
           "Cursor, Codex, Antigravity, and autonomous Autopilot / RL agents.\n"
+          "\n"
+          "Management subcommands:\n"
+          "  samurai_mcp doctor [--client <id>] [--json]\n"
+          "  samurai_mcp setup  --client <id> [--dry-run] [--yes] [--docker] [--scope user|project] [--json]\n"
+          "\n"
+          "Supported --client IDs:\n"
+          "  claude_code, claude_desktop, cursor, codex, gemini_cli,\n"
+          "  antigravity, windsurf, vscode, opencode, copilot_cli\n"
           "\n"
           "Environment variables:\n"
           "  SAMURAI_BIN_DIR                      Directory containing samurai binaries\n"

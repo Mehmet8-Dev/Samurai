@@ -24,6 +24,7 @@ bool NeedsValue(int i, int argc, const char* flag) {
 void PrintUsage(const char* argv0) {
   std::printf(
       "usage: %s --worker <cpu|gpu|dpdk|afxdp|afpacket|doca|l7|defense|scenario|telco> [options]\n"
+      "       %s mcp <doctor|setup> [options]\n"
       "\n"
       "options:\n"
       "  --worker NAME       worker backend to run (required)\n"
@@ -77,6 +78,7 @@ void PrintUsage(const char* argv0) {
       "  --kpi-max-errors N           gate: errors must be <= N\n"
       "  --kpi-min-sent N             gate: sent must be >= N\n"
       "  -h, --help          show this help\n",
+      argv0,
       argv0);
 }
 

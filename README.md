@@ -1,8 +1,20 @@
-# Samurai Network Resilience & Line-Rate Stress Platform
+# Samurai — Pure C++17 Line-Rate Load, Kernel-Bypass & AI Resilience Engine
 
-Samurai (v3.3.0) is a high-performance network resilience, carrier-telecom emulation, and line-rate stress testing platform designed strictly for authorized lab and infrastructure validation environments.
+**1,000,000 stateful TCP flows in 577 MiB (`605 B/flow`) · Stateful HTTP/2 & QUIC/H3 (`io_uring`/kTLS) · Consumer GeForce BAR1 P2P CUDA · 5G CUPS Telecom · Native C++17 MCP Server (`samurai_mcp`)**
 
-The platform is engineered in modern **C++ (C++17)** with zero runtime Python latency, featuring a **ZeroMQ (ZMQ) binary IPC wire protocol (ABI v3)**, **Kernel-Bypass (`AF_XDP`, `DPDK`)** drivers, **NVIDIA CUDA (including GeForce BAR1 P2P & GPU-initiated doorbell) & DOCA GPUNetIO packet synthesis**, **DPU ARM/GPU CUPS offloading**, a **64-shard Userspace TCP/L7 engine**, and a **native C++17 MCP server (`samurai_mcp`)** for AI coding agents and closed-loop RL autopilots.
+Samurai (v3.3.0) bridges the gap between scripting load tools (`k6`, `Locust`) and raw stateless packet generators (`pktgen`, `TRex`) in a single compiled **C++17** runtime with zero Python dataplane overhead — strictly scoped for authorized lab and infrastructure validation.
+
+---
+
+## Start in 30 Seconds (Choose Your Track)
+
+| Goal | 1-Command Entry | What You Get |
+| :--- | :--- | :--- |
+| **1. Verify 1M TCP Flows** | `docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp` | Reproduces `605 B/flow` & `2.71M CPS` in ~10s (zero build) |
+| **2. Install Native CLI & MCP** | `curl -fsSL https://raw.githubusercontent.com/Mehmet8-Dev/Samurai/main/scripts/install.sh \| bash` | Installs Linux x86_64 binaries (or Docker wrapper on macOS) |
+| **3. Connect AI Coding Agent** | `samurai_mcp setup --client claude_code --yes` | Auto-configures Claude, Cursor, Codex, Antigravity, Gemini, VS Code |
+
+> **Which engine should I pick?** Start with `--worker l7` (HTTP/1.1, HTTP/2, QUIC/H3) or `--worker scenario` for web/API SLA testing; move to `--worker afxdp` / `dpdk` / `gpu` for 10G–100G kernel-bypass or GeForce BAR1 P2P labs; use `--worker telco` for 4G/5G core (`GTP-U`, `PFCP`, `SCTP`, `Diameter`, `SIP/SRTP`).
 
 ---
 
@@ -11,23 +23,23 @@ The platform is engineered in modern **C++ (C++17)** with zero runtime Python la
 - [Benchmarks Summary & Tool Comparison](docs/benchmarks/README.md) — `605 B/flow` across 1M stateful TCP flows (`-63.3%` RAM), `2.71M CPS` in-memory / `133.5k CPS` kernel `veth`, `189.9k RPS` stateful HTTP/2, and `129.3M masks/s` CUDA QUIC offload.
 - [L4 1M Flows Report](docs/benchmarks/43-tcpdp-1m-flows-benchmark-report.md) · [L7 Stateful Userspace Report](docs/benchmarks/44-l7-stateful-userspace-benchmark-report.md) · [Reproduce Script (`reproduce-benchmarks.sh`)](scripts/reproduce-benchmarks.sh)
 
-```bash
-# Reproduce the 1M stateful TCP flow benchmark with one command (zero build)
-docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp
-```
-
 ---
 
 ## Native C++17 MCP Server (AI Agents & RL Autopilot)
 
-Samurai includes a modular, zero-Python **Model Context Protocol (MCP)** stdio server ([`samurai/mcp/`](samurai/mcp/), `protocolVersion: 2024-11-05`) built directly against `samurai_core`, `samurai_control`, and `samurai_scenario`. It connects Claude Code, Cursor, Codex, Antigravity, and autonomous Autopilot / RL agents directly to Samurai's native engines:
+Samurai includes a modular, zero-Python **Model Context Protocol (MCP)** stdio server ([`samurai/mcp/`](samurai/mcp/), `protocolVersion: 2024-11-05`) built directly against `samurai_core`, `samurai_control`, and `samurai_scenario`. It includes built-in **`doctor`** and **`setup`** subcommands for automatic client diagnostics and registration across **10 AI clients** (`claude_code`, `claude_desktop`, `cursor`, `codex`, `gemini_cli`, `antigravity`, `windsurf`, `vscode`, `opencode`, `copilot_cli`):
 
 ```bash
-# Claude Code (local compiled binary)
-claude mcp add samurai -- /path/to/Samurai/build/mcp/samurai_mcp
+# Diagnose local binaries, workers, and MCP client registration status
+samurai_mcp doctor --json
 
-# Or via the pre-built GHCR container (zero build)
-claude mcp add samurai -- docker run -i --rm --network host ghcr.io/mehmet8-dev/samurai:latest samurai_mcp
+# Preview (dry-run) or apply MCP registration (creates a .bak backup automatically)
+samurai_mcp setup --client cursor --dry-run
+samurai_mcp setup --client cursor --yes          # native binary
+samurai_mcp setup --client claude_code --docker --yes  # or zero-build GHCR container
+
+# Or register directly via Claude Code CLI:
+claude mcp add samurai -- /path/to/Samurai/build/mcp/samurai_mcp
 ```
 
 Exposes **22 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 Workflow Prompts** covering:
@@ -213,7 +225,7 @@ Run on each agent/generator machine:
   --worker bundle
 ```
 
-### 3) Pre-Built Container Image (GHCR)
+### 3) Pre-Built Container Image (GHCR) — Linux, macOS & Windows
 
 Pull and run the pre-built multi-stage native runtime image from GitHub Container Registry without compiling locally:
 
@@ -225,12 +237,17 @@ docker pull ghcr.io/mehmet8-dev/samurai:latest
 docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai --help
 docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_master --help
 
-# Run a stateful L7 test inside the container (workers are auto-discovered in /usr/local/bin)
+# Linux: run against a local service on 127.0.0.1 via --network host
 docker run --rm --network host ghcr.io/mehmet8-dev/samurai:latest \
   samurai --worker l7 --target 127.0.0.1 --port 8080 --l7-protocol http2 --count 1000 --confirm
+
+# macOS / Windows (Docker Desktop): --network host runs inside the Docker VM;
+# target services on your host laptop via host.docker.internal instead of 127.0.0.1:
+docker run --rm --add-host host.docker.internal:host-gateway ghcr.io/mehmet8-dev/samurai:latest \
+  samurai --worker l7 --target "$(python3 -c 'import socket; print(socket.gethostbyname("host.docker.internal"))')" --port 8080 --l7-protocol http2 --count 1000 --confirm
 ```
 
-> **Note:** The container image ships `samurai`, `samurai_mcp`, `samurai_master`, `samurai_slave`, reproducible benchmark harnesses (`samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, `samurai_bench_l7`), and commodity/telco workers (`cpu`, `afpacket`, `afxdp`, `l7`, `scenario`, `defense`, `telco`) under `/usr/local/bin`. For CUDA, DOCA GPUNetIO, or hardware DPDK PMD backends, compile natively from source on the target host.
+> **Note:** The container image ships `samurai`, `samurai_mcp`, `samurai_master`, `samurai_slave`, reproducible benchmark harnesses (`samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, `samurai_bench_l7`), and commodity/telco workers (`cpu`, `afpacket`, `afxdp`, `l7`, `scenario`, `defense`, `telco`) under `/usr/local/bin`. For CUDA, DOCA GPUNetIO, or hardware DPDK PMD backends, compile natively from source on a Linux host. See [`docs/11-docker.md`](docs/11-docker.md) for Docker Desktop networking details.
 
 ### 4) Docker Compose Deployment
 
@@ -327,6 +344,7 @@ Contributions are welcome under our [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). 
 
 Samurai is 100% open-source software licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see [`LICENSE`](LICENSE) for the full text.
 
-Under AGPL-3.0, all features remain open and any modified version deployed or operated over a network (including managed services and SaaS platforms) must disclose its complete source code under the same license.
-
-For **commercial support, dedicated SLA / SLO agreements, custom integration engineering, or project sponsorship**, please contact the author directly via GitHub ([@Mehmet8-Dev](https://github.com/Mehmet8-Dev)) or `mehmetokur756@gmail.com`.
+### AGPL-3.0 Adoption FAQ
+- **Internal Lab, WAF & CI/CD Testing:** Running unmodified Samurai against your own servers, staging environments, WAFs, or CI/CD pipelines does **not** require disclosing your application's source code.
+- **Custom Plugins, Forks & Managed SaaS:** If you modify Samurai and either distribute binaries or operate the modified version over a network as a hosted/managed service or SaaS platform, you must disclose the complete corresponding source code of your Samurai derivative under AGPL-3.0.
+- **Commercial Licensing & Support:** Organizations needing proprietary integration without AGPL-3.0 obligations, dedicated SLA/SLO agreements, or custom engineering can contact the author directly via GitHub ([@Mehmet8-Dev](https://github.com/Mehmet8-Dev)) or `mehmetokur756@gmail.com`.

@@ -18,12 +18,37 @@ Exposes **22 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**,
 | [`samurai/mcp/cluster_tools.hpp`](../samurai/mcp/cluster_tools.hpp) / `.cpp` | Distributed cluster discovery, SSH node provisioning, live shard reconfiguration, abort, in-process sharding/autoscale planning, and loopback local multi-worker mesh manager |
 | [`samurai/mcp/autopilot_tools.hpp`](../samurai/mcp/autopilot_tools.hpp) / `.cpp` | Closed-Loop Autopilot & Mahoraga RL session manager (`AIMD` / `BinSearch` / `kRl` + `RlPolicy` + `LeverShield` + `RlExploreConfig`) |
 | [`samurai/mcp/scenario_tools.hpp`](../samurai/mcp/scenario_tools.hpp) / `.cpp` | Scenario Engine in-process compiler, weighted worker scheduler, SLA evaluator, and fail-closed live runner |
-| [`samurai/mcp/tool_registry.hpp`](../samurai/mcp/tool_registry.hpp) / `.cpp` | Registration of all 21 tools, 5 skill resources, and 5 workflow prompts |
+| [`samurai/mcp/tool_registry.hpp`](../samurai/mcp/tool_registry.hpp) / `.cpp` | Registration of all 22 tools, 5 skill resources, and 5 workflow prompts |
+| [`samurai/mcp/setup_tools.hpp`](../samurai/mcp/setup_tools.hpp) / `.cpp` | Automated MCP client diagnostics (`doctor`) & registration (`setup`) across 10+ AI clients |
 | [`samurai/mcp/test_samurai_mcp.cpp`](../samurai/mcp/test_samurai_mcp.cpp) | Native C++17 verification suite (`test_samurai_mcp`) |
 
 ---
 
-## Quick Setup (Zero Python, Zero Dependencies)
+## Quick Setup (1-Command `doctor` & `setup`)
+
+### Automated Registration (`claude_code`, `cursor`, `codex`, `gemini_cli`, `antigravity`, `windsurf`, `vscode`, `opencode`, `copilot_cli`)
+
+```bash
+# 1. Inspect local binaries, workers, and MCP client registration status
+./build/mcp/samurai_mcp doctor
+./build/mcp/samurai_mcp doctor --client codex --json
+
+# 2. Preview proposed config changes (safe non-mutating dry-run)
+./build/mcp/samurai_mcp setup --client cursor --dry-run
+
+# 3. Apply registration (automatically creates a .bak backup of existing configs)
+./build/mcp/samurai_mcp setup --client cursor --yes
+
+# Or register the pre-built GHCR Docker image instead of a local binary:
+./build/mcp/samurai_mcp setup --client claude_code --docker --yes
+
+# Equivalent alias from the main CLI:
+./build/cli/samurai mcp setup --client codex --yes
+```
+
+> **macOS & Windows (Docker Desktop):** Docker Desktop runs containers inside a Linux VM, so `--network host` does not bind directly to host `127.0.0.1`. Target services running on your Mac/Windows host via `host.docker.internal` (the Docker setup mode automatically passes `--add-host host.docker.internal:host-gateway` on non-Linux hosts), or run Samurai against sibling containers on a shared Docker network.
+
+### Manual Setup (Claude Code / GHCR Container)
 
 ### Local CMake Build
 ```bash

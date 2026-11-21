@@ -22,7 +22,7 @@ Before publishing any external post, configure these in **GitHub → Settings**:
 - **Publish a `v3.3.0` Tag After Pushing:**
   Pushing a `v3.3.0` tag triggers `.github/workflows/release.yml`, automatically rebuilding `ghcr.io/mehmet8-dev/samurai:latest` so it includes:
   - Auto-discovered worker binaries (no `--worker-dir` required)
-  - Native C++17 `samurai_mcp` (21 tools, 5 skill resources, 5 workflow prompts) + `/usr/local/share/samurai/skills`
+  - Native C++17 `samurai_mcp` (22 tools, 5 skill resources, 5 workflow prompts) + `/usr/local/share/samurai/skills`
   - Built-in `samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, and `samurai_bench_l7` commands inside the GHCR image!
 
 ---
