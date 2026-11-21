@@ -119,6 +119,9 @@ exec docker run --rm -i ${NET_FLAG} "${IMAGE}" samurai "\$@"
 EOF
   cat > "${PREFIX}/samurai_mcp" <<EOF
 #!/usr/bin/env bash
+if [[ "\${1:-}" == "setup" || "\${1:-}" == "doctor" ]]; then
+  exec docker run --rm -i -u "\$(id -u):\$(id -g)" -v "\$HOME:\$HOME" -v "\$(pwd):\$(pwd)" -w "\$(pwd)" -e HOME="\$HOME" "${IMAGE}" samurai_mcp "\$@"
+fi
 exec docker run --rm -i ${NET_FLAG} "${IMAGE}" samurai_mcp "\$@"
 EOF
   chmod 0755 "${PREFIX}/samurai" "${PREFIX}/samurai_mcp"
@@ -130,7 +133,7 @@ EOF
   if [[ -n "$CLIENT" ]]; then
     SETUP_FLAG="--dry-run"
     [[ "$APPLY_SETUP" -eq 1 ]] && SETUP_FLAG="--yes"
-    docker run --rm "$IMAGE" samurai_mcp setup --docker --client "$CLIENT" "$SETUP_FLAG"
+    "${PREFIX}/samurai_mcp" setup --docker --client "$CLIENT" "$SETUP_FLAG"
   fi
 fi
 
