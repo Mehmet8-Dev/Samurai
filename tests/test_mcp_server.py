@@ -55,6 +55,7 @@ def test_cpp_mcp_initialize_and_tools_list() -> None:
         "samurai_cluster_abort",
         "samurai_cluster_plan_shards",
         "samurai_cluster_local_mesh",
+        "samurai_cluster_run_job",
         "samurai_autopilot_create",
         "samurai_autopilot_step",
         "samurai_autopilot_run_window",
@@ -257,6 +258,15 @@ def test_cpp_mcp_skills_resources_and_cluster_planning() -> None:
                     "arguments": {"host": "127.0.0.1", "node_hosts": "8.8.8.8"},
                 },
             },
+            {
+                "jsonrpc": "2.0",
+                "id": 55,
+                "method": "tools/call",
+                "params": {
+                    "name": "samurai_cluster_run_job",
+                    "arguments": {"worker": "telco", "target": "8.8.8.8", "port": 2152, "count": 100},
+                },
+            },
         ]
     )
     assert len(responses[0]["result"]["resources"]) == 5
@@ -269,3 +279,4 @@ def test_cpp_mcp_skills_resources_and_cluster_planning() -> None:
     assert "autoscale_recommendation" in plan
 
     assert responses[4]["result"]["isError"] is True
+    assert responses[5]["result"]["isError"] is True

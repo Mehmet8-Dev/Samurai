@@ -107,8 +107,8 @@ int main() {
     Check(line.has_value(), "tools/list returns response");
     const auto p = Parse(*line);
     const Value* tools = p.value.find("result")->find("tools");
-    Check(tools && tools->is_array() && tools->elements().size() == 21,
-          "tools/list returns 21 registered tools");
+    Check(tools && tools->is_array() && tools->elements().size() == 22,
+          "tools/list returns 22 registered tools");
 
     const auto rline = server.HandleLine(
         R"({"jsonrpc":"2.0","id":201,"method":"resources/list","params":{}})");
@@ -350,6 +350,19 @@ int main() {
         CallTool(server, 32, "samurai_cluster_provision_node", bad_prov.value), &is_err);
     Check(is_err && prov_err.find("error") != nullptr,
           "samurai_cluster_provision_node blocks public node IP fail-closed");
+
+    // Fail-closed safety blocks public targets on distributed cluster_run_job & ipfix_collector
+    const auto bad_job = Parse(R"({"worker":"l7","target":"8.8.8.8","port":443,"count":100})");
+    const Value job_err = ParseToolPayload(
+        CallTool(server, 33, "samurai_cluster_run_job", bad_job.value), &is_err);
+    Check(is_err && job_err.find("error") != nullptr,
+          "samurai_cluster_run_job blocks public IP fail-closed");
+
+    const auto bad_ipfix = Parse(R"({"worker":"cpu","target":"127.0.0.1","port":9999,"count":10,"ipfix_enabled":true,"ipfix_collector":"1.1.1.1"})");
+    const Value ipfix_err = ParseToolPayload(
+        CallTool(server, 34, "samurai_run_benchmark", bad_ipfix.value), &is_err);
+    Check(is_err && ipfix_err.find("error") != nullptr,
+          "samurai_run_benchmark blocks public ipfix_collector fail-closed");
   }
 
   if (g_failures > 0) {

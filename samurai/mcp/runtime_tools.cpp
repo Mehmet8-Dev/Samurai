@@ -426,6 +426,14 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
   const std::string report_path(tmpl);
 
   std::vector<std::string> cmd = {bin, "--worker", worker};
+  for (const auto& allow_ip : safety.allow_targets) {
+    cmd.push_back("--allow-target");
+    cmd.push_back(allow_ip);
+  }
+  for (const auto& deny_ip : safety.deny_targets) {
+    cmd.push_back("--deny-target");
+    cmd.push_back(deny_ip);
+  }
   if (const Value* prof = args.find("profile"); prof && prof->is_string() && !prof->as_string().empty()) {
     cmd.push_back("--profile");
     cmd.push_back(prof->as_string());
@@ -438,33 +446,109 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
   cmd.push_back("--report-json"); cmd.push_back(report_path);
   cmd.push_back("--confirm");
 
+  auto push_str = [&](const char* key, const char* flag) {
+    if (const Value* v = args.find(key); v && v->is_string() && !v->as_string().empty()) {
+      cmd.push_back(flag);
+      cmd.push_back(v->as_string());
+    }
+  };
+  auto push_pos_int = [&](const char* key, const char* flag) {
+    if (const Value* v = args.find(key); v && v->is_number() && v->as_int(0) > 0) {
+      cmd.push_back(flag);
+      cmd.push_back(std::to_string(v->as_int(0)));
+    }
+  };
+  auto push_nonneg_int = [&](const char* key, const char* flag) {
+    if (const Value* v = args.find(key); v && v->is_number() && v->as_int(-1) >= 0) {
+      cmd.push_back(flag);
+      cmd.push_back(std::to_string(v->as_int(0)));
+    }
+  };
+  auto push_num = [&](const char* key, const char* flag) {
+    if (const Value* v = args.find(key); v && v->is_number()) {
+      cmd.push_back(flag);
+      cmd.push_back(std::to_string(v->as_double(0.0)));
+    }
+  };
+  auto push_bool_flag = [&](const char* key, const char* flag) {
+    if (const Value* v = args.find(key); v && v->as_bool(false)) {
+      cmd.push_back(flag);
+    }
+  };
+
   if (rps > 0.0) {
     cmd.push_back("--rps");
     cmd.push_back(std::to_string(rps));
   }
-  if (const Value* l7p = args.find("l7_protocol"); l7p && l7p->is_string() && !l7p->as_string().empty()) {
-    cmd.push_back("--l7-protocol");
-    cmd.push_back(l7p->as_string());
+
+  // Core / vector / CPU pinning
+  push_str("vector", "--vector");
+  push_nonneg_int("pin_cpu", "--pin-cpu");
+
+  // L7 / TLS / HTTP2 / QUIC controls
+  push_str("l7_protocol", "--l7-protocol");
+  push_str("l7_profile_file", "--l7-profile-file");
+  push_str("l7_payload_file", "--l7-payload-file");
+  push_str("scheme", "--scheme");
+  push_str("host_header", "--host-header");
+  push_pos_int("concurrency", "--concurrency");
+  push_pos_int("max_connections", "--max-connections");
+  push_pos_int("max_streams", "--max-streams");
+  push_pos_int("l7_timeout_ms", "--l7-timeout-ms");
+  push_bool_flag("verify_tls", "--verify-tls");
+  push_bool_flag("keepalive", "--keepalive");
+
+  // Carrier 4G/5G Telecom controls (GTP-U, PFCP, SCTP, Diameter, SIP/RTP/SRTP, QinQ)
+  push_pos_int("telco_subscribers", "--telco-subscribers");
+  push_nonneg_int("telco_subscriber_start", "--telco-subscriber-start");
+  push_pos_int("telco_cps", "--telco-cps");
+  push_pos_int("telco_duration_ms", "--telco-duration-ms");
+  push_pos_int("vlan_s", "--vlan-s");
+  push_pos_int("vlan_c", "--vlan-c");
+  push_pos_int("sctp_rate", "--sctp-rate");
+  push_pos_int("diameter_rate", "--diameter-rate");
+  push_pos_int("sip_rate", "--sip-rate");
+  push_bool_flag("enable_srtp", "--enable-srtp");
+  push_nonneg_int("teid_start", "--teid-start");
+  push_pos_int("teid_count", "--teid-count");
+  push_nonneg_int("qfi", "--qfi");
+  push_str("ue_subnet", "--ue-subnet");
+  push_str("gtpu_vlan", "--gtpu-vlan");
+  push_str("gtpu_inner_proto", "--gtpu-inner-proto");
+  push_str("telco_base_ip", "--telco-base-ip");
+  push_str("telco_gateway_ip", "--telco-gateway-ip");
+
+  // GPU CUDA / GeForce BAR1 P2P controls
+  push_bool_flag("gpu_bar1_p2p", "--gpu-bar1-p2p");
+  push_bool_flag("gpu_persistent", "--gpu-persistent");
+
+  // Live IPFIX / NetFlow v9/v10 telemetry export (collector validated fail-closed)
+  if (const Value* ipfix = args.find("ipfix_enabled"); ipfix && ipfix->as_bool(false)) {
+    const std::string collector =
+        args.find("ipfix_collector") ? args.find("ipfix_collector")->as_string("127.0.0.1") : "127.0.0.1";
+    const auto cchk = ValidateMcpTarget(collector, safety);
+    if (!cchk.ok) {
+      ::unlink(report_path.c_str());
+      return MakeToolError("ipfix_collector blocked by fail-closed MCP safety gate: " + cchk.reason);
+    }
+    cmd.push_back("--ipfix-enabled");
+    cmd.push_back("--ipfix-collector");
+    cmd.push_back(collector);
+    push_pos_int("ipfix_port", "--ipfix-port");
+    push_pos_int("ipfix_sample_rate", "--ipfix-sample-rate");
+    push_bool_flag("ipfix_netflow_v9", "--ipfix-netflow-v9");
+    push_pos_int("ipfix_domain_id", "--ipfix-domain-id");
   }
-  if (const Value* pf = args.find("l7_profile_file"); pf && pf->is_string() && !pf->as_string().empty()) {
-    cmd.push_back("--l7-profile-file");
-    cmd.push_back(pf->as_string());
-  }
-  if (const Value* conc = args.find("concurrency"); conc && conc->is_number() && conc->as_int(0) > 0) {
-    cmd.push_back("--concurrency");
-    cmd.push_back(std::to_string(conc->as_int(1)));
-  }
-  if (const Value* ka = args.find("keepalive"); ka && ka->as_bool(false)) {
-    cmd.push_back("--keepalive");
-  }
-  if (const Value* kerr = args.find("kpi_max_errors"); kerr && kerr->is_number()) {
-    cmd.push_back("--kpi-max-errors");
-    cmd.push_back(std::to_string(kerr->as_int(0)));
-  }
-  if (const Value* kloss = args.find("kpi_max_loss_pct"); kloss && kloss->is_number()) {
-    cmd.push_back("--kpi-max-loss-pct");
-    cmd.push_back(std::to_string(kloss->as_double(0.0)));
-  }
+
+  // KPI pass/fail gates
+  push_num("kpi_min_rate_accuracy", "--kpi-min-rate-accuracy");
+  push_num("kpi_max_loss_pct", "--kpi-max-loss-pct");
+  push_nonneg_int("kpi_max_errors", "--kpi-max-errors");
+  push_pos_int("kpi_min_sent", "--kpi-min-sent");
+  push_pos_int("kpi_min_tls_handshakes", "--kpi-min-tls-handshakes");
+  push_pos_int("kpi_min_dns_queries", "--kpi-min-dns-queries");
+  push_pos_int("kpi_min_dhcp_leases", "--kpi-min-dhcp-leases");
+  push_nonneg_int("kpi_max_tcp_overflows", "--kpi-max-tcp-overflows");
 
   const auto res = RunSubprocess(cmd, timeout_s);
   const std::string report_raw = ReadWholeFile(report_path);

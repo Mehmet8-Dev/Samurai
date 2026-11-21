@@ -628,4 +628,201 @@ ToolResult ClusterManager::HandleLocalMesh(const Value& args) {
   return MakeToolError("Invalid action '" + action + "'. Expected: start, scale, status, or stop.");
 }
 
+ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
+                                                   const SafetyConfig& safety) const {
+  const std::string master_bin = FindNativeBinary({"samurai_master"});
+  if (master_bin.empty()) {
+    return MakeToolError("samurai_master binary not found. Build via CMake first.");
+  }
+
+  const std::string worker = LowerCopy(OptStr(args, "worker", "cpu"));
+  if (!IsAllowedWorker(worker)) {
+    return MakeToolError("Unsupported worker: " + worker);
+  }
+
+  const std::string target = OptStr(args, "target", "127.0.0.1");
+  const auto chk = ValidateMcpTarget(target, safety);
+  if (!chk.ok) {
+    return MakeToolError("Target blocked by fail-closed MCP safety gate: " + chk.reason);
+  }
+
+  const std::int64_t port = OptInt(args, "port", 80);
+  if (port < 1 || port > 65535) {
+    return MakeToolError("port must be between 1 and 65535");
+  }
+
+  const std::string protocol = LowerCopy(OptStr(args, "protocol", "udp"));
+  if (!IsAllowedProtocol(protocol)) {
+    return MakeToolError("Unsupported protocol: " + protocol);
+  }
+
+  const std::int64_t count = OptInt(args, "count", 10000);
+  const std::int64_t telco_dur_ms = OptInt(args, "telco_duration_ms", 0);
+  const bool telco_timed = (worker == "telco" && telco_dur_ms > 0 && count == 0);
+  if (!telco_timed && (count < 1 || static_cast<std::uint64_t>(count) > safety.max_packet_count)) {
+    return MakeToolError("count must be between 1 and " + std::to_string(safety.max_packet_count));
+  }
+
+  const std::int64_t size = OptInt(args, "size", 64);
+  if (size < 1 || size > 65535) {
+    return MakeToolError("size must be between 1 and 65535");
+  }
+
+  const std::string shard_strategy = LowerCopy(OptStr(args, "shard_strategy", ""));
+  if (!shard_strategy.empty() &&
+      shard_strategy != "equal" && shard_strategy != "capability" && shard_strategy != "region") {
+    return MakeToolError("shard_strategy must be one of: equal, capability, region");
+  }
+
+  const bool closed_loop = OptBool(args, "closed_loop", false);
+  const std::string cl_strategy = LowerCopy(OptStr(args, "cl_strategy", "aimd"));
+  if (closed_loop && cl_strategy != "aimd" && cl_strategy != "binsearch" && cl_strategy != "rl") {
+    return MakeToolError("cl_strategy must be one of: aimd, binsearch, rl");
+  }
+
+  const int expect_workers = static_cast<int>(std::clamp<std::int64_t>(OptInt(args, "expect_workers", 1), 1, 128));
+  const int wait_workers_s = static_cast<int>(std::clamp<std::int64_t>(OptInt(args, "wait_workers_s", 15), 1, 60));
+  const int timeout_s = static_cast<int>(std::clamp<std::int64_t>(OptInt(args, "timeout_s", 45), 5, safety.max_timeout_s));
+  const std::string control_listen = OptStr(args, "control_listen", "tcp://127.0.0.1:5099");
+
+  std::vector<std::string> cmd = {
+      master_bin,
+      "--control-listen", control_listen,
+      "--worker", worker,
+      "--target", target,
+      "--port", std::to_string(port),
+      "--protocol", protocol,
+      "--count", std::to_string(count),
+      "--size", std::to_string(size),
+      "--expect-workers", std::to_string(expect_workers),
+      "--wait-workers-s", std::to_string(wait_workers_s),
+  };
+
+  for (const auto& allow_ip : safety.allow_targets) {
+    cmd.push_back("--allow-target");
+    cmd.push_back(allow_ip);
+  }
+  for (const auto& deny_ip : safety.deny_targets) {
+    cmd.push_back("--deny-target");
+    cmd.push_back(deny_ip);
+  }
+
+  if (OptBool(args, "insecure_control", false)) cmd.push_back("--insecure-control");
+  if (!shard_strategy.empty()) {
+    cmd.push_back("--shard-strategy");
+    cmd.push_back(shard_strategy);
+  }
+  if (const std::string reg = OptStr(args, "target_region", ""); !reg.empty()) {
+    cmd.push_back("--target-region");
+    cmd.push_back(reg);
+  }
+  if (const std::string mgmt = OptStr(args, "management_listen", ""); !mgmt.empty()) {
+    cmd.push_back("--management-listen");
+    cmd.push_back(mgmt);
+  }
+
+  auto push_pos_int = [&](const char* key, const char* flag) {
+    if (const Value* v = args.find(key); v && v->is_number() && v->as_int(0) > 0) {
+      cmd.push_back(flag);
+      cmd.push_back(std::to_string(v->as_int(0)));
+    }
+  };
+  auto push_num = [&](const char* key, const char* flag) {
+    if (const Value* v = args.find(key); v && v->is_number()) {
+      cmd.push_back(flag);
+      cmd.push_back(std::to_string(v->as_double(0.0)));
+    }
+  };
+  auto push_str = [&](const char* key, const char* flag) {
+    if (const Value* v = args.find(key); v && v->is_string() && !v->as_string().empty()) {
+      cmd.push_back(flag);
+      cmd.push_back(v->as_string());
+    }
+  };
+
+  // Distributed 4G/5G Telecom workload options
+  push_pos_int("telco_subscribers", "--telco-subscribers");
+  push_pos_int("telco_cps", "--telco-cps");
+  push_pos_int("telco_duration_ms", "--telco-duration-ms");
+  push_str("telco_pool_profile", "--telco-pool-profile");
+  push_pos_int("sctp_rate", "--sctp-rate");
+  push_pos_int("diameter_rate", "--diameter-rate");
+  push_pos_int("sip_rate", "--sip-rate");
+  if (OptBool(args, "enable_srtp", false)) cmd.push_back("--enable-srtp");
+  if (const Value* v = args.find("teid_start"); v && v->is_number() && v->as_int(-1) >= 0) {
+    cmd.push_back("--teid-start");
+    cmd.push_back(std::to_string(v->as_int(0)));
+  }
+  push_pos_int("teid_count", "--teid-count");
+  if (const Value* v = args.find("qfi"); v && v->is_number() && v->as_int(-1) >= 0) {
+    cmd.push_back("--qfi");
+    cmd.push_back(std::to_string(v->as_int(0)));
+  }
+
+  // Distributed Live IPFIX / NetFlow export
+  if (OptBool(args, "ipfix_enabled", false)) {
+    const std::string collector = OptStr(args, "ipfix_collector", "127.0.0.1");
+    const auto cchk = ValidateMcpTarget(collector, safety);
+    if (!cchk.ok) {
+      return MakeToolError("ipfix_collector blocked by fail-closed MCP safety gate: " + cchk.reason);
+    }
+    cmd.push_back("--ipfix-enabled");
+    cmd.push_back("1");
+    cmd.push_back("--ipfix-collector");
+    cmd.push_back(collector);
+    push_pos_int("ipfix_port", "--ipfix-port");
+    push_pos_int("ipfix_sample_rate", "--ipfix-sample-rate");
+    if (OptBool(args, "ipfix_netflow_v9", false)) {
+      cmd.push_back("--ipfix-netflow-v9");
+      cmd.push_back("1");
+    }
+  }
+
+  // Distributed Closed-Loop Autopilot & Mahoraga RL
+  if (closed_loop) {
+    cmd.push_back("--closed-loop");
+    cmd.push_back("--cl-strategy");
+    cmd.push_back(cl_strategy);
+    push_pos_int("cl_window_s", "--cl-window-s");
+    if (OptBool(args, "cl_live_reconfigure", false)) cmd.push_back("--cl-live-reconfigure");
+    push_num("cl_min_rps", "--cl-min-rps");
+    push_num("cl_max_rps", "--cl-max-rps");
+    push_num("cl_initial_rps", "--cl-initial-rps");
+    push_num("cl_slo_max_error_pct", "--cl-slo-max-error-pct");
+    push_num("cl_slo_max_loss_pct", "--cl-slo-max-loss-pct");
+    push_num("cl_slo_max_latency_ms", "--cl-slo-max-latency-ms");
+    push_num("cl_slo_max_pushback_pct", "--cl-slo-max-pushback-pct");
+    push_pos_int("cl_aimd_max_windows", "--cl-aimd-max-windows");
+    push_pos_int("cl_binsearch_max_windows", "--cl-binsearch-max-windows");
+    push_str("rl_policy", "--rl-policy");
+    push_num("cl_rl_max_jump_factor", "--cl-rl-max-jump-factor");
+    if (const Value* ls = args.find("cl_lever_shield"); ls && ls->is_bool()) {
+      cmd.push_back("--cl-lever-shield");
+      cmd.push_back(ls->as_bool() ? "1" : "0");
+    }
+    if (const Value* oa = args.find("cl_online_adapt"); oa && oa->is_bool()) {
+      cmd.push_back("--cl-online-adapt");
+      cmd.push_back(oa->as_bool() ? "1" : "0");
+    }
+    if (const Value* nv = args.find("cl_novelty"); nv && nv->is_bool()) {
+      cmd.push_back("--cl-novelty");
+      cmd.push_back(nv->as_bool() ? "1" : "0");
+    }
+  }
+
+  const auto res = RunSubprocess(cmd, timeout_s);
+  Value out = Value::Object();
+  out.set("host", HostMetadataJson());
+  out.set("worker", Value::Str(worker));
+  out.set("target", Value::Str(target));
+  out.set("port", Value::Int(port));
+  out.set("expect_workers", Value::Int(expect_workers));
+  out.set("closed_loop", Value::Bool(closed_loop));
+  out.set("exit_code", Value::Int(res.exit_code));
+  out.set("timed_out", Value::Bool(res.timed_out));
+  out.set("stdout", Value::Str(res.stdout_text));
+  out.set("stderr", Value::Str(res.stderr_text));
+  return MakeToolSuccess(std::move(out));
+}
+
 }  // namespace samurai::mcp

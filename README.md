@@ -30,9 +30,9 @@ claude mcp add samurai -- /path/to/Samurai/build/mcp/samurai_mcp
 claude mcp add samurai -- docker run -i --rm --network host ghcr.io/mehmet8-dev/samurai:latest samurai_mcp
 ```
 
-Exposes **21 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 Workflow Prompts** covering:
-- **Dataplane, Benchmarks & RFC Compliance:** `samurai_list_workers`, `samurai_list_profiles`, `samurai_run_benchmark`, `samurai_run_rfc_suite`, `samurai_bench_tcp_flows`, `samurai_bench_l7_userspace`.
-- **Distributed Cluster & Multi-Worker Orchestration:** `samurai_cluster_discover` (live worker/shard/metrics discovery), `samurai_cluster_provision_node` (add new lab nodes), `samurai_cluster_plan_shards` (capability/region/5G telco CGNAT sharding + `AutoscaleController`), `samurai_cluster_reconfigure` (live multi-worker rate/lever coordination), `samurai_cluster_abort`, and `samurai_cluster_local_mesh` (start/scale/stop a loopback `samurai_master` + N `samurai_slave` mesh).
+Exposes **22 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 Workflow Prompts** covering:
+- **Live Target Testing, Benchmarks & RFC Compliance:** `samurai_list_workers`, `samurai_list_profiles`, `samurai_run_benchmark` (all 10 workers, L7/TLS/H2/QUIC, 4G/5G Telco CUPS, GPU BAR1 P2P, live IPFIX, KPI gates), `samurai_run_rfc_suite`, `samurai_bench_tcp_flows`, `samurai_bench_l7_userspace`.
+- **Distributed Cluster & Multi-Worker Orchestration:** `samurai_cluster_discover`, `samurai_cluster_provision_node`, `samurai_cluster_run_job` (distributed `samurai_master` multi-worker & closed-loop RL job execution), `samurai_cluster_plan_shards`, `samurai_cluster_reconfigure`, `samurai_cluster_abort`, and `samurai_cluster_local_mesh`.
 - **Scenario Engine (`samurai_scenario`):** `samurai_scenario_compile`, `samurai_scenario_run`, `samurai_scenario_evaluate_sla`.
 - **Closed-Loop Autopilot & Mahoraga RL (`samurai_control`):** `samurai_autopilot_create`, `samurai_autopilot_step`, `samurai_autopilot_run_window`, `samurai_autopilot_status`, `samurai_autopilot_reset` — supporting `AIMD`, `BinSearch`, in-process SRLP MLP & RL² GRU `RlPolicy` inference, `LeverShield` WAF path-block reflex, and `RlExploreConfig`.
 

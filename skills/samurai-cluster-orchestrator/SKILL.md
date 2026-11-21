@@ -23,6 +23,7 @@ Use this skill when coordinating multiple Samurai worker nodes across a local la
    - **Local lab mesh:** Call `samurai_cluster_local_mesh` with `action: "scale"`, `slaves: <desired>` to add or remove live `samurai_slave` processes dynamically.
    - **Remote private lab nodes:** Call `samurai_cluster_provision_node` with `node_hosts: "10.0.0.11,10.0.0.12"`, `worker_kind: "bundle"`, `worker_region: "eu-central"`. Every host IP is validated fail-closed (private/RFC1918/loopback only).
 
-4. **Coordinate Live Workers Mid-Flight:**
+4. **Dispatch Distributed Multi-Worker Jobs & Coordinate Mid-Flight:**
+   - Call `samurai_cluster_run_job` to execute a real distributed multi-worker test via `samurai_master` across `expect_workers` connected `samurai_slave` nodes (supports all 10 workers, `shard_strategy`, 4G/5G `telco_pool_profile`, live `ipfix_enabled`, and distributed `--closed-loop` AIMD/BinSearch/Mahoraga RL with `cl_live_reconfigure`, `cl_lever_shield`, `cl_online_adapt`, and `cl_novelty`).
    - Call `samurai_cluster_reconfigure` to update `target_rps`, `concurrency`, `request_mix`, `source_rotation`, or `pacing_mode` across active shards without restarting workers.
    - If SLO degradation or unexpected target saturation occurs, immediately call `samurai_cluster_abort` (`POST /v1/jobs/abort`) and tear down any local mesh with `samurai_cluster_local_mesh` (`action: "stop"`).

@@ -115,27 +115,73 @@ void RegisterAllTools(McpServer& server,
       [](const Value& a) { return HandleListProfiles(a); },
   });
 
-  // 3. Safety-gated benchmark runner
+  // 3. Full-control target-facing test & benchmark runner (all 10 workers, L7/TLS, Telco 5G, GPU BAR1, IPFIX, KPI gates)
   {
     Value props = Value::Object();
     props.set("worker", PropStr("Dataplane worker backend (default: cpu).", AllowedWorkers()));
-    props.set("target", PropStr("Private/loopback IPv4 target (fail-closed; public IPs blocked)."));
+    props.set("target", PropStr("Authorized private/loopback (or SAMURAI_MCP_ALLOW_TARGETS) IPv4 target."));
     props.set("port", PropInt("Target TCP/UDP port (1-65535)."));
     props.set("protocol", PropStr("L4/L7/Telco protocol (default: udp).", AllowedProtocols()));
+    props.set("vector", PropStr("Workload/attack vector label (e.g. flood, basic, http, http2, dns, slowloris, sctp-flood)."));
     props.set("count", PropInt("Bounded packet/request count."));
     props.set("size", PropInt("Packet size in bytes (1-65535)."));
     props.set("rps", PropNum("Target rate in packets/requests per second (0 = max speed)."));
-    props.set("profile", PropStr("Optional built-in profile name."));
+    props.set("pin_cpu", PropInt("Pin dataplane worker to a specific CPU core index."));
+    props.set("profile", PropStr("Optional built-in profile name from samurai_list_profiles."));
+    // L7 / TLS / HTTP2 / QUIC
     props.set("l7_protocol", PropStr("L7 protocol override.", {"http1", "http2", "quic", "dns"}));
     props.set("l7_profile_file", PropStr("Optional L7/Scenario JSON profile file path (--l7-profile-file)."));
+    props.set("l7_payload_file", PropStr("Optional raw L7 request bytes file path (--l7-payload-file)."));
+    props.set("scheme", PropStr("L7 URL scheme override.", {"http", "https"}));
+    props.set("host_header", PropStr("L7 Host header / TLS SNI override."));
+    props.set("verify_tls", PropBool("Verify peer TLS certificate (default: false)."));
     props.set("concurrency", PropInt("L7 parallel lanes/threads."));
+    props.set("max_connections", PropInt("L7 connection pool size."));
+    props.set("max_streams", PropInt("L7 HTTP/2 or HTTP/3 concurrent streams per connection."));
+    props.set("l7_timeout_ms", PropInt("L7 per-request timeout in ms."));
     props.set("keepalive", PropBool("Reuse L7 connections across requests."));
-    props.set("kpi_max_errors", PropInt("Fail KPI gate if errors exceed this threshold."));
-    props.set("kpi_max_loss_pct", PropNum("Fail KPI gate if estimated wire loss % exceeds this threshold."));
+    // 4G/5G Carrier Telecom
+    props.set("telco_subscribers", PropInt("Telco subscriber count."));
+    props.set("telco_subscriber_start", PropInt("Telco starting subscriber index."));
+    props.set("telco_cps", PropInt("Telco subscriber setup rate (CPS)."));
+    props.set("telco_duration_ms", PropInt("Telco bounded test duration in ms."));
+    props.set("vlan_s", PropInt("Telco outer QinQ S-VLAN base."));
+    props.set("vlan_c", PropInt("Telco inner QinQ C-VLAN base."));
+    props.set("sctp_rate", PropInt("Target rate for SCTP associations/chunks (S1-AP/NG-AP)."));
+    props.set("diameter_rate", PropInt("Target rate for Diameter CCR transactions (Ro/Gx)."));
+    props.set("sip_rate", PropInt("Target rate for SIP INVITE calls (VoLTE/IMS)."));
+    props.set("enable_srtp", PropBool("Enable SRTP encrypted audio media stream."));
+    props.set("teid_start", PropInt("Starting 4G/5G GTP-U TEID."));
+    props.set("teid_count", PropInt("Number of GTP-U TEIDs to cycle."));
+    props.set("qfi", PropInt("5G NR QoS Flow Identifier (QFI) in GTP-U 0x85 extension header."));
+    props.set("ue_subnet", PropStr("Inner UE subnet for GTP-U encapsulation (e.g. 10.60.0.0/16)."));
+    props.set("gtpu_vlan", PropStr("GTP-U VLAN tag ('S' or 'S:C' QinQ)."));
+    props.set("gtpu_inner_proto", PropStr("GTP-U inner IP protocol.", {"udp", "tcp", "icmp"}));
+    props.set("telco_base_ip", PropStr("Telco subscriber base IPv4."));
+    props.set("telco_gateway_ip", PropStr("Telco BNG/UPF gateway IPv4."));
+    // GPU / CUDA
+    props.set("gpu_bar1_p2p", PropBool("Enable GeForce BAR1 P2P GPU-to-NIC zero-copy DMA (gpu worker)."));
+    props.set("gpu_persistent", PropBool("Enable zero-CPU persistent CUDA dataplane kernel (gpu worker)."));
+    // Live IPFIX / NetFlow
+    props.set("ipfix_enabled", PropBool("Enable live UDP IPFIX/NetFlow telemetry export."));
+    props.set("ipfix_collector", PropStr("Private/loopback IPv4 address of the IPFIX/NetFlow collector."));
+    props.set("ipfix_port", PropInt("IPFIX collector UDP port (default: 4739)."));
+    props.set("ipfix_sample_rate", PropInt("IPFIX 1-in-N packet sampling rate."));
+    props.set("ipfix_netflow_v9", PropBool("Emit NetFlow v9 instead of IPFIX v10."));
+    props.set("ipfix_domain_id", PropInt("IPFIX observation domain ID."));
+    // KPI Gates
+    props.set("kpi_min_rate_accuracy", PropNum("Fail KPI gate if rate_accuracy_pct < threshold."));
+    props.set("kpi_max_loss_pct", PropNum("Fail KPI gate if estimated wire loss % > threshold."));
+    props.set("kpi_max_errors", PropInt("Fail KPI gate if errors > threshold."));
+    props.set("kpi_min_sent", PropInt("Fail KPI gate if packets/requests sent < threshold."));
+    props.set("kpi_min_tls_handshakes", PropInt("Fail KPI gate if TLS handshakes < threshold."));
+    props.set("kpi_min_dns_queries", PropInt("Fail KPI gate if DNS queries < threshold."));
+    props.set("kpi_min_dhcp_leases", PropInt("Fail KPI gate if DHCP leases < threshold."));
+    props.set("kpi_max_tcp_overflows", PropInt("Fail KPI gate if TCP overflows > threshold."));
     props.set("timeout_s", PropInt("Subprocess wall-clock timeout in seconds (5-120)."));
     server.RegisterTool({
         "samurai_run_benchmark",
-        "Run a bounded, fail-closed native C++17 Samurai benchmark against a loopback/RFC1918 lab target and return structured JSON telemetry + KPI gate results.",
+        "Execute a real, live, fail-closed Samurai dataplane test against an authorized target server using any of the 10 native workers (L4, L7/TLS/H2/QUIC, AF_XDP, DPDK, GPU BAR1 P2P, DOCA, 4G/5G Telco CUPS, IPFIX, VAE Defense) and return structured JSON telemetry + KPI gate results.",
         SchemaWithProps(std::move(props)),
         [safety](const Value& a) { return HandleRunBenchmark(a, safety); },
     });
@@ -302,6 +348,67 @@ void RegisterAllTools(McpServer& server,
         "Spin up, dynamically scale (add/remove slave nodes), inspect, or tear down a loopback-only (127.0.0.1) distributed samurai_master + N samurai_slave cluster for multi-worker coordination.",
         SchemaWithProps(std::move(props)),
         [&cluster](const Value& a) { return cluster.HandleLocalMesh(a); },
+    });
+  }
+
+  // 13. Distributed multi-worker job execution via samurai_master
+  {
+    Value props = Value::Object();
+    props.set("worker", PropStr("Worker flavor required across cluster slaves (default: cpu).", AllowedWorkers()));
+    props.set("target", PropStr("Authorized private/loopback (or SAMURAI_MCP_ALLOW_TARGETS) IPv4 target."));
+    props.set("port", PropInt("Target port (1-65535)."));
+    props.set("protocol", PropStr("L4/L7/Telco protocol (default: udp).", AllowedProtocols()));
+    props.set("count", PropInt("Total distributed packet/request count split across workers (0 allowed for timed telco)."));
+    props.set("size", PropInt("Packet size in bytes (default: 64)."));
+    props.set("control_listen", PropStr("ZMQ control bind endpoint (default: tcp://127.0.0.1:5099)."));
+    props.set("management_listen", PropStr("Optional HTTP Management API bind (e.g. 127.0.0.1:8089)."));
+    props.set("insecure_control", PropBool("Permit non-loopback control bind without CURVE."));
+    props.set("expect_workers", PropInt("Wait for N slave workers to register before dispatching shards (default: 1)."));
+    props.set("wait_workers_s", PropInt("Max seconds to wait for slave workers (default: 15)."));
+    props.set("shard_strategy", PropStr("Multi-worker sharding strategy.", {"equal", "capability", "region"}));
+    props.set("target_region", PropStr("Target region for region-aware shard routing."));
+    // Distributed Telco & IPFIX
+    props.set("telco_subscribers", PropInt("Total 4G/5G subscribers partitioned across workers."));
+    props.set("telco_cps", PropInt("Cluster-wide subscriber setup CPS."));
+    props.set("telco_duration_ms", PropInt("Timed telco run duration in ms."));
+    props.set("telco_pool_profile", PropStr("CGNAT/BNG lab pool preset.", {"linear", "regional-bng", "national-cgnat"}));
+    props.set("sctp_rate", PropInt("SCTP target rate."));
+    props.set("diameter_rate", PropInt("Diameter CCR target rate."));
+    props.set("sip_rate", PropInt("SIP target rate."));
+    props.set("enable_srtp", PropBool("Enable SRTP encrypted media."));
+    props.set("teid_start", PropInt("Starting GTP-U TEID."));
+    props.set("teid_count", PropInt("GTP-U TEID count."));
+    props.set("qfi", PropInt("5G NR QFI."));
+    props.set("ipfix_enabled", PropBool("Enable live UDP IPFIX/NetFlow export."));
+    props.set("ipfix_collector", PropStr("Private/loopback IPFIX collector IPv4."));
+    props.set("ipfix_port", PropInt("IPFIX collector UDP port."));
+    props.set("ipfix_sample_rate", PropInt("IPFIX 1:N sampling rate."));
+    props.set("ipfix_netflow_v9", PropBool("Emit NetFlow v9 instead of IPFIX v10."));
+    // Distributed Closed-Loop Autopilot / Mahoraga RL
+    props.set("closed_loop", PropBool("Enable distributed Closed-Loop Autopilot across connected workers."));
+    props.set("cl_strategy", PropStr("Closed-loop strategy.", {"aimd", "binsearch", "rl"}));
+    props.set("cl_window_s", PropInt("Seconds per measured closed-loop window."));
+    props.set("cl_live_reconfigure", PropBool("Drive closed-loop transitions via live ReconfigureShard RPCs."));
+    props.set("cl_min_rps", PropNum("Closed-loop min RPS floor."));
+    props.set("cl_max_rps", PropNum("Closed-loop max RPS ceiling."));
+    props.set("cl_initial_rps", PropNum("Closed-loop initial RPS."));
+    props.set("cl_slo_max_error_pct", PropNum("SLO max error %."));
+    props.set("cl_slo_max_loss_pct", PropNum("SLO max wire loss %."));
+    props.set("cl_slo_max_latency_ms", PropNum("SLO max P99 latency ms."));
+    props.set("cl_slo_max_pushback_pct", PropNum("SLO max 4xx/5xx pushback %."));
+    props.set("cl_aimd_max_windows", PropInt("Max AIMD windows."));
+    props.set("cl_binsearch_max_windows", PropInt("Max binary-search windows."));
+    props.set("rl_policy", PropStr("Path to SRLP RL policy weights for cl_strategy='rl'."));
+    props.set("cl_rl_max_jump_factor", PropNum("RL shield max upward jump factor."));
+    props.set("cl_lever_shield", PropBool("Enable Mahoraga LeverShield on distributed RL runs."));
+    props.set("cl_online_adapt", PropBool("Enable serving-time continual online adaptation."));
+    props.set("cl_novelty", PropBool("Enable open-vocabulary novelty defense detection."));
+    props.set("timeout_s", PropInt("Subprocess wall-clock timeout in seconds (5-120)."));
+    server.RegisterTool({
+        "samurai_cluster_run_job",
+        "Dispatch and execute a real distributed multi-worker test job via samurai_master across connected samurai_slave nodes (supports all 10 workers, shard strategies, 4G/5G telco pools, IPFIX, and distributed Closed-Loop AIMD/BinSearch/Mahoraga RL).",
+        SchemaWithProps(std::move(props)),
+        [&cluster, safety](const Value& a) { return cluster.HandleRunDistributedJob(a, safety); },
     });
   }
 

@@ -4,7 +4,7 @@ A **100% native C++17, zero-Python, modular Model Context Protocol (MCP) server*
 
 Links directly against `samurai_core` (native JSON + `ValidateTargetSafety`), `samurai_control` (`ClosedLoopController`, **Mahoraga `RlPolicy`** SRLP MLP & RL² GRU, `LeverShield`, `RlExploreConfig`, `SplitJobToShards`, `SplitTelcoSubscribers`, `AutoscaleController`), and `samurai_scenario` (`parse_spec`, `build_worker_session_plans_native`, `evaluate_sla_native`).
 
-Exposes **21 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 MCP Workflow Prompts** over stdio JSON-RPC 2.0 — enabling Claude Code, Cursor, Codex, Antigravity, and autonomous RL agents to discover services/nodes, provision and scale workers, coordinate multi-worker shards, run Scenario Engine journeys, and drive Closed-Loop Autopilot runs.
+Exposes **22 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 MCP Workflow Prompts** over stdio JSON-RPC 2.0 — enabling Claude Code, Cursor, Codex, Antigravity, and autonomous RL agents to execute live tests against authorized target servers across all 10 workers (L4, L7/TLS/H2/QUIC, GPU BAR1 P2P, 4G/5G Telco CUPS, IPFIX), discover/provision/scale cluster nodes, dispatch distributed multi-worker jobs, run Scenario Engine journeys, and drive Closed-Loop Autopilot runs.
 
 ---
 
@@ -51,24 +51,25 @@ claude mcp add samurai -- docker run -i --rm --network host ghcr.io/mehmet8-dev/
 
 ---
 
-## All 21 Native MCP Tools
+## All 22 Native MCP Tools
 
-### Dataplane, Benchmarks & RFC Compliance (6 Tools)
+### Dataplane, Live Target Testing, Benchmarks & RFC Compliance (6 Tools)
 | Tool | Purpose |
 | :--- | :--- |
 | `samurai_list_workers` | Discovers all 10 compiled C++17 workers (`cpu`, `afpacket`, `afxdp`, `dpdk`, `gpu`, `doca`, `l7`, `scenario`, `telco`, `defense`), daemons, and benchmarks |
 | `samurai_list_profiles` | Lists built-in L4, L7, and 4G/5G carrier-telecom profiles |
-| `samurai_run_benchmark` | Runs a bounded, fail-closed benchmark via `samurai` and returns parsed JSON telemetry + KPI gate status |
-| `samurai_run_rfc_suite` | Runs RFC 2544 / 3511 / 8219 compliance benchmarks and returns a Markdown report |
-| `samurai_bench_tcp_flows` | Reproduces the 100k quick check or 1M active TCP flows (`605 B/flow`) scaling benchmark |
-| `samurai_bench_l7_userspace` | Runs the Shared-Nothing HTTP/1.1 & HTTP/2 userspace benchmark (`CPS`, `RPS`, `P50/P95/P99`, `VmRSS`) |
+| `samurai_run_benchmark` | Executes real live traffic against an authorized target server using any of the 10 workers (full L7/TLS/H2/QUIC, 4G/5G Telco CUPS/GTP-U/SCTP/Diameter/SIP-SRTP, GPU BAR1 P2P, IPFIX, and KPI gate controls) |
+| `samurai_run_rfc_suite` | Runs RFC 2544 / 3511 / 8219 compliance benchmarks (analytical dry-run or `live_dataplane: true` against a target) |
+| `samurai_bench_tcp_flows` | Reproduces the 100k quick check or 1M active TCP flows (`605 B/flow`) internal dataplane scaling benchmark |
+| `samurai_bench_l7_userspace` | Runs the Shared-Nothing HTTP/1.1 & HTTP/2 internal userspace benchmark (`CPS`, `RPS`, `P50/P95/P99`, `VmRSS`) |
 
-### Distributed Cluster Discovery, Node Provisioning & Multi-Worker Coordination (7 Tools)
+### Distributed Cluster Discovery, Provisioning, Multi-Worker Jobs & Coordination (8 Tools)
 | Tool | Purpose |
 | :--- | :--- |
 | `samurai_cluster_discover` | Queries `samurai_master` `:8089` (`/healthz`, `/v1/cluster/summary`, `/v1/cluster/workers`, `/v1/cluster/shards`, `/v1/cluster/events`, `/metrics`) |
 | `samurai_cluster_status` | Alias for `samurai_cluster_discover` |
 | `samurai_cluster_provision_node` | Adds new private/RFC1918 worker nodes via `POST /v1/cluster/provision` (SSH/zero-install bootstrap) |
+| `samurai_cluster_run_job` | Dispatches and executes a real distributed multi-worker test via `samurai_master` across connected `samurai_slave` nodes (all 10 workers, shard strategies, 4G/5G telco pools, IPFIX, and distributed Closed-Loop AIMD/BinSearch/Mahoraga RL) |
 | `samurai_cluster_reconfigure` | Coordinates live worker shards mid-flight via `POST /v1/shards/reconfigure` (RPS, concurrency, Mahoraga levers) |
 | `samurai_cluster_abort` | Emergency cluster-wide job abort via `POST /v1/jobs/abort` |
 | `samurai_cluster_plan_shards` | In-process multi-worker sharding (`equal`/`capability`/`region` + 5G telco `regional-bng`/`national-cgnat`) & `AutoscaleController` replica planning |

@@ -55,6 +55,12 @@ class ClusterManager {
   //   action = "start" | "scale" | "status" | "stop"
   ToolResult HandleLocalMesh(const samurai::core::json::Value& args);
 
+  // Dispatch a real distributed multi-worker job via `samurai_master` across
+  // connected `samurai_slave` nodes (supports all workers, shard strategies,
+  // 4G/5G telco pools, IPFIX, and closed-loop AIMD/BinSearch/Mahoraga RL).
+  ToolResult HandleRunDistributedJob(const samurai::core::json::Value& args,
+                                     const SafetyConfig& safety) const;
+
  private:
   struct LocalSlave {
     std::string worker_id;
