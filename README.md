@@ -1,6 +1,6 @@
 # Samurai Network Resilience & Line-Rate Stress Platform
 
-Samurai (Release 3.0.0) is a high-performance network resilience, carrier-telecom emulation, and line-rate stress testing platform designed strictly for authorized lab and infrastructure validation environments.
+Samurai (v3.1.1) is a high-performance network resilience, carrier-telecom emulation, and line-rate stress testing platform designed strictly for authorized lab and infrastructure validation environments.
 
 The platform is engineered in modern **C++ (C++17)** with zero runtime Python latency, featuring a **ZeroMQ (ZMQ) binary IPC wire protocol (ABI v3)**, **Kernel-Bypass (`AF_XDP`, `DPDK`)** drivers, **NVIDIA CUDA (including GeForce BAR1 P2P & GPU-initiated doorbell) & DOCA GPUNetIO packet synthesis**, **DPU ARM/GPU CUPS offloading**, a **64-shard Userspace TCP/L7 engine**, and a **native C++17 MCP server (`samurai_mcp`)** for AI coding agents and closed-loop RL autopilots.
 
@@ -217,7 +217,7 @@ Run on each agent/generator machine:
 Pull and run the pre-built multi-stage native runtime image from GitHub Container Registry without compiling locally:
 
 ```bash
-# Pull the latest release image (or pin a version tag such as :v3.0.1)
+# Pull the latest release image (or pin a version tag such as :v3.1.1)
 docker pull ghcr.io/mehmet8-dev/samurai:latest
 
 # Inspect CLI and distributed daemon options
