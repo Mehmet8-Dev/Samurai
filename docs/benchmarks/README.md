@@ -20,7 +20,7 @@ All measurements below were captured on a commodity laptop (AMD Ryzen 5 5600H â€
 
 ## Capability Comparison
 
-| Capability | **Samurai v3.2** | `wrk` / `hey` | `k6` / `Locust` | `Cisco TRex` | `pktgen` |
+| Capability | **Samurai v3.3** | `wrk` / `hey` | `k6` / `Locust` | `Cisco TRex` | `pktgen` |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | Pure Native C++17 (Zero Scripting Runtime) | Yes | C / Go | JS / Python | C++ / Py ctrl | Kernel C |
 | Stateful Userspace TCP (1M Flows @ 605 B/flow) | Yes | No | No | Yes | No |

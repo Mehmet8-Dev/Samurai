@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-11-21
+
+### Added
+- **Full Worker & Distributed Cluster Job Dispatch in MCP (`samurai/mcp/`)**:
+  - Exposed full L7/TLS/Telco/GPU/IPFIX worker flags on `samurai_run_benchmark` and added `samurai_cluster_run_job` for distributed multi-worker execution (including closed-loop RL autopilot and 5G telco pool profiles).
+  - Added AF_XDP SKB/copy (`xdp_mode=0` default) and `custom_tcp` wire selection (`af_xdp`, `af_packet`, `dpdk`, `in_memory`) plus automatic route/interface/IP/MAC discovery (`ResolveCustomTcpEnv`) to `samurai_run_benchmark` and `samurai_scenario_run`.
+
+### Fixed
+- **Master–Slave, Multi-Master Federation & Redis HA (`samurai/control/`, `samurai/mcp/cluster_tools.cpp`)**:
+  - Parsed `[user]:password@` credentials in `ParseRedisUrl` and wired `AUTH` + `SELECT` error handling into `HiredisKvStore::EnsureConnected`.
+  - Enabled serve-only `samurai_master` (`--management-listen` with `--count 0`), real `POST /v1/jobs/abort` mid-flight shard recall, and skipped local worker blocking when delegating jobs to remote regions.
+  - Added `--ha-standby` and `--ha-lease-s` for Redis/file-lock HA standby promotion and scaled lease renewal.
+  - Populated `ha`, `multi_master`, `multi_master_regions`/`latest`, `shards`, `current_job`, and `latest_snapshot` in Management API state, enriched `region_rollup` with worker region capabilities, and passed resolved `--worker-dir` to `samurai_slave` in `samurai_cluster_local_mesh`.
+
+### Changed
+- Bumped canonical SemVer across package, Helm `appVersion`, citation metadata, MCP server, and documentation to `3.3.0`.
+
 ## [3.2.0] - 2026-11-21
 
 ### Added
@@ -133,7 +150,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Kenjaku` is retained as codename.
 - Previous codename: `Ronin`.
 
-[Unreleased]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.2.0...HEAD
+[Unreleased]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.3.0...HEAD
+[3.3.0]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.1.1...v3.2.0
 [3.1.1]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.0.1...v3.1.1
 [3.0.1]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.0.0...v3.0.1
