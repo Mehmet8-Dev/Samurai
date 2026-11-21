@@ -2366,10 +2366,13 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Serve loop: pull delegated jobs from peer regions and/or keep the control +
-  // management plane alive until signalled.
+  // Serve loop: pull delegated jobs from peer regions (multi-master) or keep
+  // a serve-only (--count 0) control/management/autoscale plane alive until
+  // signalled. One-shot local jobs (--count > 0) with --management-listen exit
+  // once their job completes so callers waiting on master PID do not hang.
   const bool mm_serve = (mm && mm->active() && !master_region.empty());
-  if (mm_serve || !mgmt_listen.empty() || autoscale_on) {
+  const bool serve_only = !has_local_job && (!mgmt_listen.empty() || autoscale_on);
+  if (mm_serve || serve_only) {
     const int dequeue_max =
         static_cast<int>(OptInt(argc, argv, "--multi-master-dequeue-max", 3));
     if (mm_serve) {
