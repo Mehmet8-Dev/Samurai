@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-11-22
+
+### Added
+- **Zero-Build `samurai-net` npm/npx Launcher (`npm/`)**:
+  - Added zero-dependency `samurai-net` CLI launcher (`samurai-net`, `samurai`, `samurai-mcp`, `samurai-master`, `samurai-slave`, and `bench 1m-tcp|100k-tcp|l7`) that caches and SHA-256 verifies Linux `x86_64` GitHub Release bundles or falls back cleanly to GHCR Docker on macOS/Windows/ARM64.
+- **1-Command MCP Diagnostics & Setup (`samurai/mcp/setup_tools.*`)**:
+  - Added `doctor` and `setup` subcommands to both `samurai_mcp` and `samurai mcp` supporting 10 AI clients (`claude_code`, `claude_desktop`, `cursor`, `codex`, `gemini_cli`, `antigravity`, `windsurf`, `vscode`, `opencode`, `copilot_cli`) with `--dry-run`, `--yes` (`.bak` backups + sibling server preservation), `--npx`, and `--docker` transports.
+- **Cross-Platform Docker Desktop Guide & AGPL-3.0 Adoption FAQ (`README.md`, `docs/11-docker.md`)**:
+  - Added top-level `Quick Start`, macOS/Windows `host.docker.internal` guidance, and a 3-point AGPL-3.0 FAQ clarifying internal lab/CI usage vs network service redistribution.
+
+### Changed
+- **Release Tarball & Internationalization (`release.yml`, `samurai/core/`)**:
+  - Included `samurai_bench_100k_tcp`, `samurai_bench_1m_tcp`, `samurai_bench_l7`, and `skills/` in the GitHub Release tarball, and added an optional `publish-npm` job to `.github/workflows/release.yml`.
+  - Standardized user-facing target safety and network utility messages in `samurai/core/target_safety.cpp` and `samurai/core/net_utils.cpp` to English, aligned `22 tools` counts across `mcp/README.md` and docs, and bumped canonical SemVer to `3.3.1`.
+
 ## [3.3.0] - 2026-11-21
 
 ### Added
@@ -150,7 +165,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Kenjaku` is retained as codename.
 - Previous codename: `Ronin`.
 
-[Unreleased]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.3.0...HEAD
+[Unreleased]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.3.1...HEAD
+[3.3.1]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.1.1...v3.2.0
 [3.1.1]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.0.1...v3.1.1

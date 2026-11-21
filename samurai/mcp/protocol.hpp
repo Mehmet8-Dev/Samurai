@@ -17,7 +17,7 @@
 namespace samurai::mcp {
 
 inline constexpr const char* kServerName = "samurai-mcp";
-inline constexpr const char* kServerVersion = "3.3.0";
+inline constexpr const char* kServerVersion = "3.3.1";
 inline constexpr const char* kProtocolVersion = "2024-11-05";
 
 struct ToolResult {

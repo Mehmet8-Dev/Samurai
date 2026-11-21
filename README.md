@@ -2,7 +2,7 @@
 
 **1,000,000 stateful TCP flows in 577 MiB (`605 B/flow`) · Stateful HTTP/2 & QUIC/H3 (`io_uring`/kTLS) · Consumer GeForce BAR1 P2P CUDA · 5G CUPS Telecom · Native C++17 MCP Server (`samurai_mcp`)**
 
-Samurai (v3.3.0) bridges the gap between scripting load tools (`k6`, `Locust`) and raw stateless packet generators (`pktgen`, `TRex`) in a single compiled **C++17** runtime with zero Python dataplane overhead — strictly scoped for authorized lab and infrastructure validation.
+Samurai (v3.3.1) bridges the gap between scripting load tools (`k6`, `Locust`) and raw stateless packet generators (`pktgen`, `TRex`) in a single compiled **C++17** runtime with zero Python dataplane overhead — strictly scoped for authorized lab and infrastructure validation.
 
 ---
 
@@ -263,7 +263,7 @@ Run on each agent/generator machine:
 Pull and run the pre-built multi-stage native runtime image from GitHub Container Registry without compiling locally:
 
 ```bash
-# Pull the latest release image (or pin a version tag such as :v3.3.0)
+# Pull the latest release image (or pin a version tag such as :v3.3.1)
 docker pull ghcr.io/mehmet8-dev/samurai:latest
 
 # Inspect CLI and distributed daemon options
