@@ -48,7 +48,13 @@ def test_cpp_mcp_initialize_and_tools_list() -> None:
         "samurai_run_rfc_suite",
         "samurai_bench_tcp_flows",
         "samurai_bench_l7_userspace",
+        "samurai_cluster_discover",
         "samurai_cluster_status",
+        "samurai_cluster_provision_node",
+        "samurai_cluster_reconfigure",
+        "samurai_cluster_abort",
+        "samurai_cluster_plan_shards",
+        "samurai_cluster_local_mesh",
         "samurai_autopilot_create",
         "samurai_autopilot_step",
         "samurai_autopilot_run_window",
@@ -212,3 +218,54 @@ def test_cpp_mcp_scenario_compile_and_sla() -> None:
 
     sla = json.loads(responses[1]["result"]["content"][0]["text"])
     assert sla["passed"] is True
+
+
+def test_cpp_mcp_skills_resources_and_cluster_planning() -> None:
+    responses = _send_rpc(
+        [
+            {"jsonrpc": "2.0", "id": 50, "method": "resources/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 51, "method": "prompts/list", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 52,
+                "method": "resources/read",
+                "params": {"uri": "samurai://skills/samurai-hardware-dataplane"},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 53,
+                "method": "tools/call",
+                "params": {
+                    "name": "samurai_cluster_plan_shards",
+                    "arguments": {
+                        "mode": "packets",
+                        "strategy": "capability",
+                        "total_count": 50000,
+                        "workers": [
+                            {"worker_id": "w1", "gpu_available": True, "capacity_score": 3},
+                            {"worker_id": "w2", "xdp_available": True, "capacity_score": 1},
+                        ],
+                    },
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 54,
+                "method": "tools/call",
+                "params": {
+                    "name": "samurai_cluster_provision_node",
+                    "arguments": {"host": "127.0.0.1", "node_hosts": "8.8.8.8"},
+                },
+            },
+        ]
+    )
+    assert len(responses[0]["result"]["resources"]) == 5
+    assert len(responses[1]["result"]["prompts"]) == 5
+    skill_text = responses[2]["result"]["contents"][0]["text"]
+    assert "samurai_afxdp_worker" in skill_text
+
+    plan = json.loads(responses[3]["result"]["content"][0]["text"])
+    assert len(plan["shards"]) == 2
+    assert "autoscale_recommendation" in plan
+
+    assert responses[4]["result"]["isError"] is True

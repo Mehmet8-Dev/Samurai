@@ -56,6 +56,14 @@ void McpServer::RegisterTool(ToolSpec spec) {
   tools_.push_back(std::move(spec));
 }
 
+void McpServer::RegisterResource(ResourceSpec spec) {
+  resources_.push_back(std::move(spec));
+}
+
+void McpServer::RegisterPrompt(PromptSpec spec) {
+  prompts_.push_back(std::move(spec));
+}
+
 std::optional<Value> McpServer::HandleRequest(const Value& req) const {
   if (!req.is_object()) {
     return MakeRpcError(nullptr, -32600, "Invalid Request: expected JSON object");
@@ -68,7 +76,6 @@ std::optional<Value> McpServer::HandleRequest(const Value& req) const {
   }
   const std::string method = method_val->as_string();
 
-  // Notifications carry no response per JSON-RPC 2.0 / MCP spec.
   if (method.rfind("notifications/", 0) == 0) {
     return std::nullopt;
   }
@@ -76,6 +83,8 @@ std::optional<Value> McpServer::HandleRequest(const Value& req) const {
   if (method == "initialize") {
     Value caps = Value::Object();
     caps.set("tools", Value::Object());
+    if (!resources_.empty()) caps.set("resources", Value::Object());
+    if (!prompts_.empty()) caps.set("prompts", Value::Object());
 
     Value server_info = Value::Object();
     server_info.set("name", Value::Str(name_));
@@ -138,6 +147,99 @@ std::optional<Value> McpServer::HandleRequest(const Value& req) const {
       }
     }
     return MakeRpcError(id, -32601, "Unknown tool: " + tool_name);
+  }
+
+  if (method == "resources/list") {
+    Value arr = Value::Array();
+    for (const auto& r : resources_) {
+      Value entry = Value::Object();
+      entry.set("uri", Value::Str(r.uri));
+      entry.set("name", Value::Str(r.name));
+      entry.set("description", Value::Str(r.description));
+      entry.set("mimeType", Value::Str(r.mime_type));
+      arr.push_back(std::move(entry));
+    }
+    Value result = Value::Object();
+    result.set("resources", std::move(arr));
+    return MakeRpcResult(id, std::move(result));
+  }
+
+  if (method == "resources/read") {
+    const Value* params = req.find("params");
+    if (!params || !params->is_object()) {
+      return MakeRpcError(id, -32602, "Invalid params: expected object");
+    }
+    const Value* uri_val = params->find("uri");
+    if (!uri_val || !uri_val->is_string()) {
+      return MakeRpcError(id, -32602, "Invalid params: missing string 'uri'");
+    }
+    const std::string uri = uri_val->as_string();
+    for (const auto& r : resources_) {
+      if (r.uri == uri) {
+        Value item = Value::Object();
+        item.set("uri", Value::Str(r.uri));
+        item.set("mimeType", Value::Str(r.mime_type));
+        item.set("text", Value::Str(r.reader ? r.reader() : ""));
+
+        Value contents = Value::Array();
+        contents.push_back(std::move(item));
+
+        Value result = Value::Object();
+        result.set("contents", std::move(contents));
+        return MakeRpcResult(id, std::move(result));
+      }
+    }
+    return MakeRpcError(id, -32602, "Resource not found: " + uri);
+  }
+
+  if (method == "prompts/list") {
+    Value arr = Value::Array();
+    for (const auto& p : prompts_) {
+      Value entry = Value::Object();
+      entry.set("name", Value::Str(p.name));
+      entry.set("description", Value::Str(p.description));
+      entry.set("arguments", Value::Array());
+      arr.push_back(std::move(entry));
+    }
+    Value result = Value::Object();
+    result.set("prompts", std::move(arr));
+    return MakeRpcResult(id, std::move(result));
+  }
+
+  if (method == "prompts/get") {
+    const Value* params = req.find("params");
+    if (!params || !params->is_object()) {
+      return MakeRpcError(id, -32602, "Invalid params: expected object");
+    }
+    const Value* name_val = params->find("name");
+    if (!name_val || !name_val->is_string()) {
+      return MakeRpcError(id, -32602, "Invalid params: missing string 'name'");
+    }
+    const std::string name = name_val->as_string();
+    const Value empty_args = Value::Object();
+    const Value* args_val = params->find("arguments");
+    const Value& args = (args_val && args_val->is_object()) ? *args_val : empty_args;
+
+    for (const auto& p : prompts_) {
+      if (p.name == name) {
+        Value content = Value::Object();
+        content.set("type", Value::Str("text"));
+        content.set("text", Value::Str(p.renderer ? p.renderer(args) : ""));
+
+        Value msg = Value::Object();
+        msg.set("role", Value::Str("user"));
+        msg.set("content", std::move(content));
+
+        Value msgs = Value::Array();
+        msgs.push_back(std::move(msg));
+
+        Value result = Value::Object();
+        result.set("description", Value::Str(p.description));
+        result.set("messages", std::move(msgs));
+        return MakeRpcResult(id, std::move(result));
+      }
+    }
+    return MakeRpcError(id, -32602, "Prompt not found: " + name);
   }
 
   return MakeRpcError(id, -32601, "Method not found: " + method);

@@ -2,7 +2,8 @@
 
 // Modular C++17 Model Context Protocol (MCP) JSON-RPC 2.0 engine.
 // Implements MCP protocolVersion "2024-11-05" over stdio (newline-delimited JSON)
-// using samurai_core's dependency-free JSON parser/serializer.
+// with Tools, Resources (portable Skills & Worker playbooks), and Prompts using
+// samurai_core's dependency-free JSON parser/serializer.
 
 #include <functional>
 #include <istream>
@@ -33,6 +34,20 @@ struct ToolSpec {
   ToolHandler handler;
 };
 
+struct ResourceSpec {
+  std::string uri;
+  std::string name;
+  std::string description;
+  std::string mime_type = "text/markdown";
+  std::function<std::string()> reader;
+};
+
+struct PromptSpec {
+  std::string name;
+  std::string description;
+  std::function<std::string(const samurai::core::json::Value& args)> renderer;
+};
+
 // Convenience builders for tool handlers.
 ToolResult MakeToolSuccess(samurai::core::json::Value payload);
 ToolResult MakeToolError(const std::string& message);
@@ -42,6 +57,8 @@ class McpServer {
   McpServer(std::string name = kServerName, std::string version = kServerVersion);
 
   void RegisterTool(ToolSpec spec);
+  void RegisterResource(ResourceSpec spec);
+  void RegisterPrompt(PromptSpec spec);
 
   // Dispatches a single JSON-RPC 2.0 request object. Returns std::nullopt for
   // notifications that require no response.
@@ -54,11 +71,15 @@ class McpServer {
   int RunStream(std::istream& in, std::ostream& out) const;
 
   std::size_t ToolCount() const { return tools_.size(); }
+  std::size_t ResourceCount() const { return resources_.size(); }
+  std::size_t PromptCount() const { return prompts_.size(); }
 
  private:
   std::string name_;
   std::string version_;
   std::vector<ToolSpec> tools_;
+  std::vector<ResourceSpec> resources_;
+  std::vector<PromptSpec> prompts_;
 };
 
 }  // namespace samurai::mcp

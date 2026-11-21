@@ -8,6 +8,7 @@
 #include <string>
 
 #include "autopilot_tools.hpp"
+#include "cluster_tools.hpp"
 #include "json.hpp"
 #include "protocol.hpp"
 #include "safety.hpp"
@@ -70,10 +71,12 @@ Value ParseToolPayload(const Value& rpc_resp, bool* out_is_error = nullptr) {
 int main() {
   samurai::mcp::SafetyConfig safety;
   samurai::mcp::AutopilotManager autopilot;
+  samurai::mcp::ClusterManager cluster;
   samurai::mcp::McpServer server;
-  samurai::mcp::RegisterAllTools(server, autopilot, safety);
+  samurai::mcp::RegisterAllTools(server, autopilot, cluster, safety);
+  samurai::mcp::RegisterSkillsAndPrompts(server);
 
-  // 1. Initialize handshake (protocolVersion 2024-11-05)
+  // 1. Initialize handshake (protocolVersion 2024-11-05) + tools/resources/prompts capabilities
   {
     const auto line = server.HandleLine(
         R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})");
@@ -85,6 +88,9 @@ int main() {
           "protocolVersion is 2024-11-05");
     Check(res && res->find("serverInfo")->find("name")->as_string() == "samurai-mcp",
           "serverInfo.name is samurai-mcp");
+    const Value* caps = res ? res->find("capabilities") : nullptr;
+    Check(caps && caps->find("tools") && caps->find("resources") && caps->find("prompts"),
+          "capabilities advertise tools, resources, and prompts");
   }
 
   // 2. Notification produces no response
@@ -94,15 +100,37 @@ int main() {
     Check(!notif.has_value(), "notifications/initialized emits no response");
   }
 
-  // 3. tools/list exposes all 15 modular tools (runtime + Autopilot RL + Scenario Engine)
+  // 3. tools/list, resources/list, and prompts/list
   {
     const auto line = server.HandleLine(
         R"({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})");
     Check(line.has_value(), "tools/list returns response");
     const auto p = Parse(*line);
     const Value* tools = p.value.find("result")->find("tools");
-    Check(tools && tools->is_array() && tools->elements().size() == 15,
-          "tools/list returns 15 registered tools");
+    Check(tools && tools->is_array() && tools->elements().size() == 21,
+          "tools/list returns 21 registered tools");
+
+    const auto rline = server.HandleLine(
+        R"({"jsonrpc":"2.0","id":201,"method":"resources/list","params":{}})");
+    const auto rp = Parse(*rline);
+    const Value* resources = rp.value.find("result")->find("resources");
+    Check(resources && resources->is_array() && resources->elements().size() == 5,
+          "resources/list returns 5 skill resources");
+
+    const auto rread = server.HandleLine(
+        R"({"jsonrpc":"2.0","id":202,"method":"resources/read","params":{"uri":"samurai://skills/samurai-cluster-orchestrator"}})");
+    const auto rrp = Parse(*rread);
+    const Value* contents = rrp.value.find("result")->find("contents");
+    Check(contents && contents->is_array() && !contents->elements().empty() &&
+              !contents->elements()[0].find("text")->as_string().empty(),
+          "resources/read returns samurai-cluster-orchestrator skill text");
+
+    const auto pline = server.HandleLine(
+        R"({"jsonrpc":"2.0","id":203,"method":"prompts/list","params":{}})");
+    const auto pp = Parse(*pline);
+    const Value* prompts = pp.value.find("result")->find("prompts");
+    Check(prompts && prompts->is_array() && prompts->elements().size() == 5,
+          "prompts/list returns 5 skill prompts");
   }
 
   // 4. Fail-closed safety blocks public targets
@@ -276,11 +304,62 @@ int main() {
           "samurai_scenario_run blocks public IP fail-closed");
   }
 
+  // 7. Cluster Orchestration: multi-worker sharding, 5G telco CGNAT split, autoscale & provision safety
+  {
+    const auto plan_args = Parse(R"({
+      "mode": "packets",
+      "strategy": "capability",
+      "total_count": 100000,
+      "workers": [
+        {"worker_id": "node-gpu-1", "region": "eu-central", "gpu_available": true, "capacity_score": 4},
+        {"worker_id": "node-xdp-2", "region": "eu-central", "xdp_available": true, "capacity_score": 2}
+      ],
+      "shards_per_worker": 1,
+      "max_replicas": 16
+    })");
+    bool is_err = false;
+    const Value plan = ParseToolPayload(
+        CallTool(server, 30, "samurai_cluster_plan_shards", plan_args.value), &is_err);
+    Check(!is_err, "samurai_cluster_plan_shards (packets) succeeds");
+    const Value* shards = plan.find("shards");
+    Check(shards && shards->is_array() && shards->elements().size() == 2,
+          "2 weighted shards planned across heterogeneous workers");
+    Check(plan.find("autoscale_recommendation") != nullptr,
+          "autoscale recommendation included");
+
+    const auto telco_plan_args = Parse(R"({
+      "mode": "telco",
+      "strategy": "region",
+      "target_region": "tr-ist",
+      "total_subscribers": 4000,
+      "protocol": "gtpu",
+      "pool_profile": "regional-bng",
+      "workers": [
+        {"worker_id": "bng-ist-1", "region": "tr-ist", "capacity_score": 3},
+        {"worker_id": "bng-ank-1", "region": "tr-ank", "capacity_score": 1}
+      ]
+    })");
+    const Value tplan = ParseToolPayload(
+        CallTool(server, 31, "samurai_cluster_plan_shards", telco_plan_args.value), &is_err);
+    Check(!is_err && tplan.find("shards")->elements().size() == 2,
+          "5G telco subscriber sharding with regional-bng pool succeeds");
+
+    // Fail-closed safety blocks provisioning public IPs
+    const auto bad_prov = Parse(R"({"host":"127.0.0.1","node_hosts":"10.0.0.5,8.8.8.8","worker_kind":"bundle"})");
+    const Value prov_err = ParseToolPayload(
+        CallTool(server, 32, "samurai_cluster_provision_node", bad_prov.value), &is_err);
+    Check(is_err && prov_err.find("error") != nullptr,
+          "samurai_cluster_provision_node blocks public node IP fail-closed");
+  }
+
   if (g_failures > 0) {
     std::fprintf(stderr, "samurai_mcp selftest: %d failure(s)\n", g_failures);
     return 1;
   }
-  std::printf("samurai_mcp selftest: all checks passed (protocolVersion=%s, tools=%zu)\n",
-              samurai::mcp::kProtocolVersion, server.ToolCount());
+  std::printf("samurai_mcp selftest: all checks passed (protocolVersion=%s, tools=%zu, resources=%zu, prompts=%zu)\n",
+              samurai::mcp::kProtocolVersion,
+              server.ToolCount(),
+              server.ResourceCount(),
+              server.PromptCount());
   return 0;
 }

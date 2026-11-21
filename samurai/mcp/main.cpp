@@ -2,14 +2,17 @@
 //
 // Zero Python runtime, zero third-party MCP SDKs. Speaks JSON-RPC 2.0 over
 // stdin/stdout (protocolVersion: "2024-11-05") and exposes Samurai's native
-// dataplane engines, RFC compliance suites, reproducible benchmarks, and
-// Closed-Loop Autopilot / Mahoraga RL Agent controllers.
+// dataplane engines, RFC compliance suites, Scenario Engine, Distributed
+// Cluster Orchestrator (discovery, node provisioning, scaling, live shard
+// coordination), Closed-Loop Autopilot / Mahoraga RL controllers, and native
+// MCP Skill Resources & Prompts.
 
 #include <cstdio>
 #include <iostream>
 #include <string>
 
 #include "autopilot_tools.hpp"
+#include "cluster_tools.hpp"
 #include "protocol.hpp"
 #include "safety.hpp"
 #include "tool_registry.hpp"
@@ -25,11 +28,13 @@ int main(int argc, char** argv) {
           "Cursor, Codex, Antigravity, and autonomous Autopilot / RL agents.\n"
           "\n"
           "Environment variables:\n"
-          "  SAMURAI_BIN_DIR                    Directory containing samurai binaries\n"
-          "  SAMURAI_MCP_ALLOW_TARGETS          Optional CSV allowlist of lab IPv4/CIDRs\n"
-          "  SAMURAI_MCP_DENY_TARGETS           Optional CSV denylist (always wins)\n"
-          "  SAMURAI_MCP_MAX_COUNT              Max packet/request count per tool call (default: 500000)\n"
-          "  SAMURAI_MANAGEMENT_API_VIEWER_TOKEN Optional Bearer token for samurai_master :8089\n",
+          "  SAMURAI_BIN_DIR                      Directory containing samurai binaries\n"
+          "  SAMURAI_MCP_ALLOW_TARGETS            Optional CSV allowlist of lab IPv4/CIDRs\n"
+          "  SAMURAI_MCP_DENY_TARGETS             Optional CSV denylist (always wins)\n"
+          "  SAMURAI_MCP_MAX_COUNT                Max packet/request count per tool call (default: 500000)\n"
+          "  SAMURAI_MANAGEMENT_API_VIEWER_TOKEN  Optional Viewer token for samurai_master :8089\n"
+          "  SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN Optional Operator token for provision/reconfigure/abort\n"
+          "  SAMURAI_MANAGEMENT_API_ADMIN_TOKEN   Optional Admin token for samurai_master :8089\n",
           samurai::mcp::kServerVersion,
           samurai::mcp::kProtocolVersion);
       return 0;
@@ -48,8 +53,10 @@ int main(int argc, char** argv) {
 
   const samurai::mcp::SafetyConfig safety = samurai::mcp::LoadSafetyConfigFromEnv();
   samurai::mcp::AutopilotManager autopilot;
+  samurai::mcp::ClusterManager cluster;
   samurai::mcp::McpServer server;
-  samurai::mcp::RegisterAllTools(server, autopilot, safety);
+  samurai::mcp::RegisterAllTools(server, autopilot, cluster, safety);
+  samurai::mcp::RegisterSkillsAndPrompts(server);
 
   return server.RunStream(std::cin, std::cout);
 }

@@ -1,5 +1,12 @@
 #include "tool_registry.hpp"
 
+#include <unistd.h>
+
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
 #include "runtime_tools.hpp"
 #include "scenario_tools.hpp"
 
@@ -61,9 +68,37 @@ Value SchemaWithProps(Value props, const std::vector<std::string>& required = {}
   return s;
 }
 
+std::string ReadSkillMarkdown(const std::string& rel_path, const std::string& fallback_text) {
+  std::vector<std::string> prefixes = {"."};
+  char buf[4096] = {0};
+  const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n > 0) {
+    std::string p(buf, static_cast<std::size_t>(n));
+    const auto slash = p.find_last_of('/');
+    if (slash != std::string::npos) {
+      const std::string dir = p.substr(0, slash);
+      prefixes.push_back(dir + "/../..");
+      prefixes.push_back(dir + "/..");
+      prefixes.push_back("/usr/local/share/samurai");
+    }
+  }
+  for (const auto& pre : prefixes) {
+    std::ifstream in(pre + "/" + rel_path);
+    if (in.is_open()) {
+      std::ostringstream oss;
+      oss << in.rdbuf();
+      return oss.str();
+    }
+  }
+  return fallback_text;
+}
+
 }  // namespace
 
-void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const SafetyConfig& safety) {
+void RegisterAllTools(McpServer& server,
+                      AutopilotManager& autopilot,
+                      ClusterManager& cluster,
+                      const SafetyConfig& safety) {
   // 1. Worker & binary discovery
   server.RegisterTool({
       "samurai_list_workers",
@@ -145,20 +180,132 @@ void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const Safe
     });
   }
 
-  // 7. Distributed cluster status via POSIX HTTP
+  // 7. Cluster service/node/worker/shard discovery (real samurai_master endpoints)
   {
     Value props = Value::Object();
     props.set("host", PropStr("Private/loopback IPv4 address of samurai_master (default: 127.0.0.1)."));
     props.set("port", PropInt("Management API HTTP port (default: 8089)."));
+    props.set("auth_token", PropStr("Optional Bearer token (falls back to SAMURAI_MANAGEMENT_API_*_TOKEN)."));
+    props.set("include_events", PropBool("Include /v1/cluster/events log (default: false)."));
+    props.set("include_metrics", PropBool("Include Prometheus /metrics scrape (default: false)."));
+    server.RegisterTool({
+        "samurai_cluster_discover",
+        "Discover live cluster topology, registered worker nodes, heartbeats, regions, active shards, and optional Prometheus metrics from samurai_master (:8089).",
+        SchemaWithProps(std::move(props)),
+        [&cluster, safety](const Value& a) { return cluster.HandleDiscover(a, safety); },
+    });
+    // Backwards-compatible alias
     server.RegisterTool({
         "samurai_cluster_status",
-        "Query a running samurai_master distributed cluster via its native HTTP Management API (/healthz and /v1/state).",
-        SchemaWithProps(std::move(props)),
-        [safety](const Value& a) { return HandleClusterStatus(a, safety); },
+        "Alias for samurai_cluster_discover: inspect samurai_master /healthz, /v1/cluster/summary, /v1/cluster/workers, and /v1/cluster/shards.",
+        SchemaWithProps(Value::Object()),
+        [&cluster, safety](const Value& a) { return cluster.HandleDiscover(a, safety); },
     });
   }
 
-  // 8. Autopilot / Mahoraga RL: Create session
+  // 8. Provision new worker nodes into the cluster
+  {
+    Value props = Value::Object();
+    props.set("host", PropStr("samurai_master private/loopback IPv4 (default: 127.0.0.1)."));
+    props.set("port", PropInt("Management API HTTP port (default: 8089)."));
+    props.set("node_hosts", PropStr("Comma-separated private/RFC1918 IPv4 addresses of new nodes to provision."));
+    props.set("ssh_user", PropStr("SSH username on target lab nodes (default: root)."));
+    props.set("ssh_key_path", PropStr("Optional SSH private key path on the master host."));
+    props.set("worker_kind", PropStr("Dataplane worker kind to deploy ('bundle' for all workers, or specific worker name)."));
+    props.set("worker_region", PropStr("Optional region tag for the newly joined nodes (e.g. eu-central, tr-ist)."));
+    props.set("auth_token", PropStr("Optional Operator/Admin Bearer token."));
+    props.set("timeout_s", PropInt("Provisioning timeout per host in seconds (2-60, default: 10)."));
+    server.RegisterTool({
+        "samurai_cluster_provision_node",
+        "Add new worker nodes to a running Samurai cluster via POST /v1/cluster/provision (fail-closed: only private/RFC1918 node IPs permitted).",
+        SchemaWithProps(std::move(props), {"node_hosts"}),
+        [&cluster, safety](const Value& a) { return cluster.HandleProvisionNode(a, safety); },
+    });
+  }
+
+  // 9. Live multi-worker shard reconfiguration
+  {
+    Value props = Value::Object();
+    props.set("host", PropStr("samurai_master private/loopback IPv4 (default: 127.0.0.1)."));
+    props.set("port", PropInt("Management API HTTP port (default: 8089)."));
+    props.set("shard_id", PropStr("Optional active shard ID to reconfigure (omit for cluster-wide update)."));
+    props.set("worker_id", PropStr("Optional worker ID filter."));
+    props.set("target_rps", PropNum("New target RPS setpoint."));
+    props.set("concurrency", PropInt("New L7 concurrency level."));
+    props.set("request_mix", PropInt("New Mahoraga request_mix variant index."));
+    props.set("source_rotation", PropInt("New source rotation mode."));
+    props.set("pacing_mode", PropInt("New pacing mode."));
+    Value p_obj = Value::Object();
+    p_obj.set("type", Value::Str("object"));
+    p_obj.set("description", Value::Str("Optional raw params object forwarded to /v1/shards/reconfigure."));
+    props.set("params", std::move(p_obj));
+    props.set("auth_token", PropStr("Optional Operator/Admin Bearer token."));
+    server.RegisterTool({
+        "samurai_cluster_reconfigure",
+        "Coordinate multiple active worker shards in real time via POST /v1/shards/reconfigure (live RPS, concurrency, and Mahoraga shaping updates).",
+        SchemaWithProps(std::move(props)),
+        [&cluster, safety](const Value& a) { return cluster.HandleReconfigure(a, safety); },
+    });
+  }
+
+  // 10. Emergency cluster-wide abort
+  {
+    Value props = Value::Object();
+    props.set("host", PropStr("samurai_master private/loopback IPv4 (default: 127.0.0.1)."));
+    props.set("port", PropInt("Management API HTTP port (default: 8089)."));
+    props.set("auth_token", PropStr("Optional Operator/Admin Bearer token."));
+    server.RegisterTool({
+        "samurai_cluster_abort",
+        "Safely abort active distributed jobs across all cluster workers via POST /v1/jobs/abort.",
+        SchemaWithProps(std::move(props)),
+        [&cluster, safety](const Value& a) { return cluster.HandleAbort(a, safety); },
+    });
+  }
+
+  // 11. In-process multi-worker sharding & autoscale planner
+  {
+    Value props = Value::Object();
+    props.set("mode", PropStr("Sharding mode: 'packets' (L4/L7) or 'telco' (subscriber/CGNAT/BNG partitioning).", {"packets", "telco"}));
+    props.set("strategy", PropStr("Assignment strategy: 'equal', 'capability', or 'region'.", {"equal", "capability", "region"}));
+    props.set("target_region", PropStr("Target PoP/region for locality-aware sharding (e.g. 'eu-central', 'tr-ist')."));
+    props.set("total_count", PropInt("Total packet/request budget (packets mode)."));
+    props.set("total_subscribers", PropInt("Total subscriber count (telco mode)."));
+    props.set("protocol", PropStr("Telco protocol (telco mode, e.g. gtpu, pppoe, dhcp, sctp, diameter, sip-rtp)."));
+    props.set("target_cps", PropInt("Telco subscriber setup CPS (telco mode)."));
+    props.set("pool_profile", PropStr("Isolated CGNAT/BNG lab pool preset.", {"linear", "regional-bng", "national-cgnat"}));
+    Value w_arr = Value::Object();
+    w_arr.set("type", Value::Str("array"));
+    w_arr.set("description", Value::Str("Array of worker IDs or objects {worker_id, region, capacity_score, gpu_available, xdp_available}."));
+    props.set("workers", std::move(w_arr));
+    props.set("min_replicas", PropInt("Autoscale minimum worker replicas (default: 1)."));
+    props.set("max_replicas", PropInt("Autoscale maximum worker replicas (default: 32)."));
+    props.set("shards_per_worker", PropInt("Target shards per worker for autoscale calculation (default: 2)."));
+    server.RegisterTool({
+        "samurai_cluster_plan_shards",
+        "Plan multi-worker shard distribution (equal/capability/region or 4G/5G telco CGNAT/BNG subscriber pools) and compute native AutoscaleController replica recommendations in-process.",
+        SchemaWithProps(std::move(props), {"workers"}),
+        [&cluster](const Value& a) { return cluster.HandlePlanShards(a); },
+    });
+  }
+
+  // 12. Local loopback multi-worker mesh lifecycle (start / scale / status / stop)
+  {
+    Value props = Value::Object();
+    props.set("action", PropStr("Lifecycle action: start, scale, status, or stop.", {"start", "scale", "status", "stop"}));
+    props.set("slaves", PropInt("Desired number of local samurai_slave worker nodes (0-16, default: 2)."));
+    props.set("worker_kind", PropStr("Worker flavor for local slaves ('bundle' for all workers, or specific worker name)."));
+    props.set("worker_region", PropStr("Region label for local slave nodes (default: local-lab)."));
+    props.set("control_port", PropInt("Loopback ZMQ control port for samurai_master (default: 5099)."));
+    props.set("management_port", PropInt("Loopback HTTP Management API port (default: 8089)."));
+    server.RegisterTool({
+        "samurai_cluster_local_mesh",
+        "Spin up, dynamically scale (add/remove slave nodes), inspect, or tear down a loopback-only (127.0.0.1) distributed samurai_master + N samurai_slave cluster for multi-worker coordination.",
+        SchemaWithProps(std::move(props)),
+        [&cluster](const Value& a) { return cluster.HandleLocalMesh(a); },
+    });
+  }
+
+  // 13-17. Autopilot / Mahoraga RL tools
   {
     Value props = Value::Object();
     props.set("strategy", PropStr("Closed-loop strategy: aimd, binsearch, or rl (Mahoraga RL + safety shield).", {"aimd", "binsearch", "rl"}));
@@ -190,7 +337,6 @@ void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const Safe
     });
   }
 
-  // 9. Autopilot / Mahoraga RL: Step with telemetry sample
   {
     Value props = Value::Object();
     props.set("session_id", PropStr("Autopilot session ID returned by samurai_autopilot_create."));
@@ -223,7 +369,6 @@ void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const Safe
     });
   }
 
-  // 10. Autopilot / Mahoraga RL: Live closed-loop window execution
   {
     Value props = Value::Object();
     props.set("session_id", PropStr("Autopilot session ID."));
@@ -246,7 +391,6 @@ void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const Safe
     });
   }
 
-  // 11. Autopilot status
   {
     Value props = Value::Object();
     props.set("session_id", PropStr("Optional session ID (omit to list all active sessions)."));
@@ -258,7 +402,6 @@ void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const Safe
     });
   }
 
-  // 12. Autopilot reset / delete
   {
     Value props = Value::Object();
     props.set("session_id", PropStr("Autopilot session ID to reset or delete."));
@@ -271,7 +414,7 @@ void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const Safe
     });
   }
 
-  // 13. Scenario Engine: Compile & validate multi-step persona JSON in-process
+  // 18-20. Scenario Engine tools
   {
     Value props = Value::Object();
     Value sc_obj = Value::Object();
@@ -291,7 +434,6 @@ void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const Safe
     });
   }
 
-  // 14. Scenario Engine: Execute live fail-closed multi-step scenario
   {
     Value props = Value::Object();
     Value sc_obj = Value::Object();
@@ -313,7 +455,6 @@ void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const Safe
     });
   }
 
-  // 15. Scenario Engine: Evaluate SLA document in-process
   {
     Value props = Value::Object();
     Value sla_obj = Value::Object();
@@ -334,6 +475,44 @@ void RegisterAllTools(McpServer& server, AutopilotManager& autopilot, const Safe
         "Evaluate a Scenario Engine SLA contract against observed session/step/latency/TCP counters in-process via native evaluate_sla_native().",
         SchemaWithProps(std::move(props), {"sla"}),
         [](const Value& a) { return HandleScenarioEvaluateSla(a); },
+    });
+  }
+}
+
+void RegisterSkillsAndPrompts(McpServer& server) {
+  struct SkillDef {
+    const char* slug;
+    const char* rel_path;
+    const char* desc;
+  };
+  static const SkillDef kSkills[] = {
+      {"samurai-netbench", "skills/samurai-netbench/SKILL.md",
+       "Core Samurai L4/L7/RFC benchmarking, host discovery, and evidence-boundary workflow."},
+      {"samurai-cluster-orchestrator", "skills/samurai-cluster-orchestrator/SKILL.md",
+       "Distributed cluster discovery, node provisioning, multi-worker sharding, autoscaling, and live shard coordination."},
+      {"samurai-autopilot-rl", "skills/samurai-autopilot-rl/SKILL.md",
+       "Closed-Loop Autopilot (AIMD/BinSearch/Mahoraga RL), SRLP MLP/RL^2 GRU inference, and LeverShield WAF reflex."},
+      {"samurai-scenario-author", "skills/samurai-scenario-author/SKILL.md",
+       "Multi-step Web/Mobile persona scenario authoring, JWT/cookie binding, in-process compilation, and SLA verification."},
+      {"samurai-hardware-dataplane", "skills/samurai-hardware-dataplane/SKILL.md",
+       "Complete catalog & orchestration playbook for all 10 native dataplane workers (cpu, afpacket, afxdp, dpdk, gpu CUDA/BAR1 P2P, doca, l7, scenario, telco 4G/5G CUPS, defense VAE)."},
+  };
+
+  for (const auto& s : kSkills) {
+    const std::string uri = std::string("samurai://skills/") + s.slug;
+    const std::string rel = s.rel_path;
+    const std::string desc = s.desc;
+    server.RegisterResource({
+        uri,
+        s.slug,
+        desc,
+        "text/markdown",
+        [rel, desc]() { return ReadSkillMarkdown(rel, "# " + rel + "\n\n" + desc + "\n"); },
+    });
+    server.RegisterPrompt({
+        s.slug,
+        desc,
+        [rel, desc](const Value&) { return ReadSkillMarkdown(rel, "# " + rel + "\n\n" + desc + "\n"); },
     });
   }
 }

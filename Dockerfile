@@ -92,6 +92,7 @@ COPY --from=build /src/build/zmq/samurai_telco_worker             /usr/local/bin
 COPY --from=build /src/build/l4/test_100k_tcp_flows               /usr/local/bin/samurai_bench_100k_tcp
 COPY --from=build /src/build/l4/test_1m_tcp_flows                 /usr/local/bin/samurai_bench_1m_tcp
 COPY --from=build /src/build/zmq/bench_l7_stateful_userspace      /usr/local/bin/samurai_bench_l7
+COPY --from=build /src/skills                                     /usr/local/share/samurai/skills
 
 USER 10001:10001
 WORKDIR /home/samurai
