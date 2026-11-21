@@ -7,14 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-11-21
+
 ### Added
-- 
+- **Distributed Cluster Orchestration via Native MCP (`samurai/mcp/cluster_tools.*`)**:
+  - Added 7 native cluster orchestration tools to `samurai_mcp`: `samurai_cluster_discover` (and `samurai_cluster_status` alias querying `/healthz`, `/v1/cluster/{summary,workers,shards,events}`, `/metrics`), `samurai_cluster_provision_node` (`POST /v1/cluster/provision`), `samurai_cluster_reconfigure` (`POST /v1/shards/reconfigure`), `samurai_cluster_abort` (`POST /v1/jobs/abort`), `samurai_cluster_plan_shards` (`SplitJobToShards`, `SplitTelcoSubscribers` with CGNAT/BNG pool profiles, and `AutoscaleController`), and `samurai_cluster_local_mesh` (loopback `samurai_master` + N `samurai_slave` start/scale/status/stop).
+- **MCP Resources, Prompts & 5 Portable Agent Skills (`skills/`)**:
+  - Extended `samurai/mcp/protocol.*` with standard MCP `2024-11-05` `resources/list`, `resources/read`, `prompts/list`, and `prompts/get` capabilities.
+  - Added 5 modular skills covering all 10 dataplane workers, distributed cluster orchestration, Closed-Loop Autopilot / Mahoraga RL, Scenario Engine authoring, and benchmarking (`skills/samurai-*/SKILL.md`), packaged into `/usr/local/share/samurai/skills` in `Dockerfile`.
 
 ### Changed
-- 
+- Bumped canonical SemVer across package, Helm `appVersion`, citation metadata, MCP server, and documentation to `3.2.0`.
+
+## [3.1.1] - 2026-11-21
+
+### Added
+- **Modular Native C++17 MCP Server (`samurai_mcp`, `samurai/mcp/`)**:
+  - Built zero-Python, zero-external-SDK MCP `2024-11-05` stdio server linked directly against `samurai_core`, `samurai_control`, and `samurai_scenario`.
+  - Added Closed-Loop Autopilot & Mahoraga RL tools (`samurai_autopilot_{create,step,run_window,status,reset}` with `AIMD`/`BinSearch`/`kRl`, SRLP MLP & RL² GRU inference, `LeverShield`, and `RlExploreConfig`).
+  - Added Scenario Engine tools (`samurai_scenario_{compile,run,evaluate_sla}`).
+  - Added native C++17 `test_samurai_mcp` selftest and E2E stdio JSON-RPC pytest suite (`tests/test_mcp_server.py`).
+- **Reproducible Benchmarks & Community Reporting**:
+  - Packaged `samurai_mcp`, `samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, and `samurai_bench_l7` into `Dockerfile` / GHCR releases.
+  - Added `scripts/reproduce-benchmarks.sh`, `docs/benchmarks/README.md`, `docs/50-open-source-growth-and-launch-playbook.md`, and `.github/ISSUE_TEMPLATE/benchmark_report.md`.
 
 ### Fixed
-- 
+- **Automatic Worker Binary Discovery (`samurai/orchestrator/supervisor.cpp`)**: Automatically resolves worker binaries next to `/proc/self/exe`, `../zmq`, `../../zmq`, `build/zmq`, or `$PATH` without requiring `--worker-dir`.
+- **Docker Compose Native Alignment**: Updated `docker-compose.yml` and `docker-compose.distributed.yml` for native `samurai`, `samurai_master`, and `samurai_slave` entrypoints and `curl` healthchecks.
+
+## [3.0.1] - 2026-11-21
+
+### Fixed
+- **CI & Compatibility**: Added QUIC/H3 API compatibility checks, pinned CI runners to `ubuntu-24.04`, gated GPU architecture test suite on `ci_safe`/CUDA, and added GHCR container usage documentation.
 
 ## [3.0.0] - 2026-11-20
 
@@ -109,7 +133,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Kenjaku` is retained as codename.
 - Previous codename: `Ronin`.
 
-[Unreleased]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.2.0...HEAD
+[3.2.0]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.1.1...v3.2.0
+[3.1.1]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.0.1...v3.1.1
+[3.0.1]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/Mehmet8-Dev/Samurai/compare/v2.2.0...v3.0.0
 [2.2.0]: https://github.com/Mehmet8-Dev/Samurai/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/Mehmet8-Dev/Samurai/compare/v2.0.0...v2.1.1

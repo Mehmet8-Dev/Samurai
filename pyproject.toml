@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "samurai"
-version = "3.1.1"
+version = "3.2.0"
 description = "Samurai - High Performance Layer 4-7 Traffic Generation and Admission Control Engine"
 readme = "README.md"
 requires-python = ">=3.10"
