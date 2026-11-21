@@ -6,13 +6,40 @@ Samurai (v3.3.0) bridges the gap between scripting load tools (`k6`, `Locust`) a
 
 ---
 
-## Start in 30 Seconds (Choose Your Track)
+## Quick Start
 
-| Goal | 1-Command Entry | What You Get |
-| :--- | :--- | :--- |
-| **1. Verify 1M TCP Flows** | `docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp` | Reproduces `605 B/flow` & `2.71M CPS` in ~10s (zero build) |
-| **2. Install Native CLI & MCP** | `curl -fsSL https://raw.githubusercontent.com/Mehmet8-Dev/Samurai/main/scripts/install.sh \| bash` | Installs Linux x86_64 binaries (or Docker wrapper on macOS) |
-| **3. Connect AI Coding Agent** | `samurai_mcp setup --client claude_code --yes` | Auto-configures Claude, Cursor, Codex, Antigravity, Gemini, VS Code |
+### 1. Install Project (Zero-Build or Source)
+```bash
+# Option A: Pre-built Linux x86_64 release binaries (or Docker wrapper on macOS/Windows)
+curl -fsSL https://raw.githubusercontent.com/Mehmet8-Dev/Samurai/main/scripts/install.sh | bash
+
+# Option B: Reproduce the 1M stateful TCP flow benchmark immediately via Docker (zero install)
+docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp
+
+# Option C: Build from source (Linux C++17)
+cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$(nproc)"
+```
+
+### 2. Connect AI Coding Agent (1-Command MCP Setup)
+Automatically diagnose binaries and register `samurai_mcp` across **Claude Code, Cursor, Codex, Antigravity, Gemini CLI, Windsurf, VS Code, OpenCode, or Copilot CLI**:
+
+```bash
+# Check installed binaries, workers, and MCP client status
+samurai_mcp doctor
+
+# Preview (dry-run) and apply MCP config safely (creates a .bak backup automatically)
+samurai_mcp setup --client claude_code --dry-run
+samurai_mcp setup --client claude_code --yes
+
+# Or connect via the GHCR container without local binaries (macOS / Windows / Docker):
+samurai_mcp setup --client cursor --docker --yes
+```
+
+### 3. Run Your First Stress Test
+```bash
+# Stateful HTTP/2 load test against a local lab target (private/loopback only by default)
+samurai --worker l7 --target 127.0.0.1 --port 8080 --l7-protocol http2 --concurrency 4 --count 10000 --confirm
+```
 
 > **Which engine should I pick?** Start with `--worker l7` (HTTP/1.1, HTTP/2, QUIC/H3) or `--worker scenario` for web/API SLA testing; move to `--worker afxdp` / `dpdk` / `gpu` for 10G–100G kernel-bypass or GeForce BAR1 P2P labs; use `--worker telco` for 4G/5G core (`GTP-U`, `PFCP`, `SCTP`, `Diameter`, `SIP/SRTP`).
 
