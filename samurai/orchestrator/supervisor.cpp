@@ -128,6 +128,47 @@ int SendWireV3(
   return rc;
 }
 
+// Resolve a worker binary path. Checks the explicit `worker_dir` first, then
+// (when using the default ".") probes next to the running executable
+// (/proc/self/exe -> /usr/local/bin in containers, or build/cli -> ../zmq and
+// build/control/daemon -> ../../zmq in source builds), then ./build/zmq.
+// Returns an empty string if no direct path is executable, signalling the
+// caller to fall back to PATH lookup via execvp().
+std::string ResolveWorkerPath(const std::string& worker_dir, const std::string& binary) {
+  auto is_exec = [](const std::string& p) -> bool {
+    return !p.empty() && ::access(p.c_str(), X_OK) == 0;
+  };
+
+  if (!worker_dir.empty()) {
+    const std::string direct = worker_dir + "/" + binary;
+    if (is_exec(direct)) return direct;
+  }
+
+  if (worker_dir.empty() || worker_dir == ".") {
+    char exe_buf[4096] = {0};
+    const ssize_t len = ::readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (len > 0) {
+      std::string exe_path(exe_buf, static_cast<std::size_t>(len));
+      const std::size_t slash = exe_path.find_last_of('/');
+      if (slash != std::string::npos) {
+        const std::string exe_dir = exe_path.substr(0, slash);
+        const std::string candidates[] = {
+            exe_dir + "/" + binary,
+            exe_dir + "/../zmq/" + binary,
+            exe_dir + "/../../zmq/" + binary,
+        };
+        for (const auto& c : candidates) {
+          if (is_exec(c)) return c;
+        }
+      }
+    }
+    const std::string build_cand = "build/zmq/" + binary;
+    if (is_exec(build_cand)) return build_cand;
+  }
+
+  return "";
+}
+
 // fork/exec the worker binary, wiring its jobs/events endpoints. The worker
 // binds the jobs (PULL) endpoint and connects the events (PUSH) endpoint by
 // default, which mirrors the supervisor's connect(jobs)/bind(events) below.
@@ -136,16 +177,39 @@ pid_t SpawnWorker(
     const std::string& binary,
     const std::string& jobs_endpoint,
     const std::string& events_endpoint) {
-  const std::string path = worker_dir + "/" + binary;
+  const std::string resolved = ResolveWorkerPath(worker_dir, binary);
   const pid_t pid = fork();
   if (pid == 0) {
-    execl(
-        path.c_str(),
-        binary.c_str(),
-        "--job-endpoint", jobs_endpoint.c_str(),
-        "--event-endpoint", events_endpoint.c_str(),
-        static_cast<char*>(nullptr));
-    std::fprintf(stderr, "orchestrator: exec failed for %s\n", path.c_str());
+    if (!resolved.empty()) {
+      execl(
+          resolved.c_str(),
+          binary.c_str(),
+          "--job-endpoint", jobs_endpoint.c_str(),
+          "--event-endpoint", events_endpoint.c_str(),
+          static_cast<char*>(nullptr));
+      std::fprintf(stderr, "orchestrator: exec failed for %s\n", resolved.c_str());
+    } else if (worker_dir.empty() || worker_dir == ".") {
+      execlp(
+          binary.c_str(),
+          binary.c_str(),
+          "--job-endpoint", jobs_endpoint.c_str(),
+          "--event-endpoint", events_endpoint.c_str(),
+          static_cast<char*>(nullptr));
+      std::fprintf(
+          stderr,
+          "orchestrator: exec failed for %s (not found in %s, exe dir, build/zmq, or PATH)\n",
+          binary.c_str(),
+          worker_dir.c_str());
+    } else {
+      const std::string path = worker_dir + "/" + binary;
+      execl(
+          path.c_str(),
+          binary.c_str(),
+          "--job-endpoint", jobs_endpoint.c_str(),
+          "--event-endpoint", events_endpoint.c_str(),
+          static_cast<char*>(nullptr));
+      std::fprintf(stderr, "orchestrator: exec failed for %s\n", path.c_str());
+    }
     _exit(127);
   }
   return pid;

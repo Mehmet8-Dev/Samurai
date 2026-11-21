@@ -27,7 +27,7 @@ void PrintUsage(const char* argv0) {
       "\n"
       "options:\n"
       "  --worker NAME       worker backend to run (required)\n"
-      "  --worker-dir DIR    directory containing the worker binaries (default: .)\n"
+      "  --worker-dir DIR    directory containing worker binaries (default: auto-detect)\n"
       "  --target IP         target IPv4 address (default: 127.0.0.1)\n"
       "  --port N            target port (default: 80)\n"
       "  --count N           packet count (default: 1000)\n"
