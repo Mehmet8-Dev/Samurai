@@ -93,6 +93,7 @@ class Servicer : public ControlService {
   bool HasShardStats(const std::string& shard_id) const;
   std::string GetShardStatsRaw(const std::string& shard_id) const;  // "{}" if none
   void SetShardStatsRaw(const std::string& shard_id, const std::string& stats_json);
+  std::map<std::string, std::string> SnapshotShardStats() const;
 
   // Reverse-mode dispatch: queue a command for a worker; the next Heartbeat
   // response drains one command into its body (see Heartbeat). Thread-safe.

@@ -478,11 +478,21 @@ pid_t ClusterManager::SpawnLocalSlaveLocked(const std::string& slave_bin,
                                             const std::string& worker_id,
                                             const std::string& worker_kind,
                                             const std::string& region) {
+  std::string worker_dir = "build/zmq";
+  const std::string sample_worker =
+      FindNativeBinary({"samurai_cpu_worker", "samurai_l7_worker", "samurai_telco_worker"});
+  if (!sample_worker.empty()) {
+    const auto slash = sample_worker.rfind('/');
+    if (slash != std::string::npos && slash > 0) {
+      worker_dir = sample_worker.substr(0, slash);
+    }
+  }
   std::vector<std::string> cmd = {
       slave_bin,
       "--control-endpoints", "127.0.0.1:" + std::to_string(control_port_),
       "--dispatch-mode", "reverse",
       "--worker", worker_kind,
+      "--worker-dir", worker_dir,
       "--worker-id", worker_id,
       "--worker-region", region,
       "--heartbeat-interval-ms", "1000",
@@ -592,8 +602,23 @@ ToolResult ClusterManager::HandleLocalMesh(const Value& args) {
       }
     }
 
+    int registered_workers = 0;
+    if (healthy && desired_slaves > 0) {
+      for (int i = 0; i < 15; ++i) {
+        const Value sum = HttpCallLocal("GET", "127.0.0.1", mgmt_port_, "/v1/cluster/summary", admin_token_);
+        if (const Value* body = sum.find("body"); body && body->is_object()) {
+          if (const Value* wc = body->find("workers_count"); wc && wc->is_number()) {
+            registered_workers = static_cast<int>(wc->as_int(0));
+            if (registered_workers >= desired_slaves) break;
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+
     Value out = LocalMeshSummaryLocked();
     out.set("master_healthy", Value::Bool(healthy));
+    out.set("registered_workers", Value::Int(registered_workers));
     out.set("auth_token", Value::Str(admin_token_));
     return MakeToolSuccess(std::move(out));
   }

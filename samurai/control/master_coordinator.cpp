@@ -711,6 +711,7 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
   }
 
   // Aggregate reported stats for this job's shards.
+  const auto final_workers = load_workers();
   DistributedAggregator aggregator;
   for (const std::string& sid : all_sids) {
     if (!view_->ShardReported(sid)) continue;
@@ -718,6 +719,15 @@ JobResult MasterCoordinator::RunSingleJob(const JobConfig& job, const std::strin
     if (!parsed.ok || !parsed.value.is_object()) continue;
     Value item = parsed.value;
     if (!item.find("shard_id")) item.set("shard_id", Value::Str(sid));
+    if (!item.find("region") && !item.find("worker_region")) {
+      const Value* wv = item.find("worker_id");
+      const std::string wid = wv ? wv->as_string("") : "";
+      auto wit = final_workers.find(wid);
+      if (wit != final_workers.end()) {
+        const std::string wreg = Strip(CapStr(wit->second.capabilities, "region"));
+        if (!wreg.empty()) item.set("region", Value::Str(wreg));
+      }
+    }
     aggregator.Add(item);
   }
   const Value agg = aggregator.Snapshot();

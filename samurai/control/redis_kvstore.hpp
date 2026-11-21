@@ -28,7 +28,8 @@ namespace samurai::control {
 // no-op / miss so the coordinator behaves as if offline rather than crashing.
 class HiredisKvStore : public KvStore {
  public:
-  HiredisKvStore(std::string host, int port, int db, int connect_timeout_ms = 2000);
+  HiredisKvStore(std::string host, int port, int db, int connect_timeout_ms = 2000,
+                 std::string username = "", std::string password = "");
   ~HiredisKvStore() override;
 
   bool connected() const { return ctx_ != nullptr; }
@@ -57,6 +58,8 @@ class HiredisKvStore : public KvStore {
   int port_;
   int db_;
   int connect_timeout_ms_;
+  std::string username_;
+  std::string password_;
   std::string error_;
 
   std::mutex mu_;
@@ -65,14 +68,14 @@ class HiredisKvStore : public KvStore {
 
 #endif  // SAMURAI_CONTROL_HAVE_HIREDIS
 
-// Parsed redis://[:password@]host:port/db URL. password is accepted but the
-// coordinator paths used here assume an unauthenticated/ACL-less Redis; AUTH can
-// be layered later if needed.
+// Parsed redis://[[username]:password@]host:port/db URL.
 struct RedisUrl {
   bool ok = false;
   std::string host = "127.0.0.1";
   int port = 6379;
   int db = 0;
+  std::string username;
+  std::string password;
   std::string error;
 };
 RedisUrl ParseRedisUrl(const std::string& url);

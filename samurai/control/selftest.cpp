@@ -1399,8 +1399,13 @@ int main() {
     Check(bare.ok && bare.host == "myhost" && bare.port == 6379 && bare.db == 0,
           "redis-url: bare host -> default port/db");
     RedisUrl cred = ParseRedisUrl("redis://user:pass@cache.local:6390/1");
-    Check(cred.ok && cred.host == "cache.local" && cred.port == 6390 && cred.db == 1,
-          "redis-url: credentials skipped, host/port/db parsed");
+    Check(cred.ok && cred.host == "cache.local" && cred.port == 6390 && cred.db == 1 &&
+              cred.username == "user" && cred.password == "pass",
+          "redis-url: credentials, host/port/db parsed");
+    RedisUrl passonly = ParseRedisUrl("redis://:onlypass@cache.local:6391/0");
+    Check(passonly.ok && passonly.host == "cache.local" && passonly.port == 6391 &&
+              passonly.db == 0 && passonly.username.empty() && passonly.password == "onlypass",
+          "redis-url: password-only credentials parsed");
 
     std::string err;
     std::unique_ptr<KvStore> kv = MakeKvStore("redis://127.0.0.1:6379/0", err);
@@ -2625,6 +2630,9 @@ int main() {
 
     auto rs = slave.ReportStats("w1", "shard-1", "{\"sent\":42}", 123);
     Check(rs.ok && rs.body.find("received")->as_bool(), "control: ReportStats received");
+    const auto shard_snap = servicer.SnapshotShardStats();
+    Check(shard_snap.count("shard-1") == 1 && shard_snap.at("shard-1") == "{\"sent\":42}",
+          "control: SnapshotShardStats captures shard-1");
 
     WorkerControlClient master(ep, "s3cr3t");
     auto st = master.GetWorkerStatus("w1");

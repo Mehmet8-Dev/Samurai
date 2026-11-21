@@ -22,9 +22,19 @@ RedisUrl ParseRedisUrl(const std::string& url) {
     out.error = "rediss:// (TLS) not supported";
     return out;
   }
-  // Optional [user][:password]@ credentials — accepted and skipped.
+  // Optional [user][:password]@ credentials.
   const auto at = s.find('@');
-  if (at != std::string::npos) s = s.substr(at + 1);
+  if (at != std::string::npos) {
+    const std::string creds = s.substr(0, at);
+    const auto colon = creds.find(':');
+    if (colon != std::string::npos) {
+      out.username = creds.substr(0, colon);
+      out.password = creds.substr(colon + 1);
+    } else {
+      out.password = creds;
+    }
+    s = s.substr(at + 1);
+  }
   // host[:port][/db]
   std::string db_part;
   const auto slash = s.find('/');
@@ -80,8 +90,14 @@ constexpr const char* kCasDel =
 
 }  // namespace
 
-HiredisKvStore::HiredisKvStore(std::string host, int port, int db, int connect_timeout_ms)
-    : host_(std::move(host)), port_(port), db_(db), connect_timeout_ms_(connect_timeout_ms) {
+HiredisKvStore::HiredisKvStore(std::string host, int port, int db, int connect_timeout_ms,
+                               std::string username, std::string password)
+    : host_(std::move(host)),
+      port_(port),
+      db_(db),
+      connect_timeout_ms_(connect_timeout_ms),
+      username_(std::move(username)),
+      password_(std::move(password)) {
   std::lock_guard<std::mutex> lk(mu_);
   EnsureConnected();
 }
@@ -113,10 +129,37 @@ bool HiredisKvStore::EnsureConnected() {
   }
   redisSetTimeout(c, tv);
   ctx_ = c;
-  // Select the target logical DB; ignore reply object (best effort).
+  if (!password_.empty()) {
+    std::vector<std::string> auth_args;
+    auth_args.push_back("AUTH");
+    if (!username_.empty()) auth_args.push_back(username_);
+    auth_args.push_back(password_);
+    std::vector<const char*> argv(auth_args.size());
+    std::vector<size_t> lens(auth_args.size());
+    for (size_t i = 0; i < auth_args.size(); ++i) {
+      argv[i] = auth_args[i].data();
+      lens[i] = auth_args[i].size();
+    }
+    redisReply* ar = static_cast<redisReply*>(
+        redisCommandArgv(ctx_, static_cast<int>(auth_args.size()), argv.data(), lens.data()));
+    const bool auth_ok = ar && ar->type != REDIS_REPLY_ERROR;
+    if (!auth_ok) {
+      error_ = ar && ar->str ? std::string("redis auth: ") + ar->str : "redis auth failed";
+      if (ar) freeReplyObject(ar);
+      Disconnect();
+      return false;
+    }
+    freeReplyObject(ar);
+  }
   if (db_ != 0) {
     redisReply* r = static_cast<redisReply*>(redisCommand(ctx_, "SELECT %d", db_));
-    if (r) freeReplyObject(r);
+    if (!r || r->type == REDIS_REPLY_ERROR) {
+      error_ = r && r->str ? std::string("redis select: ") + r->str : "redis select failed";
+      if (r) freeReplyObject(r);
+      Disconnect();
+      return false;
+    }
+    freeReplyObject(r);
   }
   error_.clear();
   return true;
@@ -325,7 +368,7 @@ std::unique_ptr<KvStore> MakeKvStore(const std::string& redis_url, std::string& 
     return nullptr;
   }
 #ifdef SAMURAI_CONTROL_HAVE_HIREDIS
-  auto store = std::make_unique<HiredisKvStore>(u.host, u.port, u.db);
+  auto store = std::make_unique<HiredisKvStore>(u.host, u.port, u.db, 2000, u.username, u.password);
   if (!store->connected()) {
     err = store->error();
     return nullptr;

@@ -81,6 +81,11 @@ void Servicer::SetShardStatsRaw(const std::string& shard_id, const std::string& 
   shard_stats_[shard_id] = stats_json;
 }
 
+std::map<std::string, std::string> Servicer::SnapshotShardStats() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return shard_stats_;
+}
+
 std::string Servicer::TenantFromContext(const RpcContext& ctx) const {
   if (ctx.meta == nullptr) return "";
   const std::string raw = Strip(StrField(*ctx.meta, "x-tenant-namespace"));

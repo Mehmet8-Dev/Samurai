@@ -95,13 +95,17 @@ std::uint32_t ParseIpv4HostOrder(const std::string& s, std::uint32_t def_val) {
 Value BuildState(samurai::control::Servicer* svc,
                  samurai::control::RedisMultiMasterCoordinator* mm = nullptr,
                  const Value* autoscale_json = nullptr,
-                 const Value* closed_loop_json = nullptr) {
+                 const Value* closed_loop_json = nullptr,
+                 const samurai::control::LeaderElector* elector = nullptr,
+                 const Value* current_job_json = nullptr,
+                 const Value* latest_snapshot_json = nullptr) {
   Value st = Value::Object();
   Value workers = Value::Array();
   for (const auto& w : svc->SnapshotWorkers()) {
     Value o = Value::Object();
     o.set("worker_id", Value::Str(w.worker_id));
     o.set("last_heartbeat_ms", Value::Int(w.last_heartbeat_ms));
+    if (!w.active_shard_id.empty()) o.set("active_shard_id", Value::Str(w.active_shard_id));
     auto rit = w.capabilities.find("region");
     if (rit != w.capabilities.end()) o.set("region", Value::Str(rit->second));
     auto tit = w.capabilities.find("tenant_namespace");
@@ -109,10 +113,42 @@ Value BuildState(samurai::control::Servicer* svc,
     workers.push_back(std::move(o));
   }
   st.set("workers", std::move(workers));
-  if (mm && mm->active()) {
-    Value regions = Value::Array();
-    for (auto& snap : mm->LatestRegionSnapshots()) regions.push_back(std::move(snap));
-    st.set("multi_master_regions", std::move(regions));
+
+  Value shards = Value::Array();
+  for (const auto& kv : svc->SnapshotShardStats()) {
+    const auto parsed = samurai::core::json::Parse(kv.second);
+    if (parsed.ok && parsed.value.is_object()) {
+      Value so = parsed.value;
+      if (!so.find("shard_id")) so.set("shard_id", Value::Str(kv.first));
+      shards.push_back(std::move(so));
+    } else {
+      Value so = Value::Object();
+      so.set("shard_id", Value::Str(kv.first));
+      shards.push_back(std::move(so));
+    }
+  }
+  st.set("shards", std::move(shards));
+
+  if (elector) {
+    st.set("ha", elector->Snapshot());
+  }
+  if (current_job_json && current_job_json->is_object()) {
+    st.set("current_job", *current_job_json);
+  }
+  if (latest_snapshot_json && latest_snapshot_json->is_object()) {
+    st.set("latest_snapshot", *latest_snapshot_json);
+  }
+  if (mm) {
+    st.set("multi_master", mm->Snapshot());
+    if (mm->active()) {
+      Value regions = Value::Array();
+      for (auto& snap : mm->RegionsState()) regions.push_back(std::move(snap));
+      st.set("multi_master_regions", std::move(regions));
+
+      Value latest = Value::Array();
+      for (auto& snap : mm->LatestRegionSnapshots()) latest.push_back(std::move(snap));
+      st.set("multi_master_latest", std::move(latest));
+    }
   }
   if (autoscale_json && autoscale_json->is_object()) {
     st.set("autoscale", *autoscale_json);
@@ -818,6 +854,8 @@ void Usage(const char* argv0) {
       "  --ha-lease-path PATH      lease file (file-lock mode)\n"
       "  --ha-lease-key KEY        Redis lease key (redis mode;\n"
       "                            default samurai:ha:<tenant|default>:lease)\n"
+      "  --ha-lease-s N            HA lease TTL in seconds (default 15)\n"
+      "  --ha-standby              wait in standby loop until HA lease is acquired\n"
       "  Multi-master (region federation):\n"
       "  --multi-master-enable     coordinate with peer-region masters over Redis;\n"
       "                            delegate/serve cross-region jobs. With this set,\n"
@@ -945,16 +983,17 @@ int main(int argc, char** argv) {
   const long telco_subs = OptInt(argc, argv, "--telco-subscribers", 0);
   const long telco_dur_ms = OptInt(argc, argv, "--telco-duration-ms", 0);
   const bool mm_enabled = Flag(argc, argv, "--multi-master-enable");
+  const std::string mgmt_listen_early = Opt(argc, argv, "--management-listen", "");
+  const bool autoscale_early = Flag(argc, argv, "--autoscale-enable");
 
   const std::string worker_kind = Opt(argc, argv, "--worker", "cpu");
   const bool has_telco_job =
       (LowerCopy(worker_kind) == "telco" && (telco_subs > 0 || telco_dur_ms > 0));
   const bool has_local_job = (count > 0) || has_telco_job;
   const long effective_count = count > 0 ? count : telco_subs;
-  // Multi-master masters may be serve-only (they run delegated jobs pulled from
-  // peer regions), so --count 0 is allowed then; otherwise a job needs a count
-  // (or --worker telco with subscribers/duration).
-  if (!has_local_job && !mm_enabled) {
+  // Multi-master, management-API serve-only, or autoscale controller masters
+  // may run with --count 0 (no immediate local job); otherwise require count > 0.
+  if (!has_local_job && !mm_enabled && mgmt_listen_early.empty() && !autoscale_early) {
     std::fprintf(stderr, "samurai_master: --count must be > 0\n");
     return 2;
   }
@@ -1032,6 +1071,9 @@ int main(int argc, char** argv) {
   }
 
   // HA leadership (optional).
+  const double ha_lease_s = std::max(1.0, OptDouble(argc, argv, "--ha-lease-s", 15.0));
+  const bool ha_standby =
+      Flag(argc, argv, "--ha-standby") || !mgmt_listen_early.empty() || mm_enabled;
   std::unique_ptr<LeaderElector> elector;
   if (ha_mode == "static") {
     elector = std::make_unique<StaticLeaderElector>(Opt(argc, argv, "--ha-node-id", ""),
@@ -1039,14 +1081,14 @@ int main(int argc, char** argv) {
   } else if (ha_mode == "file-lock") {
     elector = std::make_unique<FileLeaseLeaderElector>(
         Opt(argc, argv, "--ha-node-id", ""),
-        Opt(argc, argv, "--ha-lease-path", "/tmp/samurai_master_lease.json"), 15.0);
+        Opt(argc, argv, "--ha-lease-path", "/tmp/samurai_master_lease.json"), ha_lease_s);
   } else if (ha_mode == "redis") {
     if (kv) {
       const std::string tenant0 = Opt(argc, argv, "--tenant-namespace", "");
       const std::string lease_key = Opt(argc, argv, "--ha-lease-key",
           "samurai:ha:" + (tenant0.empty() ? std::string("default") : tenant0) + ":lease");
       elector = std::make_unique<RedisLeaseLeaderElector>(
-          Opt(argc, argv, "--ha-node-id", ""), lease_key, kv.get(), 15.0);
+          Opt(argc, argv, "--ha-node-id", ""), lease_key, kv.get(), ha_lease_s);
     } else {
       std::fprintf(stderr,
           "samurai_master: --ha-mode redis requires a reachable Redis; skipping HA\n");
@@ -1054,11 +1096,29 @@ int main(int argc, char** argv) {
   }
   if (elector) {
     if (!elector->TryAcquire() || !elector->IsLeader()) {
-      std::printf("samurai_master: not leader (%s); skipping master run\n",
-                  elector->Snapshot().dump().c_str());
-      return 0;
+      if (ha_standby && (ha_mode == "redis" || ha_mode == "file-lock")) {
+        std::printf("samurai_master: standby (%s); waiting for HA leadership\n",
+                    elector->Snapshot().dump().c_str());
+        std::fflush(stdout);
+        while (!g_stop.load()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+          if (elector->TryAcquire() && elector->IsLeader()) break;
+        }
+        if (g_stop.load() || !elector->IsLeader()) {
+          std::printf("samurai_master: stopped while in HA standby\n");
+          return 0;
+        }
+        std::printf("samurai_master: promoted to HA leader (%s)\n",
+                    elector->Snapshot().dump().c_str());
+        std::fflush(stdout);
+      } else {
+        std::printf("samurai_master: not leader (%s); skipping master run\n",
+                    elector->Snapshot().dump().c_str());
+        return 0;
+      }
     }
-    elector->StartRenewLoop(5.0);
+    const double renew_iv = std::max(0.2, std::min(5.0, ha_lease_s / 3.0));
+    elector->StartRenewLoop(renew_iv);
   }
   // Fencing token, read live at each dispatch. The elector bumps its epoch on a
   // fresh re-acquire (lose+regain lease), so a cached value would let a briefly
@@ -1227,7 +1287,32 @@ int main(int argc, char** argv) {
   const int rpc_timeout_ms = static_cast<int>(OptInt(argc, argv, "--rpc-timeout-ms", 2000));
   ClientWorkerCommander commander(cluster_secret, tenant, rpc_timeout_ms, &servicer);
   MasterCoordinator coord(&view, &commander);
-  auto guard = [&elector]() { return !elector || elector->IsLeader(); };
+  std::atomic<bool> job_abort_requested{false};
+  auto guard = [&elector, &job_abort_requested]() {
+    return (!elector || elector->IsLeader()) && !job_abort_requested.load();
+  };
+
+  std::mutex job_state_mu;
+  Value current_job_json = Value::Object();
+  current_job_json.set("state", Value::Str("idle"));
+  current_job_json.set("job_id", Value::Str(""));
+  current_job_json.set("tenant_namespace", Value::Str(tenant));
+  Value latest_snapshot_json;
+  bool has_latest_snapshot = false;
+
+  auto set_current_job = [&](const std::string& state, const std::string& jid) {
+    std::lock_guard<std::mutex> lk(job_state_mu);
+    current_job_json = Value::Object();
+    current_job_json.set("state", Value::Str(state));
+    current_job_json.set("job_id", Value::Str(jid));
+    current_job_json.set("tenant_namespace", Value::Str(tenant));
+  };
+  auto set_latest_snapshot = [&](const Value& snap) {
+    if (!snap.is_object()) return;
+    std::lock_guard<std::mutex> lk(job_state_mu);
+    latest_snapshot_json = snap;
+    has_latest_snapshot = true;
+  };
 
   // Management API (optional).
   std::unique_ptr<ManagementApiServer> mgmt;
@@ -1281,8 +1366,9 @@ int main(int argc, char** argv) {
     }
     ManagementProviders providers;
     const bool closed_loop_on = clcfg.enabled;
-    providers.state_provider = [&servicer, &mm, &as_mu, &as_json, autoscale_on, &cl_mu, &cl_json,
-                                closed_loop_on]() {
+    providers.state_provider = [&servicer, &mm, &elector, &as_mu, &as_json, autoscale_on,
+                                &cl_mu, &cl_json, closed_loop_on, &job_state_mu,
+                                &current_job_json, &latest_snapshot_json, &has_latest_snapshot]() {
       Value asj;
       bool has_as = false;
       if (autoscale_on) {
@@ -1297,12 +1383,27 @@ int main(int argc, char** argv) {
         clj = cl_json;
         has_cl = clj.find("enabled") != nullptr;  // populated once the first window ran
       }
+      Value cur_job;
+      Value lat_snap;
+      bool have_snap = false;
+      {
+        std::lock_guard<std::mutex> lk(job_state_mu);
+        cur_job = current_job_json;
+        if (has_latest_snapshot) {
+          lat_snap = latest_snapshot_json;
+          have_snap = true;
+        }
+      }
       return BuildState(&servicer, mm.get(), has_as ? &asj : nullptr,
-                        has_cl ? &clj : nullptr);
+                        has_cl ? &clj : nullptr, elector.get(), &cur_job,
+                        have_snap ? &lat_snap : nullptr);
     };
-    providers.abort_callback = []() {
+    providers.abort_callback = [&job_abort_requested, &coord]() {
+      job_abort_requested.store(true);
+      const auto active = coord.ActiveShardWorkers();
       Value r = Value::Object();
       r.set("aborted", Value::Bool(true));
+      r.set("active_shards_at_abort", Value::Int(static_cast<std::int64_t>(active.size())));
       return r;
     };
     providers.reconfigure_callback = [&coord, &commander, &servicer, &current_leader_epoch](
@@ -1433,23 +1534,40 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Wait for workers.
-  const long expect = OptInt(argc, argv, "--expect-workers", 1);
-  const double wait_deadline =
-      std::chrono::duration_cast<std::chrono::duration<double>>(
-          std::chrono::system_clock::now().time_since_epoch())
-          .count() +
-      static_cast<double>(OptInt(argc, argv, "--wait-workers-s", 30));
-  while (!g_stop.load() && static_cast<long>(servicer.worker_count()) < expect) {
-    const double now = std::chrono::duration_cast<std::chrono::duration<double>>(
-                           std::chrono::system_clock::now().time_since_epoch())
-                           .count();
-    if (now >= wait_deadline) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  // Wait for workers (skipped when delegating to a remote region or running
+  // serve-only without an explicit --expect-workers).
+  const std::string resolved_primary_tr = has_local_job
+      ? cli_region_topo.ResolveRegion(cli_target_asn, Opt(argc, argv, "--target-region", ""))
+      : std::string();
+  const bool delegating_remote =
+      has_local_job && mm && mm->active() && !resolved_primary_tr.empty() &&
+      resolved_primary_tr != master_region;
+  bool expect_explicit = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--expect-workers") {
+      expect_explicit = true;
+      break;
+    }
   }
-  if (static_cast<long>(servicer.worker_count()) < expect) {
-    std::fprintf(stderr, "samurai_master: only %zu/%ld workers registered; proceeding\n",
-                 servicer.worker_count(), expect);
+  const long expect =
+      delegating_remote ? 0 : ((!has_local_job && !expect_explicit) ? 0 : OptInt(argc, argv, "--expect-workers", 1));
+  if (expect > 0) {
+    const double wait_deadline =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count() +
+        static_cast<double>(OptInt(argc, argv, "--wait-workers-s", 30));
+    while (!g_stop.load() && static_cast<long>(servicer.worker_count()) < expect) {
+      const double now = std::chrono::duration_cast<std::chrono::duration<double>>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+      if (now >= wait_deadline) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (static_cast<long>(servicer.worker_count()) < expect) {
+      std::fprintf(stderr, "samurai_master: only %zu/%ld workers registered; proceeding\n",
+                   servicer.worker_count(), expect);
+    }
   }
 
   // The coordinator dispatches shards to workers advertising the requested flavor.
@@ -2237,23 +2355,37 @@ int main(int argc, char** argv) {
       } else {
         JobConfig job = BuildJobConfig(spec, ep_now, tenant, master_region);
         attach_progress(job);
+        set_current_job("running", "job-1");
         const JobResult res = coord.RunSingleJob(job, "job-1", guard);
+        set_latest_snapshot(res.snapshot);
+        set_current_job("idle", "");
+        job_abort_requested.store(false);
         std::printf("%s\n", res.snapshot.dump().c_str());
         rc = res.rc;
       }
     }
   }
 
-  // Serve loop: pull delegated jobs from peer regions and run them locally until
-  // signalled. This is what makes a region a live participant in the federation.
-  if (mm && mm->active() && !master_region.empty()) {
+  // Serve loop: pull delegated jobs from peer regions and/or keep the control +
+  // management plane alive until signalled.
+  const bool mm_serve = (mm && mm->active() && !master_region.empty());
+  if (mm_serve || !mgmt_listen.empty() || autoscale_on) {
     const int dequeue_max =
         static_cast<int>(OptInt(argc, argv, "--multi-master-dequeue-max", 3));
-    std::printf("samurai_master: serving delegated jobs for region %s (Ctrl-C to stop)\n",
-                master_region.c_str());
+    if (mm_serve) {
+      std::printf("samurai_master: serving delegated jobs for region %s (Ctrl-C to stop)\n",
+                  master_region.c_str());
+    } else {
+      std::printf("samurai_master: serving control/management plane (Ctrl-C to stop)\n");
+    }
+    std::fflush(stdout);
     long deleg_seq = 0;
     while (!g_stop.load()) {
-      if (!elector || elector->IsLeader()) {
+      if (elector && !elector->IsLeader()) {
+        std::fprintf(stderr, "samurai_master: lost HA leadership during serve loop; stepping down\n");
+        break;
+      }
+      if (mm_serve) {
         for (auto& j : mm->DequeueJobs(dequeue_max)) {
           const std::int64_t ep_now = current_leader_epoch();
           servicer.set_leader_epoch_min(ep_now);
@@ -2261,16 +2393,23 @@ int main(int argc, char** argv) {
           attach_progress(job);
           const Value* from = j.find("_mmr_delegated_from");
           const std::string from_region = from ? from->as_string("") : "";
+          const std::string deleg_id = "deleg-" + std::to_string(++deleg_seq);
           std::printf("samurai_master: running delegated job from '%s' (count=%lld)\n",
                       from_region.c_str(), static_cast<long long>(job.count));
-          const JobResult res =
-              coord.RunSingleJob(job, "deleg-" + std::to_string(++deleg_seq), guard);
+          set_current_job("running", deleg_id);
+          job_abort_requested.store(false);
+          const JobResult res = coord.RunSingleJob(job, deleg_id, guard);
+          set_latest_snapshot(res.snapshot);
+          set_current_job("idle", "");
+          job_abort_requested.store(false);
           Value ev = Value::Object();
           ev.set("type", Value::Str("delegated_job_done"));
+          ev.set("job_id", Value::Str(deleg_id));
           ev.set("rc", Value::Int(res.rc));
           ev.set("from_region", Value::Str(from_region));
           mm->PublishEvent(ev);
           std::printf("%s\n", res.snapshot.dump().c_str());
+          std::fflush(stdout);
         }
       }
       for (int slept = 0; slept < 500 && !g_stop.load(); slept += 100) {
