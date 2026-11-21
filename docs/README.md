@@ -44,8 +44,11 @@ This directory serves as the centralized technical index for the Samurai network
 - [47 - Zero-CPU Persistent Kernel Dataplane Architecture](./47-zero-cpu-persistent-dataplane-architecture.md)
 - [48 - Commodity Workarounds & Enterprise Hardware Migration Plan](./48-commodity-workarounds-and-enterprise-migration-plan.md)
 - [49 - DPU ARM & GPU Telecom CUPS Dataplane Architecture](./49-telecom-gpu-dpu-cups-dataplane-architecture.md)
+- [50 - Open-Source Growth & Viral Launch Playbook](./50-open-source-growth-and-launch-playbook.md)
+- [Samurai MCP Server (AI Coding Agent Bridge)](../mcp/README.md)
 
 ### Benchmarks & Verified Acceptance Reports:
+- [Benchmarks Overview & Capability Comparison](./benchmarks/README.md)
 - [43 - L4 Stateful TCP 1M Active Flows Benchmark Report](./benchmarks/43-tcpdp-1m-flows-benchmark-report.md)
 - [44 - L7 Stateful Userspace Shared-Nothing Benchmark Report](./benchmarks/44-l7-stateful-userspace-benchmark-report.md)
 
