@@ -8,6 +8,7 @@
 //                    bench_tcp_flows, bench_l7_userspace, cluster_status
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "json.hpp"
@@ -15,6 +16,23 @@
 #include "safety.hpp"
 
 namespace samurai::mcp {
+
+using EnvVarList = std::vector<std::pair<std::string, std::string>>;
+
+struct CustomTcpEnvResolution {
+  bool active = false;
+  std::string wire;      // "af_xdp" | "af_packet" | "dpdk" | "in_memory"
+  std::string xdp_mode;  // "0" (skb/copy), "1" (native/zerocopy), "2" (offload)
+  std::string iface;
+  std::string src_ip;
+  std::string src_mac;
+  std::string dst_mac;
+  std::string queue_id;
+  bool auto_detected = false;
+  std::string error;
+  EnvVarList env_overrides;
+  samurai::core::json::Value summary_json;
+};
 
 struct SubprocessResult {
   int exit_code = -1;
@@ -28,9 +46,18 @@ struct SubprocessResult {
 // /usr/local/bin, and $PATH. Returns empty string if not found.
 std::string FindNativeBinary(const std::vector<std::string>& candidates);
 
+// Resolve custom_tcp / AF_XDP SKB-copy-mode environment overrides from explicit
+// tool arguments, process environment, and Linux route/interface/ARP discovery.
+CustomTcpEnvResolution ResolveCustomTcpEnv(const samurai::core::json::Value& args,
+                                           const std::string& target_ip,
+                                           int target_port,
+                                           bool requested_custom_tcp);
+
 // Execute `argv` directly via fork/execv (never invokes /bin/sh) with a bounded
-// wall-clock timeout and non-blocking stdout/stderr capture.
-SubprocessResult RunSubprocess(const std::vector<std::string>& argv, int timeout_s);
+// wall-clock timeout, optional child env overrides, and non-blocking stdout/stderr capture.
+SubprocessResult RunSubprocess(const std::vector<std::string>& argv,
+                               int timeout_s,
+                               const EnvVarList& env_overrides = {});
 
 // Build a JSON object summarizing OS, kernel, architecture, and CPU count.
 samurai::core::json::Value HostMetadataJson();

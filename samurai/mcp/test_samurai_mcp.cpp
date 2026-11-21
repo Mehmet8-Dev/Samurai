@@ -11,6 +11,7 @@
 #include "cluster_tools.hpp"
 #include "json.hpp"
 #include "protocol.hpp"
+#include "runtime_tools.hpp"
 #include "safety.hpp"
 #include "tool_registry.hpp"
 
@@ -363,6 +364,63 @@ int main() {
         CallTool(server, 34, "samurai_run_benchmark", bad_ipfix.value), &is_err);
     Check(is_err && ipfix_err.find("error") != nullptr,
           "samurai_run_benchmark blocks public ipfix_collector fail-closed");
+  }
+
+  // 8. Custom TCP / AF_XDP SKB copy mode auto-env & schema exposure
+  {
+    const auto auto_args = Parse(R"({"target":"127.0.0.1","port":3455})");
+    const auto resolved = samurai::mcp::ResolveCustomTcpEnv(auto_args.value, "127.0.0.1", 3455, true);
+    Check(resolved.active && resolved.error.empty(), "ResolveCustomTcpEnv activates for custom_tcp");
+    Check(resolved.wire == "af_xdp", "custom_tcp defaults wire to af_xdp");
+    Check(resolved.xdp_mode == "0", "custom_tcp defaults AF_XDP mode to 0 (SKB/copy)");
+    Check(resolved.iface == "lo" && resolved.src_ip == "127.0.0.1",
+          "auto-discovery resolves loopback iface and src_ip");
+
+    const auto override_args = Parse(R"({
+      "custom_tcp_wire": "af_xdp",
+      "xdp_mode": "skb",
+      "custom_tcp_iface": "eth0",
+      "custom_tcp_src_ip": "10.0.0.5",
+      "custom_tcp_src_mac": "02:00:00:00:00:01",
+      "custom_tcp_dst_mac": "02:00:00:00:00:02",
+      "xdp_queue_id": 2
+    })");
+    const auto ov = samurai::mcp::ResolveCustomTcpEnv(override_args.value, "10.0.0.1", 80, false);
+    Check(ov.active && ov.error.empty(), "explicit custom_tcp_* args activate resolution");
+    Check(ov.wire == "af_xdp" && ov.xdp_mode == "0" && ov.iface == "eth0" &&
+              ov.src_ip == "10.0.0.5" && ov.dst_mac == "02:00:00:00:00:02" && ov.queue_id == "2",
+          "explicit custom_tcp_* overrides propagate accurately");
+
+    const auto bad_wire = Parse(R"({"custom_tcp_wire":"invalid_wire"})");
+    const auto bw = samurai::mcp::ResolveCustomTcpEnv(bad_wire.value, "127.0.0.1", 80, true);
+    Check(!bw.error.empty(), "invalid custom_tcp_wire rejected with clear error");
+
+    const auto list_line = server.HandleLine(
+        R"({"jsonrpc":"2.0","id":35,"method":"tools/list","params":{}})");
+    const auto list_parsed = list_line.has_value() ? Parse(*list_line) : samurai::core::json::ParseResult{};
+    const Value* list_result = list_parsed.ok ? list_parsed.value.find("result") : nullptr;
+    const Value* tools = list_result ? list_result->find("tools") : nullptr;
+    auto has_prop = [&](const std::string& tool_name, const std::string& prop_name) -> bool {
+      if (!tools || !tools->is_array()) return false;
+      for (const auto& t : tools->elements()) {
+        const Value* n = t.find("name");
+        if (!n || n->as_string() != tool_name) continue;
+        const Value* schema = t.find("inputSchema");
+        const Value* props = schema ? schema->find("properties") : nullptr;
+        return props && props->find(prop_name) != nullptr;
+      }
+      return false;
+    };
+    Check(has_prop("samurai_scenario_run", "custom_tcp_wire") &&
+              has_prop("samurai_scenario_run", "xdp_mode") &&
+              has_prop("samurai_scenario_run", "custom_tcp_iface") &&
+              has_prop("samurai_scenario_run", "custom_tcp_dst_mac"),
+          "samurai_scenario_run schema exposes custom_tcp/AF_XDP params");
+    Check(has_prop("samurai_run_benchmark", "custom_tcp_wire") &&
+              has_prop("samurai_run_benchmark", "xdp_mode") &&
+              has_prop("samurai_run_benchmark", "custom_tcp_iface") &&
+              has_prop("samurai_run_benchmark", "custom_tcp_dst_mac"),
+          "samurai_run_benchmark schema exposes custom_tcp/AF_XDP params");
   }
 
   if (g_failures > 0) {

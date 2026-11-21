@@ -9,6 +9,13 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <net/if_arp.h>
+#include <netpacket/packet.h>
+#include <sys/ioctl.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -148,7 +155,335 @@ Value HttpGetJsonOrText(const std::string& host_ip,
   return out;
 }
 
+std::string EnvOrEmpty(const char* name) {
+  const char* val = std::getenv(name);
+  return (val != nullptr && val[0] != '\0') ? std::string(val) : std::string();
+}
+
+std::string ArgStr(const Value& args, const char* key) {
+  const Value* v = args.find(key);
+  return (v && v->is_string()) ? v->as_string() : std::string();
+}
+
+std::string FormatMacBytes(const unsigned char mac[6]) {
+  char buf[24];
+  std::snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return std::string(buf);
+}
+
+bool IsZeroMac(const std::string& mac) {
+  return mac.empty() || mac == "00:00:00:00:00:00";
+}
+
+bool IsLoopbackIpv4(const std::string& ip) {
+  in_addr addr{};
+  if (::inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
+  return (ntohl(addr.s_addr) >> 24) == 127U;
+}
+
+std::string ResolveRouteSourceIp(const std::string& target_ip, int target_port) {
+  const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) return "";
+  sockaddr_in dst{};
+  dst.sin_family = AF_INET;
+  dst.sin_port = htons(static_cast<std::uint16_t>(std::clamp(target_port, 1, 65535)));
+  if (::inet_pton(AF_INET, target_ip.c_str(), &dst.sin_addr) != 1) {
+    ::close(fd);
+    return "";
+  }
+  std::string out;
+  if (::connect(fd, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst)) == 0) {
+    sockaddr_in src{};
+    socklen_t len = sizeof(src);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&src), &len) == 0) {
+      char buf[INET_ADDRSTRLEN] = {0};
+      if (::inet_ntop(AF_INET, &src.sin_addr, buf, sizeof(buf)) != nullptr) {
+        out = buf;
+      }
+    }
+  }
+  ::close(fd);
+  return out;
+}
+
+void ResolveInterfaceForSourceIp(const std::string& src_ip,
+                                 std::string& out_iface,
+                                 std::string& out_src_mac) {
+#if defined(__linux__)
+  if (src_ip.empty()) return;
+  struct ifaddrs* ifaddr = nullptr;
+  if (::getifaddrs(&ifaddr) != 0 || ifaddr == nullptr) return;
+
+  for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (!ifa->ifa_addr || !ifa->ifa_name || ifa->ifa_addr->sa_family != AF_INET) continue;
+    const auto* sin = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+    char buf[INET_ADDRSTRLEN] = {0};
+    if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) != nullptr && src_ip == buf) {
+      out_iface = ifa->ifa_name;
+      break;
+    }
+  }
+
+  if (!out_iface.empty()) {
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+      if (!ifa->ifa_addr || !ifa->ifa_name || ifa->ifa_addr->sa_family != AF_PACKET) continue;
+      if (out_iface != ifa->ifa_name) continue;
+      const auto* sll = reinterpret_cast<const sockaddr_ll*>(ifa->ifa_addr);
+      if (sll->sll_halen == 6) {
+        out_src_mac = FormatMacBytes(sll->sll_addr);
+        break;
+      }
+    }
+  }
+  ::freeifaddrs(ifaddr);
+#else
+  (void)src_ip;
+  (void)out_iface;
+  (void)out_src_mac;
+#endif
+}
+
+std::string LookupProcArpMac(const std::string& target_ip, const std::string& iface) {
+  std::ifstream in("/proc/net/arp");
+  if (!in.is_open()) return "";
+  std::string line;
+  std::getline(in, line);  // skip header
+  while (std::getline(in, line)) {
+    std::istringstream iss(line);
+    std::string ip, hw_type, flags, hw_addr, mask, dev;
+    if (!(iss >> ip >> hw_type >> flags >> hw_addr >> mask >> dev)) continue;
+    if (ip != target_ip) continue;
+    if (!iface.empty() && dev != iface) continue;
+    if (flags == "0x0" || IsZeroMac(hw_addr)) continue;
+    return LowerCopy(hw_addr);
+  }
+  return "";
+}
+
+std::string ResolveDstMacForTarget(const std::string& target_ip, const std::string& iface) {
+  if (iface == "lo" || IsLoopbackIpv4(target_ip)) {
+    return "00:00:00:00:00:00";
+  }
+  std::string mac = LookupProcArpMac(target_ip, iface);
+  if (!mac.empty()) return mac;
+
+#if defined(__linux__)
+  // Trigger neighbor resolution via a single UDP probe to discard port 9 so /proc/net/arp populates.
+  const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd >= 0) {
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(9);
+    if (::inet_pton(AF_INET, target_ip.c_str(), &dst.sin_addr) == 1) {
+      const char byte = 0;
+      (void)::sendto(fd, &byte, 1, MSG_DONTWAIT, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    if (!iface.empty()) {
+      arpreq req{};
+      std::memcpy(&req.arp_pa, &dst, sizeof(dst));
+      std::snprintf(req.arp_dev, sizeof(req.arp_dev), "%s", iface.c_str());
+      if (::ioctl(fd, SIOCGARP, &req) == 0 && (req.arp_flags & ATF_COM) != 0) {
+        const auto* hw = reinterpret_cast<const unsigned char*>(req.arp_ha.sa_data);
+        const std::string resolved = FormatMacBytes(hw);
+        if (!IsZeroMac(resolved)) {
+          ::close(fd);
+          return resolved;
+        }
+      }
+    }
+    ::close(fd);
+  }
+#endif
+  return LookupProcArpMac(target_ip, iface);
+}
+
+bool HasExplicitCustomTcpArgs(const Value& args) {
+  static const char* kKeys[] = {
+      "custom_tcp_wire",
+      "xdp_mode",
+      "custom_tcp_iface",
+      "custom_tcp_src_ip",
+      "custom_tcp_dst_mac",
+      "custom_tcp_src_mac",
+      "xdp_queue_id",
+  };
+  for (const char* k : kKeys) {
+    if (args.find(k) != nullptr) return true;
+  }
+  return false;
+}
+
+bool NormalizeCustomTcpWire(const std::string& raw, std::string& out_wire) {
+  const std::string w = LowerCopy(raw);
+  if (w == "af_xdp" || w == "afxdp") {
+    out_wire = "af_xdp";
+    return true;
+  }
+  if (w == "af_packet" || w == "afpacket") {
+    out_wire = "af_packet";
+    return true;
+  }
+  if (w == "dpdk") {
+    out_wire = "dpdk";
+    return true;
+  }
+  if (w == "in_memory" || w == "inmem") {
+    out_wire = "in_memory";
+    return true;
+  }
+  return false;
+}
+
+bool NormalizeXdpMode(const std::string& raw, std::string& out_mode) {
+  const std::string m = LowerCopy(raw);
+  if (m == "0" || m == "skb" || m == "copy" || m == "skb_copy") {
+    out_mode = "0";
+    return true;
+  }
+  if (m == "1" || m == "native" || m == "zerocopy" || m == "zero_copy") {
+    out_mode = "1";
+    return true;
+  }
+  if (m == "2" || m == "offload") {
+    out_mode = "2";
+    return true;
+  }
+  return false;
+}
+
+bool ProfileFileUsesCustomTcp(const std::string& path) {
+  if (path.empty()) return false;
+  const std::string raw = ReadWholeFile(path);
+  if (raw.empty()) return false;
+  const auto parsed = samurai::core::json::Parse(raw);
+  if (!parsed.ok || !parsed.value.is_object()) return false;
+  if (const Value* ct = parsed.value.find("connection_template"); ct && ct->is_object()) {
+    if (const Value* tb = ct->find("transport_backend"); tb && tb->is_string()) {
+      const std::string tr = LowerCopy(tb->as_string());
+      return tr == "custom_tcp" || tr == "dpdk" || tr == "dpdk_direct";
+    }
+  }
+  return false;
+}
+
 }  // namespace
+
+CustomTcpEnvResolution ResolveCustomTcpEnv(const Value& args,
+                                           const std::string& target_ip,
+                                           int target_port,
+                                           bool requested_custom_tcp) {
+  CustomTcpEnvResolution res;
+  if (!requested_custom_tcp && !HasExplicitCustomTcpArgs(args)) {
+    return res;
+  }
+
+  res.active = true;
+  const bool auto_env = args.find("auto_custom_tcp_env") ? args.find("auto_custom_tcp_env")->as_bool(true) : true;
+
+  std::string raw_wire = ArgStr(args, "custom_tcp_wire");
+  if (raw_wire.empty()) raw_wire = EnvOrEmpty("SAMURAI_CUSTOM_TCP_WIRE");
+  if (raw_wire.empty()) raw_wire = "af_xdp";
+  if (!NormalizeCustomTcpWire(raw_wire, res.wire)) {
+    res.error = "Invalid custom_tcp_wire '" + raw_wire + "'. Expected: af_xdp, af_packet, dpdk, or in_memory.";
+    return res;
+  }
+
+  std::string raw_xdp_mode = ArgStr(args, "xdp_mode");
+  if (raw_xdp_mode.empty()) raw_xdp_mode = EnvOrEmpty("SAMURAI_XDP_MODE");
+  if (raw_xdp_mode.empty()) raw_xdp_mode = "0";  // Default to AF_XDP SKB/Copy mode
+  if (!NormalizeXdpMode(raw_xdp_mode, res.xdp_mode)) {
+    res.error = "Invalid xdp_mode '" + raw_xdp_mode + "'. Expected: skb/copy (0), native/zerocopy (1), or offload (2).";
+    return res;
+  }
+
+  res.iface = ArgStr(args, "custom_tcp_iface");
+  if (res.iface.empty()) res.iface = EnvOrEmpty("SAMURAI_CUSTOM_TCP_RX_IFACE");
+  if (res.iface.empty()) res.iface = EnvOrEmpty("SAMURAI_XDP_INTERFACE");
+
+  res.src_ip = ArgStr(args, "custom_tcp_src_ip");
+  if (res.src_ip.empty()) res.src_ip = EnvOrEmpty("SAMURAI_CUSTOM_TCP_SRC_IP");
+
+  res.src_mac = LowerCopy(ArgStr(args, "custom_tcp_src_mac"));
+  if (res.src_mac.empty()) res.src_mac = LowerCopy(EnvOrEmpty("SAMURAI_CUSTOM_TCP_SRC_MAC"));
+
+  res.dst_mac = LowerCopy(ArgStr(args, "custom_tcp_dst_mac"));
+  if (res.dst_mac.empty()) res.dst_mac = LowerCopy(EnvOrEmpty("SAMURAI_CUSTOM_TCP_DST_MAC"));
+
+  if (const Value* qv = args.find("xdp_queue_id"); qv && qv->is_number() && qv->as_int(-1) >= 0) {
+    res.queue_id = std::to_string(qv->as_int(0));
+  } else {
+    res.queue_id = EnvOrEmpty("SAMURAI_XDP_QUEUE_ID");
+    if (res.queue_id.empty()) res.queue_id = "0";
+  }
+
+  if (auto_env && res.wire != "in_memory") {
+    if (res.src_ip.empty()) {
+      const std::string detected_ip = ResolveRouteSourceIp(target_ip, target_port);
+      if (!detected_ip.empty()) {
+        res.src_ip = detected_ip;
+        res.auto_detected = true;
+      }
+    }
+    if (res.iface.empty() || res.src_mac.empty()) {
+      std::string detected_iface;
+      std::string detected_mac;
+      ResolveInterfaceForSourceIp(res.src_ip, detected_iface, detected_mac);
+      if (res.iface.empty() && !detected_iface.empty()) {
+        res.iface = detected_iface;
+        res.auto_detected = true;
+      }
+      if (res.src_mac.empty() && !detected_mac.empty()) {
+        res.src_mac = detected_mac;
+        res.auto_detected = true;
+      }
+    }
+    if (res.dst_mac.empty()) {
+      const std::string detected_dst = ResolveDstMacForTarget(target_ip, res.iface);
+      if (!detected_dst.empty()) {
+        res.dst_mac = detected_dst;
+        res.auto_detected = true;
+      }
+    }
+  }
+
+  auto push_env = [&](const char* k, const std::string& v) {
+    if (!v.empty()) res.env_overrides.emplace_back(k, v);
+  };
+  push_env("SAMURAI_CUSTOM_TCP_WIRE", res.wire);
+  push_env("SAMURAI_CUSTOM_TCP_BACKEND",
+           res.wire == "af_packet" ? "af_packet" : (res.wire == "dpdk" ? "dpdk" : "af_xdp"));
+  if (EnvOrEmpty("SAMURAI_CUSTOM_TCP_MODE").empty()) {
+    push_env("SAMURAI_CUSTOM_TCP_MODE", "required");
+  }
+  push_env("SAMURAI_XDP_MODE", res.xdp_mode);
+  push_env("SAMURAI_XDP_QUEUE_ID", res.queue_id);
+  push_env("SAMURAI_CUSTOM_TCP_RX_IFACE", res.iface);
+  if (res.wire == "af_xdp") {
+    push_env("SAMURAI_XDP_INTERFACE", res.iface);
+  }
+  push_env("SAMURAI_CUSTOM_TCP_SRC_IP", res.src_ip);
+  push_env("SAMURAI_CUSTOM_TCP_SRC_MAC", res.src_mac);
+  push_env("SAMURAI_CUSTOM_TCP_DST_MAC", res.dst_mac);
+
+  Value summary = Value::Object();
+  summary.set("wire", Value::Str(res.wire));
+  summary.set("xdp_mode", Value::Str(res.xdp_mode == "0" ? "skb_copy(0)" : (res.xdp_mode == "1" ? "native_zerocopy(1)" : "offload(2)")));
+  summary.set("iface", Value::Str(res.iface));
+  summary.set("src_ip", Value::Str(res.src_ip));
+  summary.set("src_mac", Value::Str(res.src_mac));
+  summary.set("dst_mac", Value::Str(res.dst_mac));
+  summary.set("queue_id", Value::Str(res.queue_id));
+  summary.set("auto_detected", Value::Bool(res.auto_detected));
+  Value env_obj = Value::Object();
+  for (const auto& kv : res.env_overrides) {
+    env_obj.set(kv.first, Value::Str(kv.second));
+  }
+  summary.set("env", std::move(env_obj));
+  res.summary_json = std::move(summary);
+  return res;
+}
 
 std::string FindNativeBinary(const std::vector<std::string>& candidates) {
   std::vector<std::string> dirs;
@@ -188,7 +523,9 @@ std::string FindNativeBinary(const std::vector<std::string>& candidates) {
   return "";
 }
 
-SubprocessResult RunSubprocess(const std::vector<std::string>& argv, int timeout_s) {
+SubprocessResult RunSubprocess(const std::vector<std::string>& argv,
+                               int timeout_s,
+                               const EnvVarList& env_overrides) {
   SubprocessResult res;
   if (argv.empty()) {
     res.error = "Empty command";
@@ -217,6 +554,12 @@ SubprocessResult RunSubprocess(const std::vector<std::string>& argv, int timeout
     ::dup2(err_pipe[1], STDERR_FILENO);
     ::close(out_pipe[0]); ::close(out_pipe[1]);
     ::close(err_pipe[0]); ::close(err_pipe[1]);
+
+    for (const auto& kv : env_overrides) {
+      if (!kv.first.empty()) {
+        ::setenv(kv.first.c_str(), kv.second.c_str(), 1);
+      }
+    }
 
     std::vector<char*> c_argv;
     c_argv.reserve(argv.size() + 1);
@@ -550,12 +893,25 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
   push_pos_int("kpi_min_dhcp_leases", "--kpi-min-dhcp-leases");
   push_nonneg_int("kpi_max_tcp_overflows", "--kpi-max-tcp-overflows");
 
-  const auto res = RunSubprocess(cmd, timeout_s);
+  const std::string l7_profile_path = ArgStr(args, "l7_profile_file");
+  const bool wants_custom_tcp =
+      (worker == "afxdp") || ProfileFileUsesCustomTcp(l7_profile_path);
+  const CustomTcpEnvResolution tcp_env =
+      ResolveCustomTcpEnv(args, target, static_cast<int>(port), wants_custom_tcp);
+  if (!tcp_env.error.empty()) {
+    ::unlink(report_path.c_str());
+    return MakeToolError(tcp_env.error);
+  }
+
+  const auto res = RunSubprocess(cmd, timeout_s, tcp_env.env_overrides);
   const std::string report_raw = ReadWholeFile(report_path);
   ::unlink(report_path.c_str());
 
   Value out = Value::Object();
   out.set("host", HostMetadataJson());
+  if (tcp_env.active) {
+    out.set("custom_tcp_env", tcp_env.summary_json);
+  }
   out.set("exit_code", Value::Int(res.exit_code));
   out.set("timed_out", Value::Bool(res.timed_out));
   if (!report_raw.empty()) {

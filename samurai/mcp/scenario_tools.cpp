@@ -200,6 +200,32 @@ ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
     return MakeToolError(std::string("Scenario validation failed before run: ") + ex.what());
   }
 
+  auto lower_str = [](std::string s) {
+    for (char& c : s) {
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+  };
+  bool wants_custom_tcp = false;
+  if (const Value* lm = doc.find("load_model"); lm && lm->is_object()) {
+    if (const Value* t = lm->find("transport"); t && t->is_string()) {
+      const std::string tr = lower_str(t->as_string());
+      wants_custom_tcp = (tr == "custom_tcp" || tr == "dpdk" || tr == "dpdk_direct");
+    }
+  }
+  if (!wants_custom_tcp) {
+    if (const Value* tb = doc.find("transport_backend"); tb && tb->is_string()) {
+      const std::string tr = lower_str(tb->as_string());
+      wants_custom_tcp = (tr == "custom_tcp" || tr == "dpdk" || tr == "dpdk_direct");
+    }
+  }
+
+  const CustomTcpEnvResolution tcp_env =
+      ResolveCustomTcpEnv(args, target, static_cast<int>(port), wants_custom_tcp);
+  if (!tcp_env.error.empty()) {
+    return MakeToolError(tcp_env.error);
+  }
+
   std::string scenario_path;
   bool remove_temp_scenario = false;
   if (const Value* sf = args.find("scenario_file");
@@ -246,7 +272,7 @@ ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
     cmd.push_back(std::to_string(conc->as_int(1)));
   }
 
-  const auto res = RunSubprocess(cmd, timeout_s);
+  const auto res = RunSubprocess(cmd, timeout_s, tcp_env.env_overrides);
   const std::string report_raw = ReadFileToString(report_path);
   ::unlink(report_path.c_str());
   if (remove_temp_scenario) ::unlink(scenario_path.c_str());
@@ -254,6 +280,9 @@ ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
   Value out = Value::Object();
   out.set("host", HostMetadataJson());
   out.set("scenario_summary", std::move(spec_summary));
+  if (tcp_env.active) {
+    out.set("custom_tcp_env", tcp_env.summary_json);
+  }
   out.set("exit_code", Value::Int(res.exit_code));
   out.set("timed_out", Value::Bool(res.timed_out));
   if (!report_raw.empty()) {

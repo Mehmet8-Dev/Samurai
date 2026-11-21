@@ -93,6 +93,27 @@ std::string ReadSkillMarkdown(const std::string& rel_path, const std::string& fa
   return fallback_text;
 }
 
+void AddCustomTcpSchemaProps(Value& props) {
+  props.set("custom_tcp_wire", PropStr(
+      "Custom TCP wire backend (default: 'af_xdp' using SKB/copy mode).",
+      {"af_xdp", "af_packet", "dpdk", "in_memory"}));
+  props.set("xdp_mode", PropStr(
+      "AF_XDP bind mode: 'skb'/'copy' (0, default), 'native'/'zerocopy' (1), or 'offload' (2).",
+      {"skb", "copy", "native", "zerocopy", "offload"}));
+  props.set("custom_tcp_iface", PropStr(
+      "Network interface for custom_tcp / AF_XDP RX+TX (sets SAMURAI_CUSTOM_TCP_RX_IFACE & SAMURAI_XDP_INTERFACE; auto-detected from route if omitted)."));
+  props.set("custom_tcp_src_ip", PropStr(
+      "Source IPv4 override for custom_tcp (sets SAMURAI_CUSTOM_TCP_SRC_IP; auto-detected from route if omitted)."));
+  props.set("custom_tcp_dst_mac", PropStr(
+      "Destination MAC override for custom_tcp (sets SAMURAI_CUSTOM_TCP_DST_MAC; auto-detected from ARP if omitted)."));
+  props.set("custom_tcp_src_mac", PropStr(
+      "Source MAC override for custom_tcp (sets SAMURAI_CUSTOM_TCP_SRC_MAC; auto-detected from interface if omitted)."));
+  props.set("xdp_queue_id", PropInt(
+      "AF_XDP NIC RX/TX queue ID (sets SAMURAI_XDP_QUEUE_ID, default: 0)."));
+  props.set("auto_custom_tcp_env", PropBool(
+      "Automatically detect route interface, source IP, and MAC env vars when custom_tcp or af_xdp is active (default: true)."));
+}
+
 }  // namespace
 
 void RegisterAllTools(McpServer& server,
@@ -178,6 +199,8 @@ void RegisterAllTools(McpServer& server,
     props.set("kpi_min_dns_queries", PropInt("Fail KPI gate if DNS queries < threshold."));
     props.set("kpi_min_dhcp_leases", PropInt("Fail KPI gate if DHCP leases < threshold."));
     props.set("kpi_max_tcp_overflows", PropInt("Fail KPI gate if TCP overflows > threshold."));
+    // Custom TCP / AF_XDP wire configuration & auto-discovery
+    AddCustomTcpSchemaProps(props);
     props.set("timeout_s", PropInt("Subprocess wall-clock timeout in seconds (5-120)."));
     server.RegisterTool({
         "samurai_run_benchmark",
@@ -553,6 +576,7 @@ void RegisterAllTools(McpServer& server,
     props.set("count", PropInt("Bounded request/session budget (default: 100)."));
     props.set("rps", PropNum("Optional target RPS pacing cap."));
     props.set("concurrency", PropInt("Optional concurrency override."));
+    AddCustomTcpSchemaProps(props);
     props.set("timeout_s", PropInt("Subprocess wall-clock timeout in seconds (5-120)."));
     server.RegisterTool({
         "samurai_scenario_run",
