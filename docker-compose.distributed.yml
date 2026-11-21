@@ -1,3 +1,12 @@
+# Distributed Samurai Cluster (Native C++17 Master/Slave + Redis HA/Federation)
+#
+# Quick start:
+#   docker compose -f docker-compose.distributed.yml up -d
+#   curl -s http://127.0.0.1:8089/healthz
+#   docker compose -f docker-compose.distributed.yml logs -f master
+#
+# Uses the pre-built GHCR image by default; run with `--build` to compile from source.
+
 services:
   redis:
     image: redis:7-alpine
@@ -14,42 +23,32 @@ services:
       - samurai-net
 
   master:
+    image: ghcr.io/mehmet8-dev/samurai:latest
     build:
       context: .
-      dockerfile: Dockerfile.prod
+      dockerfile: Dockerfile
     container_name: samurai-master
     environment:
       SAMURAI_CLUSTER_SECRET: "samurai-cluster-secret"
       SAMURAI_MANAGEMENT_API_ADMIN_TOKEN: "samurai-admin-token"
       SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN: "samurai-operator-token"
       SAMURAI_MANAGEMENT_API_VIEWER_TOKEN: "samurai-viewer-token"
-      SAMURAI_CONTROL_RBAC_ADMIN_SECRET: "samurai-cluster-secret"
-      SAMURAI_CONTROL_RBAC_OPERATOR_SECRET: "samurai-cluster-secret"
-      SAMURAI_CONTROL_RBAC_WORKER_SECRET: "samurai-cluster-secret"
-      SAMURAI_CONTROL_JWT_SECRET: "samurai-jwt-secret"
-      SAMURAI_MANAGEMENT_API_JWT_SECRET: "samurai-jwt-secret"
       SAMURAI_TENANT_NAMESPACE: "default"
-      SAMURAI_WORKER_REGION: "eu-central"
-      SAMURAI_TARGET_REGION: "eu-central"
-      SAMURAI_MULTI_MASTER_REGION_ID: "eu-central"
     command:
-      - --role
-      - master
-      - --control-insecure
+      - samurai_master
+      - --insecure-control
       - --control-listen
-      - 0.0.0.0:5099
-      - --management-api-enable
-      - --management-api-listen
+      - tcp://0.0.0.0:5099
+      - --management-listen
       - 0.0.0.0:8089
-      - --management-api-live-interval-ms
-      - "1000"
-      - --control-rbac-enable
-      - --control-rbac-audit-log-path
-      - /tmp/rbac_audit.jsonl
-      - --control-rbac-audit-success
-      - --region-aware-routing
-      - --cross-region-heartbeat-factor
-      - "1.6"
+      - --tenant-namespace
+      - default
+      - --ha-mode
+      - redis
+      - --ha-lease-key
+      - samurai:ha:master
+      - --ha-node-id
+      - master-1
       - --multi-master-enable
       - --multi-master-region-id
       - eu-central
@@ -57,36 +56,20 @@ services:
       - redis://redis:6379/0
       - --multi-master-namespace
       - compose-demo
-      - --ha-enable
-      - --ha-mode
-      - redis
-      - --ha-redis-url
-      - redis://redis:6379/0
-      - --ha-redis-key
-      - samurai:ha:master
-      - --ha-node-id
-      - master-1
-      - --ha-wait-for-leader
-      - --worker-registration-timeout-s
+      - --expect-workers
+      - "2"
+      - --wait-workers-s
       - "30"
-      - --job-timeout-s
-      - "120"
-      - --control-autoscale-enable
-      - --control-autoscale-target-name
-      - samurai-slave
-      - --control-autoscale-min-replicas
-      - "1"
-      - --control-autoscale-max-replicas
-      - "20"
+      - --worker
+      - cpu
       - --target
       - 127.0.0.1
       - --port
       - "80"
       - --protocol
-      - tcp
+      - udp
       - --count
-      - "100000"
-      - --confirm
+      - "0"
     ports:
       - "5099:5099"
       - "8089:8089"
@@ -94,7 +77,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8089/healthz', timeout=2).read()\""]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8089/healthz >/dev/null || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 10
@@ -102,110 +85,35 @@ services:
     networks:
       - samurai-net
 
-  master-follower:
+  slave:
+    image: ghcr.io/mehmet8-dev/samurai:latest
     build:
       context: .
-      dockerfile: Dockerfile.prod
-    container_name: samurai-master-follower
+      dockerfile: Dockerfile
     environment:
       SAMURAI_CLUSTER_SECRET: "samurai-cluster-secret"
-      SAMURAI_MANAGEMENT_API_ADMIN_TOKEN: "samurai-admin-token"
-      SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN: "samurai-operator-token"
-      SAMURAI_MANAGEMENT_API_VIEWER_TOKEN: "samurai-viewer-token"
-      SAMURAI_CONTROL_RBAC_ADMIN_SECRET: "samurai-cluster-secret"
-      SAMURAI_CONTROL_RBAC_OPERATOR_SECRET: "samurai-cluster-secret"
-      SAMURAI_CONTROL_RBAC_WORKER_SECRET: "samurai-cluster-secret"
-      SAMURAI_CONTROL_JWT_SECRET: "samurai-jwt-secret"
-      SAMURAI_MANAGEMENT_API_JWT_SECRET: "samurai-jwt-secret"
       SAMURAI_TENANT_NAMESPACE: "default"
-      SAMURAI_WORKER_REGION: "us-east"
-      SAMURAI_TARGET_REGION: "eu-central"
-      SAMURAI_MULTI_MASTER_REGION_ID: "us-east"
     command:
-      - --role
-      - master
-      - --control-insecure
-      - --control-listen
-      - 0.0.0.0:5099
-      - --management-api-enable
-      - --management-api-listen
-      - 0.0.0.0:8089
-      - --management-api-live-interval-ms
-      - "1000"
-      - --control-rbac-enable
-      - --control-rbac-audit-log-path
-      - /tmp/rbac_audit.jsonl
-      - --control-rbac-audit-success
-      - --region-aware-routing
-      - --cross-region-heartbeat-factor
-      - "1.6"
-      - --multi-master-enable
-      - --multi-master-region-id
-      - us-east
-      - --multi-master-redis-url
-      - redis://redis:6379/0
-      - --multi-master-namespace
-      - compose-demo
-      - --ha-enable
-      - --ha-mode
-      - redis
-      - --ha-redis-url
-      - redis://redis:6379/0
-      - --ha-redis-key
-      - samurai:ha:master
-      - --ha-node-id
-      - master-2
-      - --ha-wait-for-leader
-      - --worker-registration-timeout-s
-      - "30"
-      - --job-timeout-s
-      - "120"
-      - --target
-      - 127.0.0.1
-      - --port
-      - "80"
-      - --protocol
-      - tcp
-      - --count
-      - "100000"
-      - --confirm
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - samurai-net
-
-  slave:
-    build:
-      context: .
-      dockerfile: Dockerfile.prod
-    command:
-      - --role
-      - slave
-      - --control-insecure
+      - samurai_slave
       - --control-endpoints
-      - master:5099,master-follower:5099
-      - --control-listen
-      - 0.0.0.0:5099
-      - --stats-stream-enable
-      - --heartbeat-interval-ms
-      - "2000"
-      - --slave-master-timeout-s
-      - "30"
-      - --worker-status-probe
-      - --tenant-namespace
-      - default
+      - master:5099
+      - --dispatch-mode
+      - reverse
+      - --worker
+      - bundle
+      - --worker-dir
+      - /usr/local/bin
       - --worker-region
       - eu-central
-    environment:
-      SAMURAI_CLUSTER_SECRET: "samurai-cluster-secret"
-      SAMURAI_CONTROL_RBAC_WORKER_SECRET: "samurai-cluster-secret"
-      SAMURAI_TENANT_NAMESPACE: "default"
-      SAMURAI_WORKER_REGION: "eu-central"
+      - --tenant-namespace
+      - default
+      - --heartbeat-interval-ms
+      - "2000"
+      - --master-timeout-s
+      - "30"
     depends_on:
-      - master
-      - master-follower
+      master:
+        condition: service_healthy
     networks:
       - samurai-net
     deploy:

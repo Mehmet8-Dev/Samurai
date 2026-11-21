@@ -69,6 +69,7 @@ jobs:
       - name: Certify Release via Selftests
         run: |
           ./build/control/samurai_control_selftest
+          ./build/mcp/test_samurai_mcp
           ./build/l4/test_tcp_sliding_window
           ./build/l7_emu_native/test_kernel_threaded_l7
           ./build/l7_emu_native/test_l2l3_astf
@@ -79,6 +80,7 @@ jobs:
           DIST_DIR="samurai-${TAG}-linux-x86_64"
           mkdir -p "${DIST_DIR}/bin"
           cp build/cli/samurai "${DIST_DIR}/bin/"
+          cp build/mcp/samurai_mcp "${DIST_DIR}/bin/"
           cp build/control/daemon/samurai_master "${DIST_DIR}/bin/"
           cp build/control/daemon/samurai_slave "${DIST_DIR}/bin/"
           cp build/zmq/samurai_*_worker "${DIST_DIR}/bin/" || true

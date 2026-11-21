@@ -1,7 +1,10 @@
 services:
-  # CLI runner (interactive). Example:
-  # docker compose run --rm samurai --target 1.2.3.4 --port 80 --protocol udp --count 10000 --confirm --allow-public-target
+  # Native Samurai CLI runner (interactive / one-shot).
+  # Examples:
+  #   docker compose --profile cli run --rm samurai samurai --list-profiles
+  #   docker compose --profile cli run --rm samurai samurai --worker cpu --target 127.0.0.1 --port 80 --count 10000 --confirm
   samurai:
+    image: ghcr.io/mehmet8-dev/samurai:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -17,7 +20,19 @@ services:
         soft: 1048576
         hard: 1048576
     volumes:
-      - ./reports:/app/reports
-    command: ["--help"]
+      - ./reports:/home/samurai/reports
+    command: ["samurai", "--help"]
     stdin_open: true
     tty: true
+
+  # 1-command reproducible 1M Userspace TCP Flow benchmark (605 B/flow, 64 shards).
+  # Example:
+  #   docker compose --profile bench run --rm bench
+  bench:
+    image: ghcr.io/mehmet8-dev/samurai:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: samurai-bench
+    profiles: ["bench"]
+    command: ["samurai_bench_1m_tcp"]

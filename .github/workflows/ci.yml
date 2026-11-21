@@ -122,9 +122,10 @@ jobs:
         run: |
           make -C samurai all || make -C samurai xdp pacing
 
-      - name: Run Core & Control Selftests
+      - name: Run Core, Control & MCP Selftests
         run: |
           ./build/control/samurai_control_selftest
+          ./build/mcp/test_samurai_mcp
 
       - name: Run L4 Sliding Window & Fastpath Tests
         run: |

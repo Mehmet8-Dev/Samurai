@@ -33,11 +33,12 @@ WORKDIR /src
 COPY . .
 
 # Configure once, then build the deployable targets (CLI + daemons + commodity
-# and telco workers). GPU/DPDK/DOCA backends are gated on their toolchains and
-# skip cleanly when absent, so they are omitted from the default image.
+# and telco workers + reproducible benchmark harnesses). GPU/DPDK/DOCA backends
+# are gated on their toolchains and skip cleanly when absent.
 RUN cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release \
  && cmake --build build -j "$(nproc)" --target \
       samurai \
+      samurai_mcp \
       samurai_master \
       samurai_slave \
       samurai_cpu_worker \
@@ -46,7 +47,10 @@ RUN cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release \
       samurai_l7_worker \
       samurai_scenario_worker \
       samurai_defense_worker \
-      samurai_telco_worker
+      samurai_telco_worker \
+      test_100k_tcp_flows \
+      test_1m_tcp_flows \
+      bench_l7_stateful_userspace
 
 # ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -75,6 +79,7 @@ RUN useradd -u 10001 -m -s /usr/sbin/nologin samurai
 # Install the native binaries on PATH. `--parents` preserves nothing; we flatten
 # every built daemon/worker into /usr/local/bin.
 COPY --from=build /src/build/cli/samurai                  /usr/local/bin/
+COPY --from=build /src/build/mcp/samurai_mcp              /usr/local/bin/
 COPY --from=build /src/build/control/daemon/samurai_master /usr/local/bin/
 COPY --from=build /src/build/control/daemon/samurai_slave  /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_cpu_worker        /usr/local/bin/
@@ -83,7 +88,10 @@ COPY --from=build /src/build/zmq/samurai_afxdp_worker      /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_l7_worker         /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_scenario_worker   /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_defense_worker    /usr/local/bin/
-COPY --from=build /src/build/zmq/samurai_telco_worker      /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_telco_worker             /usr/local/bin/
+COPY --from=build /src/build/l4/test_100k_tcp_flows               /usr/local/bin/samurai_bench_100k_tcp
+COPY --from=build /src/build/l4/test_1m_tcp_flows                 /usr/local/bin/samurai_bench_1m_tcp
+COPY --from=build /src/build/zmq/bench_l7_stateful_userspace      /usr/local/bin/samurai_bench_l7
 
 USER 10001:10001
 WORKDIR /home/samurai
