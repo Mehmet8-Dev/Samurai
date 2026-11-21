@@ -1,0 +1,49 @@
+{
+  "name": "samurai-net",
+  "version": "3.3.0",
+  "description": "Pure C++17 line-rate load, kernel-bypass & AI resilience engine — 1M TCP flows in 577 MiB (605 B/flow), HTTP/2-QUIC, GeForce BAR1 CUDA, 5G CUPS & native MCP.",
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Mehmet8-Dev/Samurai.git"
+  },
+  "homepage": "https://github.com/Mehmet8-Dev/Samurai#readme",
+  "bugs": {
+    "url": "https://github.com/Mehmet8-Dev/Samurai/issues"
+  },
+  "keywords": [
+    "networking",
+    "load-testing",
+    "stress-testing",
+    "tcp",
+    "http2",
+    "http3",
+    "quic",
+    "af-xdp",
+    "dpdk",
+    "cuda",
+    "5g",
+    "telecom",
+    "mcp",
+    "benchmark",
+    "cpp17"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "bin": {
+    "samurai-net": "./bin/samurai.js",
+    "samurai": "./bin/samurai.js",
+    "samurai-mcp": "./bin/samurai-mcp.js",
+    "samurai-master": "./bin/samurai-master.js",
+    "samurai-slave": "./bin/samurai-slave.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

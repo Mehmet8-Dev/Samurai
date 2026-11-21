@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
           "\n"
           "Management subcommands:\n"
           "  samurai_mcp doctor [--client <id>] [--json]\n"
-          "  samurai_mcp setup  --client <id> [--dry-run] [--yes] [--docker] [--scope user|project] [--json]\n"
+          "  samurai_mcp setup  --client <id> [--dry-run] [--yes] [--docker | --npx] [--scope user|project] [--json]\n"
           "\n"
           "Supported --client IDs:\n"
           "  claude_code, claude_desktop, cursor, codex, gemini_cli,\n"

@@ -133,6 +133,7 @@ std::string LocateSkillsDir() {
       "/usr/local/share/samurai/skills",
   };
   if (!self.empty()) {
+    cands.push_back(self + "/../skills");
     cands.push_back(self + "/../../skills");
     cands.push_back(self + "/../share/samurai/skills");
   }
@@ -437,7 +438,7 @@ void PrintSetupUsage() {
   std::printf(
       "Usage:\n"
       "  samurai_mcp doctor [--client <id>] [--json]\n"
-      "  samurai_mcp setup --client <id> [--dry-run] [--yes] [--docker] [--image <ref>] [--scope user|project] [--json]\n"
+      "  samurai_mcp setup --client <id> [--dry-run] [--yes] [--docker | --npx] [--image <ref>] [--scope user|project] [--json]\n"
       "\n"
       "Supported --client IDs:\n"
       "  claude_code, claude_desktop, cursor, codex, gemini_cli,\n"
@@ -579,17 +580,30 @@ SetupResult ExecuteSetup(const SetupOptions& opts) {
     return res;
   }
 
+  if (opts.docker && opts.npx) {
+    Value err = Value::Object();
+    err.set("ok", Value::Bool(false));
+    err.set("error", Value::Str("Cannot combine --docker and --npx; choose one transport mode."));
+    res.exit_code = 2;
+    res.report = std::move(err);
+    return res;
+  }
+
   const std::string home = HomeDir(opts.home_override);
   const std::string project = ProjectDir(opts.project_override);
   const std::string config_path = ResolveClientConfigPath(*spec, opts.scope, home, project);
   const std::string backup_path = config_path + ".bak";
 
   std::string mcp_bin = opts.binary_override.empty() ? LocateBinary({"samurai_mcp"}) : opts.binary_override;
-  const bool use_docker = opts.docker || mcp_bin.empty();
+  const bool use_npx = opts.npx;
+  const bool use_docker = !use_npx && (opts.docker || mcp_bin.empty());
 
   std::string command;
   std::vector<std::string> args;
-  if (use_docker) {
+  if (use_npx) {
+    command = "npx";
+    args = {"-y", "-p", "samurai-net", "samurai-mcp"};
+  } else if (use_docker) {
     command = "docker";
     args = {"run", "-i", "--rm"};
 #if defined(__linux__)
@@ -681,7 +695,7 @@ SetupResult ExecuteSetup(const SetupOptions& opts) {
   out.set("client", Value::Str(spec->id));
   out.set("display_name", Value::Str(spec->display_name));
   out.set("scope", Value::Str(opts.scope));
-  out.set("transport_mode", Value::Str(use_docker ? "docker" : "native"));
+  out.set("transport_mode", Value::Str(use_npx ? "npx" : (use_docker ? "docker" : "native")));
   out.set("config_path", Value::Str(config_path));
   out.set("config_existed", Value::Bool(exists));
   out.set("backup_path", Value::Str(exists ? backup_path : ""));
@@ -793,6 +807,8 @@ int RunSetupCli(int argc, char** argv) {
       opts.image = argv[++i];
     } else if (a == "--docker") {
       opts.docker = true;
+    } else if (a == "--npx") {
+      opts.npx = true;
     } else if (a == "--dry-run") {
       opts.dry_run = true;
     } else if (a == "--yes" || a == "-y") {

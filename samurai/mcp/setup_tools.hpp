@@ -24,6 +24,7 @@ struct SetupOptions {
   std::string scope = "user";    // "user" or "project"
   std::string image = "ghcr.io/mehmet8-dev/samurai:latest";
   bool docker = false;
+  bool npx = false;
   bool dry_run = false;
   bool yes = false;
   bool json = false;

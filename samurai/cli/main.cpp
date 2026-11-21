@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     std::printf(
         "usage: %s mcp <doctor|setup> [options]\n"
         "  samurai mcp doctor [--client <id>] [--json]\n"
-        "  samurai mcp setup  --client <id> [--dry-run] [--yes] [--docker] [--scope user|project] [--json]\n",
+        "  samurai mcp setup  --client <id> [--dry-run] [--yes] [--docker | --npx] [--scope user|project] [--json]\n",
         argv[0]);
     return (argc == 2 || (argc >= 3 && (std::string(argv[2]) == "-h" || std::string(argv[2]) == "--help")))
                ? 0

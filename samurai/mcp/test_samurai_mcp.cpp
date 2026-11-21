@@ -507,6 +507,17 @@ int main() {
     Check(!bad_res.ok && bad_res.exit_code == 2,
           "setup refuses to overwrite malformed existing JSON config");
 
+    samurai::mcp::SetupOptions npx_opts;
+    npx_opts.client = "antigravity";
+    npx_opts.npx = true;
+    npx_opts.dry_run = true;
+    npx_opts.home_override = tmp_root.string();
+    npx_opts.project_override = tmp_root.string();
+    const auto npx_res = samurai::mcp::ExecuteSetup(npx_opts);
+    Check(npx_res.ok && npx_res.report.find("transport_mode")->as_string() == "npx" &&
+              npx_res.report.find("proposed_entry")->find("command")->as_string() == "npx",
+          "setup --npx generates npx samurai-net transport entry");
+
     fs::remove_all(tmp_root, ec);
   }
 

@@ -30,20 +30,18 @@ Exposes **22 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**,
 
 ```bash
 # 1. Inspect local binaries, workers, and MCP client registration status
-./build/mcp/samurai_mcp doctor
-./build/mcp/samurai_mcp doctor --client codex --json
+npx -y samurai-net mcp doctor
+# (or locally compiled: ./build/mcp/samurai_mcp doctor --client codex --json)
 
 # 2. Preview proposed config changes (safe non-mutating dry-run)
-./build/mcp/samurai_mcp setup --client cursor --dry-run
+npx -y samurai-net mcp setup --client cursor --dry-run
 
 # 3. Apply registration (automatically creates a .bak backup of existing configs)
-./build/mcp/samurai_mcp setup --client cursor --yes
+npx -y samurai-net mcp setup --client cursor --yes
 
-# Or register the pre-built GHCR Docker image instead of a local binary:
-./build/mcp/samurai_mcp setup --client claude_code --docker --yes
-
-# Equivalent alias from the main CLI:
-./build/cli/samurai mcp setup --client codex --yes
+# Or register npx / GHCR Docker directly as the MCP transport:
+npx -y samurai-net mcp setup --client claude_code --npx --yes
+npx -y samurai-net mcp setup --client claude_code --docker --yes
 ```
 
 > **macOS & Windows (Docker Desktop):** Docker Desktop runs containers inside a Linux VM, so `--network host` does not bind directly to host `127.0.0.1`. Target services running on your Mac/Windows host via `host.docker.internal` (the Docker setup mode automatically passes `--add-host host.docker.internal:host-gateway` on non-Linux hosts), or run Samurai against sibling containers on a shared Docker network.

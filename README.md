@@ -8,37 +8,43 @@ Samurai (v3.3.0) bridges the gap between scripting load tools (`k6`, `Locust`) a
 
 ## Quick Start
 
-### 1. Install Project (Zero-Build or Source)
-```bash
-# Option A: Pre-built Linux x86_64 release binaries (or Docker wrapper on macOS/Windows)
-curl -fsSL https://raw.githubusercontent.com/Mehmet8-Dev/Samurai/main/scripts/install.sh | bash
+### 1. Run Immediately (`npx` or Docker — Zero Build)
+One package (`samurai-net`) pulls the entire Samurai runtime (CLI, MCP server, `samurai_master`/`samurai_slave`, all 10 dataplane workers, and benchmark binaries):
 
-# Option B: Reproduce the 1M stateful TCP flow benchmark immediately via Docker (zero install)
+```bash
+# Option A: Run 1M stateful TCP flows (605 B/flow) via npx (Linux native cache or Docker fallback)
+npx -y samurai-net bench 1m-tcp
+
+# Or install all binaries globally into your PATH:
+npm install -g samurai-net
+
+# Option B: Direct GHCR container (zero Node.js, zero build)
 docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp
 
-# Option C: Build from source (Linux C++17)
+# Option C: Build natively from source (Linux C++17)
 cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$(nproc)"
 ```
 
 ### 2. Connect AI Coding Agent (1-Command MCP Setup)
-Automatically diagnose binaries and register `samurai_mcp` across **Claude Code, Cursor, Codex, Antigravity, Gemini CLI, Windsurf, VS Code, OpenCode, or Copilot CLI**:
+Automatically diagnose binaries and register Samurai MCP across **Claude Code, Cursor, Codex, Antigravity, Gemini CLI, Windsurf, VS Code, OpenCode, or Copilot CLI**:
 
 ```bash
-# Check installed binaries, workers, and MCP client status
-samurai_mcp doctor
+# Check binaries, workers, and MCP client registration status
+npx -y samurai-net mcp doctor
 
-# Preview (dry-run) and apply MCP config safely (creates a .bak backup automatically)
-samurai_mcp setup --client claude_code --dry-run
-samurai_mcp setup --client claude_code --yes
+# Preview (dry-run) and apply MCP registration (creates a .bak backup automatically)
+npx -y samurai-net mcp setup --client claude_code --dry-run
+npx -y samurai-net mcp setup --client claude_code --yes
 
-# Or connect via the GHCR container without local binaries (macOS / Windows / Docker):
-samurai_mcp setup --client cursor --docker --yes
+# Register via npx or Docker transport (zero local compile; works on macOS / Windows / Linux):
+npx -y samurai-net mcp setup --client cursor --npx --yes
+npx -y samurai-net mcp setup --client cursor --docker --yes
 ```
 
 ### 3. Run Your First Stress Test
 ```bash
 # Stateful HTTP/2 load test against a local lab target (private/loopback only by default)
-samurai --worker l7 --target 127.0.0.1 --port 8080 --l7-protocol http2 --concurrency 4 --count 10000 --confirm
+npx -y samurai-net --worker l7 --target 127.0.0.1 --port 8080 --l7-protocol http2 --concurrency 4 --count 10000 --confirm
 ```
 
 > **Which engine should I pick?** Start with `--worker l7` (HTTP/1.1, HTTP/2, QUIC/H3) or `--worker scenario` for web/API SLA testing; move to `--worker afxdp` / `dpdk` / `gpu` for 10G–100G kernel-bypass or GeForce BAR1 P2P labs; use `--worker telco` for 4G/5G core (`GTP-U`, `PFCP`, `SCTP`, `Diameter`, `SIP/SRTP`).

@@ -84,6 +84,10 @@ jobs:
           cp build/control/daemon/samurai_master "${DIST_DIR}/bin/"
           cp build/control/daemon/samurai_slave "${DIST_DIR}/bin/"
           cp build/zmq/samurai_*_worker "${DIST_DIR}/bin/" || true
+          cp build/l4/test_100k_tcp_flows "${DIST_DIR}/bin/samurai_bench_100k_tcp"
+          cp build/l4/test_1m_tcp_flows "${DIST_DIR}/bin/samurai_bench_1m_tcp"
+          cp build/zmq/bench_l7_stateful_userspace "${DIST_DIR}/bin/samurai_bench_l7"
+          cp -r skills "${DIST_DIR}/skills"
           cp README.md LICENSE* "${DIST_DIR}/" 2>/dev/null || true
           tar -czvf "${DIST_DIR}.tar.gz" "${DIST_DIR}"
           sha256sum "${DIST_DIR}.tar.gz" > "${DIST_DIR}.tar.gz.sha256"
@@ -107,3 +111,31 @@ jobs:
             samurai-${{ needs.validate-tag.outputs.resolved_tag }}-linux-x86_64.tar.gz.sha256
           generate_release_notes: true
           make_latest: true
+
+  publish-npm:
+    name: Publish samurai-net to npm
+    needs: [validate-tag, build-and-certify]
+    if: ${{ vars.ENABLE_NPM_PUBLISH == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify samurai-net launcher tests
+        run: |
+          cd npm && npm test
+
+      - name: Publish samurai-net
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          TAG_VER="${{ needs.validate-tag.outputs.resolved_tag }}"
+          TAG_VER="${TAG_VER#v}"
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('npm/package.json','utf8'));if(p.version!=='${TAG_VER}'){console.error('npm version mismatch:',p.version,'!=','${TAG_VER}');process.exit(1);}"
+          cd npm && npm publish --access public
