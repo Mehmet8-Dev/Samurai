@@ -5,7 +5,7 @@
   "license": "AGPL-3.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Mehmet8-Dev/Samurai.git"
+    "url": "git+https://github.com/Mehmet8-Dev/Samurai.git"
   },
   "homepage": "https://github.com/Mehmet8-Dev/Samurai#readme",
   "bugs": {
@@ -32,11 +32,11 @@
     "node": ">=18.0.0"
   },
   "bin": {
-    "samurai-net": "./bin/samurai.js",
-    "samurai": "./bin/samurai.js",
-    "samurai-mcp": "./bin/samurai-mcp.js",
-    "samurai-master": "./bin/samurai-master.js",
-    "samurai-slave": "./bin/samurai-slave.js"
+    "samurai-net": "bin/samurai.js",
+    "samurai": "bin/samurai.js",
+    "samurai-mcp": "bin/samurai-mcp.js",
+    "samurai-master": "bin/samurai-master.js",
+    "samurai-slave": "bin/samurai-slave.js"
   },
   "files": [
     "bin/",
