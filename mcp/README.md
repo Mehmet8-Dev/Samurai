@@ -2,7 +2,9 @@
 
 A **100% native C++17, zero-Python, modular Model Context Protocol (MCP) server** (`protocolVersion: "2024-11-05"`) built directly into Samurai's CMake tree (`samurai/mcp/`).
 
-Links directly against `samurai_core` (native JSON + `ValidateTargetSafety`) and `samurai_control` (native `ClosedLoopController`, **Mahoraga `RlPolicy`** SRLP MLP & RL² GRU recurrent inference, `LeverShield`, and `RlExploreConfig`), allowing both **AI coding agents** (Claude Code, Cursor, Codex, Antigravity) and **autonomous Autopilot / RL agents** to drive Samurai over stdio JSON-RPC 2.0.
+Links directly against `samurai_core` (native JSON + `ValidateTargetSafety`), `samurai_control` (`ClosedLoopController`, **Mahoraga `RlPolicy`** SRLP MLP & RL² GRU, `LeverShield`, `RlExploreConfig`, `SplitJobToShards`, `SplitTelcoSubscribers`, `AutoscaleController`), and `samurai_scenario` (`parse_spec`, `build_worker_session_plans_native`, `evaluate_sla_native`).
+
+Exposes **21 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 MCP Workflow Prompts** over stdio JSON-RPC 2.0 — enabling Claude Code, Cursor, Codex, Antigravity, and autonomous RL agents to discover services/nodes, provision and scale workers, coordinate multi-worker shards, run Scenario Engine journeys, and drive Closed-Loop Autopilot runs.
 
 ---
 
@@ -10,29 +12,28 @@ Links directly against `samurai_core` (native JSON + `ValidateTargetSafety`) and
 
 | Module | Responsibility |
 | :--- | :--- |
-| [`samurai/mcp/protocol.hpp`](../samurai/mcp/protocol.hpp) / `.cpp` | JSON-RPC 2.0 & MCP `2024-11-05` framing, `initialize`, `ping`, `tools/list`, `tools/call`, stdio stream loop |
-| [`samurai/mcp/safety.hpp`](../samurai/mcp/safety.hpp) / `.cpp` | Fail-closed target safety gate wrapping `samurai::core::ValidateTargetSafety` (`allow_public` hard-locked to `false`) |
-| [`samurai/mcp/runtime_tools.hpp`](../samurai/mcp/runtime_tools.hpp) / `.cpp` | Shell-free POSIX `fork/execv/poll` runner, binary auto-discovery, pure POSIX HTTP client (`:8089`), benchmark & RFC tools |
-| [`samurai/mcp/autopilot_tools.hpp`](../samurai/mcp/autopilot_tools.hpp) / `.cpp` | Stateful Closed-Loop Autopilot & Mahoraga RL Agent session manager (`AIMD` / `BinSearch` / `kRl` + `RlPolicy` + `LeverShield` + `RlExploreConfig`) |
-| [`samurai/mcp/scenario_tools.hpp`](../samurai/mcp/scenario_tools.hpp) / `.cpp` | Native Scenario Engine compiler, multi-worker session scheduler, SLA evaluator (`samurai_scenario`), and fail-closed live runner (`samurai_scenario_worker`) |
-| [`samurai/mcp/tool_registry.hpp`](../samurai/mcp/tool_registry.hpp) / `.cpp` | Tool registration and JSON Schema definitions for all 15 native tools |
-| [`samurai/mcp/main.cpp`](../samurai/mcp/main.cpp) | Thin `samurai_mcp` binary entrypoint |
+| [`samurai/mcp/protocol.hpp`](../samurai/mcp/protocol.hpp) / `.cpp` | MCP `2024-11-05` JSON-RPC 2.0 engine (`tools/*`, `resources/*`, `prompts/*`, `initialize`, `ping`) |
+| [`samurai/mcp/safety.hpp`](../samurai/mcp/safety.hpp) / `.cpp` | Fail-closed target safety gate wrapping `samurai::core::ValidateTargetSafety` (`allow_public=false`) |
+| [`samurai/mcp/runtime_tools.hpp`](../samurai/mcp/runtime_tools.hpp) / `.cpp` | Shell-free POSIX `fork/execv/poll` runner, binary auto-discovery, benchmark & RFC compliance tools |
+| [`samurai/mcp/cluster_tools.hpp`](../samurai/mcp/cluster_tools.hpp) / `.cpp` | Distributed cluster discovery, SSH node provisioning, live shard reconfiguration, abort, in-process sharding/autoscale planning, and loopback local multi-worker mesh manager |
+| [`samurai/mcp/autopilot_tools.hpp`](../samurai/mcp/autopilot_tools.hpp) / `.cpp` | Closed-Loop Autopilot & Mahoraga RL session manager (`AIMD` / `BinSearch` / `kRl` + `RlPolicy` + `LeverShield` + `RlExploreConfig`) |
+| [`samurai/mcp/scenario_tools.hpp`](../samurai/mcp/scenario_tools.hpp) / `.cpp` | Scenario Engine in-process compiler, weighted worker scheduler, SLA evaluator, and fail-closed live runner |
+| [`samurai/mcp/tool_registry.hpp`](../samurai/mcp/tool_registry.hpp) / `.cpp` | Registration of all 21 tools, 5 skill resources, and 5 workflow prompts |
 | [`samurai/mcp/test_samurai_mcp.cpp`](../samurai/mcp/test_samurai_mcp.cpp) | Native C++17 verification suite (`test_samurai_mcp`) |
 
 ---
 
 ## Quick Setup (Zero Python, Zero Dependencies)
 
-### Option A — Local CMake Build
+### Local CMake Build
 ```bash
 cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j"$(nproc)" --target samurai_mcp samurai
+cmake --build build -j"$(nproc)" --target samurai_mcp samurai samurai_master samurai_slave
 
-# Register in Claude Code:
 claude mcp add samurai -- /path/to/Samurai/build/mcp/samurai_mcp
 ```
 
-### Option B — Pre-Built GHCR Container (Zero Build)
+### Pre-Built GHCR Container (Zero Build)
 ```bash
 claude mcp add samurai -- docker run -i --rm --network host ghcr.io/mehmet8-dev/samurai:latest samurai_mcp
 ```
@@ -50,39 +51,55 @@ claude mcp add samurai -- docker run -i --rm --network host ghcr.io/mehmet8-dev/
 
 ---
 
-## All 15 Native MCP Tools
+## All 21 Native MCP Tools
 
-### Dataplane, Benchmarks & Cluster Tools
+### Dataplane, Benchmarks & RFC Compliance (6 Tools)
 | Tool | Purpose |
 | :--- | :--- |
-| `samurai_list_workers` | Discovers compiled C++17 workers (`cpu`, `afpacket`, `afxdp`, `dpdk`, `gpu`, `doca`, `l7`, `scenario`, `telco`, `defense`), daemons, and benchmarks |
+| `samurai_list_workers` | Discovers all 10 compiled C++17 workers (`cpu`, `afpacket`, `afxdp`, `dpdk`, `gpu`, `doca`, `l7`, `scenario`, `telco`, `defense`), daemons, and benchmarks |
 | `samurai_list_profiles` | Lists built-in L4, L7, and 4G/5G carrier-telecom profiles |
 | `samurai_run_benchmark` | Runs a bounded, fail-closed benchmark via `samurai` and returns parsed JSON telemetry + KPI gate status |
 | `samurai_run_rfc_suite` | Runs RFC 2544 / 3511 / 8219 compliance benchmarks and returns a Markdown report |
 | `samurai_bench_tcp_flows` | Reproduces the 100k quick check or 1M active TCP flows (`605 B/flow`) scaling benchmark |
 | `samurai_bench_l7_userspace` | Runs the Shared-Nothing HTTP/1.1 & HTTP/2 userspace benchmark (`CPS`, `RPS`, `P50/P95/P99`, `VmRSS`) |
-| `samurai_cluster_status` | Queries `samurai_master` `:8089` (`/healthz`, `/v1/state`) over pure POSIX sockets |
 
-### Closed-Loop Autopilot & Mahoraga RL Agent Tools
+### Distributed Cluster Discovery, Node Provisioning & Multi-Worker Coordination (7 Tools)
 | Tool | Purpose |
 | :--- | :--- |
-| `samurai_autopilot_create` | Creates a stateful closed-loop session (`aimd`, `binsearch`, or `rl`) with SLO thresholds, optional native SRLP `policy_path` (MLP or RL² GRU), `LeverShield`, and `RlExploreConfig` |
-| `samurai_autopilot_step` | Feeds one measured `LoadSample` + Mahoraga defense ratios (or an external RL agent's `rl_action_rps` / `rl_levers`) into `RlPolicy` + `LeverShield` + `ClosedLoopController::Step()` and returns the safety-shielded 7-D action (`rps`, `concurrency`, `request_mix`, `source_rotation`, `pacing_mode`, `auth_mode`, `evasion_tactic`) |
-| `samurai_autopilot_run_window` | Executes one live safety-gated dataplane window at the session's current `setpoint_rps`, folds its JSON telemetry into a `LoadSample`, and returns both live metrics and the next shielded decision |
-| `samurai_autopilot_status` | Inspects active sessions, setpoints, `best_good_rps`, `ban_pressure` EWMA, and `LeverShield` memory |
-| `samurai_autopilot_reset` | Resets episode state (controller, RL² GRU hidden context, `LeverShield`) or deletes a session |
+| `samurai_cluster_discover` | Queries `samurai_master` `:8089` (`/healthz`, `/v1/cluster/summary`, `/v1/cluster/workers`, `/v1/cluster/shards`, `/v1/cluster/events`, `/metrics`) |
+| `samurai_cluster_status` | Alias for `samurai_cluster_discover` |
+| `samurai_cluster_provision_node` | Adds new private/RFC1918 worker nodes via `POST /v1/cluster/provision` (SSH/zero-install bootstrap) |
+| `samurai_cluster_reconfigure` | Coordinates live worker shards mid-flight via `POST /v1/shards/reconfigure` (RPS, concurrency, Mahoraga levers) |
+| `samurai_cluster_abort` | Emergency cluster-wide job abort via `POST /v1/jobs/abort` |
+| `samurai_cluster_plan_shards` | In-process multi-worker sharding (`equal`/`capability`/`region` + 5G telco `regional-bng`/`national-cgnat`) & `AutoscaleController` replica planning |
+| `samurai_cluster_local_mesh` | Spins up, dynamically scales (`add`/`remove` slave nodes), inspects, or stops a loopback-only (`127.0.0.1`) `samurai_master` + N `samurai_slave` lab cluster |
 
-### Multi-Step Persona Scenario Engine Tools
+### Closed-Loop Autopilot & Mahoraga RL Agent (5 Tools)
 | Tool | Purpose |
 | :--- | :--- |
-| `samurai_scenario_compile` | Parses, validates, and compiles inline or file-based Scenario JSON specs (personas, flows, steps, token capture, think-time, L4/L7 actions) in-process via `samurai_scenario` |
-| `samurai_scenario_run` | Validates in-process and runs a live fail-closed multi-step persona scenario (HTTP/1.1, HTTP/2, QUIC/H3) via `samurai_scenario_worker` against a loopback/RFC1918 lab target |
-| `samurai_scenario_evaluate_sla` | Evaluates any Scenario SLA contract (`min_completion_rate`, `max_step_fail_ratio`, `max_latency_p95_ms`, TCP connect/retransmit ratios) in-process via `evaluate_sla_native()` |
+| `samurai_autopilot_create` | Creates an `aimd`, `binsearch`, or `rl` session with SLO thresholds, optional SRLP `policy_path` (MLP/RL² GRU), `LeverShield`, and `RlExploreConfig` |
+| `samurai_autopilot_step` | Runs `RlPolicy::ProposeFor()` (or external RL proposal) + `LeverShield::Govern()` + `ClosedLoopController::Step()` and returns the shielded 7-D action |
+| `samurai_autopilot_run_window` | Executes one live safety-gated dataplane window at `current_setpoint_rps`, parses JSON telemetry, and advances the controller |
+| `samurai_autopilot_status` | Inspects active sessions, setpoints, `best_good_rps`, `ban_pressure`, and `LeverShield` memory |
+| `samurai_autopilot_reset` | Resets episode state (`ResetContext` + `LeverShield::Reset`) or deletes a session |
+
+### Multi-Step Persona Scenario Engine (3 Tools)
+| Tool | Purpose |
+| :--- | :--- |
+| `samurai_scenario_compile` | Parses, validates, and compiles Scenario JSON specs in-process via `samurai_scenario` |
+| `samurai_scenario_run` | Validates in-process and runs a live multi-step persona scenario via `samurai_scenario_worker` |
+| `samurai_scenario_evaluate_sla` | Evaluates Scenario SLA contracts in-process via `evaluate_sla_native()` |
 
 ---
 
-## Fail-Closed Safety Policy
+## Portable Agent Skills (Exposed via MCP `resources/*` & `prompts/*`)
 
-1. **Private/Loopback Only by Default:** All target IPs pass through native `samurai::core::ValidateTargetSafety(..., allow_public=false)`.
-2. **No Shell Execution:** Subprocesses use direct POSIX `fork()` + `execv()` with `poll()` deadlines — zero `/bin/sh` injection surface.
-3. **RL Safety Shield Always Enforced:** Even when an SRLP policy or external RL agent proposes an aggressive jump or ignores 429/503 pushback, `ClosedLoopController::StepRl` enforces `rl_max_jump_factor` and forced multiplicative backoff on SLO violations, while `LeverShield` automatically substitutes WAF path-blocked variants.
+All 5 skills are served automatically over MCP (`samurai://skills/<name>`) and stored under `skills/`:
+
+| Skill URI | File | Scope |
+| :--- | :--- | :--- |
+| `samurai://skills/samurai-netbench` | [`skills/samurai-netbench/SKILL.md`](../skills/samurai-netbench/SKILL.md) | Master benchmarking, RFC compliance & evidence boundaries |
+| `samurai://skills/samurai-cluster-orchestrator` | [`skills/samurai-cluster-orchestrator/SKILL.md`](../skills/samurai-cluster-orchestrator/SKILL.md) | Service/node discovery, provisioning, sharding, scaling & live shard coordination |
+| `samurai://skills/samurai-autopilot-rl` | [`skills/samurai-autopilot-rl/SKILL.md`](../skills/samurai-autopilot-rl/SKILL.md) | Closed-Loop AIMD/BinSearch/Mahoraga RL, SRLP policies & `LeverShield` |
+| `samurai://skills/samurai-scenario-author` | [`skills/samurai-scenario-author/SKILL.md`](../skills/samurai-scenario-author/SKILL.md) | Multi-step Web/Mobile persona scenarios, token capture & SLA checks |
+| `samurai://skills/samurai-hardware-dataplane` | [`skills/samurai-hardware-dataplane/SKILL.md`](../skills/samurai-hardware-dataplane/SKILL.md) | Complete 10-worker catalog (`cpu`, `afpacket`, `afxdp`, `dpdk`, `gpu`, `doca`, `l7`, `scenario`, `telco`, `defense`) |

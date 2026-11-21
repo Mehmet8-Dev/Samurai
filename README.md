@@ -30,12 +30,13 @@ claude mcp add samurai -- /path/to/Samurai/build/mcp/samurai_mcp
 claude mcp add samurai -- docker run -i --rm --network host ghcr.io/mehmet8-dev/samurai:latest samurai_mcp
 ```
 
-Exposes **15 native tools** covering:
-- **Dataplane, Benchmarks & RFC Compliance:** `samurai_list_workers`, `samurai_list_profiles`, `samurai_run_benchmark`, `samurai_run_rfc_suite`, `samurai_bench_tcp_flows`, `samurai_bench_l7_userspace`, `samurai_cluster_status`.
-- **Scenario Engine (`samurai_scenario`):** `samurai_scenario_compile` (in-process persona/flow/step validation and compilation), `samurai_scenario_run` (live multi-step HTTP/1.1, HTTP/2, QUIC execution), `samurai_scenario_evaluate_sla` (in-process SLA verification).
+Exposes **21 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 Workflow Prompts** covering:
+- **Dataplane, Benchmarks & RFC Compliance:** `samurai_list_workers`, `samurai_list_profiles`, `samurai_run_benchmark`, `samurai_run_rfc_suite`, `samurai_bench_tcp_flows`, `samurai_bench_l7_userspace`.
+- **Distributed Cluster & Multi-Worker Orchestration:** `samurai_cluster_discover` (live worker/shard/metrics discovery), `samurai_cluster_provision_node` (add new lab nodes), `samurai_cluster_plan_shards` (capability/region/5G telco CGNAT sharding + `AutoscaleController`), `samurai_cluster_reconfigure` (live multi-worker rate/lever coordination), `samurai_cluster_abort`, and `samurai_cluster_local_mesh` (start/scale/stop a loopback `samurai_master` + N `samurai_slave` mesh).
+- **Scenario Engine (`samurai_scenario`):** `samurai_scenario_compile`, `samurai_scenario_run`, `samurai_scenario_evaluate_sla`.
 - **Closed-Loop Autopilot & Mahoraga RL (`samurai_control`):** `samurai_autopilot_create`, `samurai_autopilot_step`, `samurai_autopilot_run_window`, `samurai_autopilot_status`, `samurai_autopilot_reset` — supporting `AIMD`, `BinSearch`, in-process SRLP MLP & RL² GRU `RlPolicy` inference, `LeverShield` WAF path-block reflex, and `RlExploreConfig`.
 
-All MCP tools enforce fail-closed target validation (`samurai::core::ValidateTargetSafety(..., allow_public=false)`) and never expose `--allow-public-target`. See [`mcp/README.md`](mcp/README.md) for Cursor/Codex configuration and [`skills/samurai-netbench/SKILL.md`](skills/samurai-netbench/SKILL.md) for the portable agent skill.
+All MCP tools enforce fail-closed target validation (`samurai::core::ValidateTargetSafety(..., allow_public=false)`) and never expose `--allow-public-target`. See [`mcp/README.md`](mcp/README.md) for Cursor/Codex configuration and [`skills/`](skills/) for all 5 portable agent skills.
 
 ---
 
