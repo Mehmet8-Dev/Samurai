@@ -36,6 +36,7 @@ add_subdirectory(telemetry)
 set(SAMURAI_ENGINES_OWNED_BY_ROOT ON)
 add_subdirectory(zmq)
 add_subdirectory(cli)
+add_subdirectory(mcp)
 # Toolchain-gated optional backends (CUDA/DPDK/AF_XDP/DOCA); each skips cleanly
 # when its toolchain is absent.
 add_subdirectory(optional)
