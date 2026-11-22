@@ -161,7 +161,12 @@ settings.json
 
 # Video presentation & assets
 /samurai-video/
+/promo/
 *.mp4
+*.mov
+*.webm
+*.mkv
+*.avi
 
 # Diagram theme guide & generator scratch
 DIAGRAM_THEME_GUIDE.md
