@@ -68,9 +68,9 @@ test("detectHostHardware, getNativeCacheDir, and getLocalImageTag use source-nat
   assert.equal(typeof hw.cpus, "number");
   assert.equal(typeof hw.cudaGpu, "boolean");
   assert.equal(typeof hw.dpdk, "boolean");
-  const dir = getNativeCacheDir("3.3.1", { SAMURAI_CACHE_DIR: "/tmp/scache" });
-  assert.equal(dir, "/tmp/scache/v3.3.1-native");
-  assert.equal(getLocalImageTag("3.3.1", {}), "samurai:local-v3.3.1");
+  const dir = getNativeCacheDir("3.3.2", { SAMURAI_CACHE_DIR: "/tmp/scache" });
+  assert.equal(dir, "/tmp/scache/v3.3.2-native");
+  assert.equal(getLocalImageTag("3.3.2", {}), "samurai:local-v3.3.2");
 });
 
 test("bin/samurai.js executes local samurai mcp doctor --json when built", (t) => {

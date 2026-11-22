@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "samurai"
-version = "3.3.1"
+version = "3.3.2"
 description = "Samurai - Offline Python test & Mahoraga RL training harness for the native C++17 network resilience platform"
 readme = "README.md"
 requires-python = ">=3.10"

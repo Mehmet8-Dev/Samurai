@@ -29,7 +29,7 @@ Exposes **22 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**,
 ### Automated Registration (`claude_code`, `cursor`, `codex`, `gemini_cli`, `antigravity`, `windsurf`, `vscode`, `opencode`, `copilot_cli`)
 
 ```bash
-# 1. Inspect local binaries, workers, and MCP client registration status
+# 1. Inspect local binaries, host hardware acceleration, and MCP client status
 npx -y samurai-net mcp doctor
 # (or locally compiled: ./build/mcp/samurai_mcp doctor --client codex --json)
 
@@ -39,26 +39,30 @@ npx -y samurai-net mcp setup --client cursor --dry-run
 # 3. Apply registration (automatically creates a .bak backup of existing configs)
 npx -y samurai-net mcp setup --client cursor --yes
 
-# Or register npx / GHCR Docker directly as the MCP transport:
+# Or register npx (auto-compiles from source for host hardware) or local Docker directly:
 npx -y samurai-net mcp setup --client claude_code --npx --yes
 npx -y samurai-net mcp setup --client claude_code --docker --yes
 ```
 
 > **macOS & Windows (Docker Desktop):** Docker Desktop runs containers inside a Linux VM, so `--network host` does not bind directly to host `127.0.0.1`. Target services running on your Mac/Windows host via `host.docker.internal` (the Docker setup mode automatically passes `--add-host host.docker.internal:host-gateway` on non-Linux hosts), or run Samurai against sibling containers on a shared Docker network.
 
-### Manual Setup (Claude Code / GHCR Container)
+### Manual Setup (Claude Code / Local Container)
 
 ### Local CMake Build
 ```bash
-cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release
+cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release -DSAMURAI_NATIVE_ARCH=ON
 cmake --build build -j"$(nproc)" --target samurai_mcp samurai samurai_master samurai_slave
 
 claude mcp add samurai -- /path/to/Samurai/build/mcp/samurai_mcp
 ```
 
-### Pre-Built GHCR Container (Zero Build)
+### Host-Native `npx` or Local Docker Container
 ```bash
-claude mcp add samurai -- docker run -i --rm --network host ghcr.io/mehmet8-dev/samurai:latest samurai_mcp
+# Compiles from source for your machine on first run
+claude mcp add samurai -- npx -y -p samurai-net samurai-mcp
+
+# Or using a locally built host-native Docker image (`docker build -t samurai:local .`)
+claude mcp add samurai -- docker run -i --rm --network host samurai:local samurai_mcp
 ```
 
 ### Cursor (`.cursor/mcp.json`) / Codex / Antigravity

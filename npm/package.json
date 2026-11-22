@@ -1,6 +1,6 @@
 {
   "name": "samurai-net",
-  "version": "3.3.1",
+  "version": "3.3.2",
   "description": "Pure C++17 line-rate load, kernel-bypass & AI resilience engine — 1M TCP flows in 577 MiB (605 B/flow), HTTP/2-QUIC, GeForce BAR1 CUDA, 5G CUPS & native MCP.",
   "license": "AGPL-3.0",
   "repository": {

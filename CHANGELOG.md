@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.2] - 2026-11-22
+
+### Added
+- **Source-First Host-Native Compilation (`samurai-net`, `samurai build`, `Dockerfile`)**:
+  - `samurai-net` (`npx`) and `samurai build` now download the tagged source archive and compile all binaries and hardware-matched workers (`-DSAMURAI_NATIVE_ARCH=ON` for `-march=native` CPU SIMD, CUDA, DPDK, AF_XDP, `io_uring`, and DOCA) directly on the target machine by default instead of pulling generic GitHub binaries.
+  - `Dockerfile`, `docker-compose.yml`, and `docker-compose.distributed.yml` default to local source builds (`SAMURAI_NATIVE_ARCH=ON`, `pull_policy: build`); portable CI builds explicitly opt in via `--build-arg SAMURAI_NATIVE_ARCH=OFF` or `SAMURAI_PREBUILT=1`.
+  - `samurai_mcp doctor` now reports host CPU/SIMD, CUDA, DPDK, AF_XDP, `io_uring`, and DOCA hardware capabilities.
+- **Complete CLI `--help` & Structured Worker Output (`samurai/cli/`, `samurai/orchestrator/`, `samurai/core/log.*`)**:
+  - Updated `samurai --help` to document every supported CLI flag, `mcp`, and `build` subcommands.
+  - Added `--output auto|pretty|ndjson|quiet` and `-q/--quiet`: interactive terminals render clean progress lines and aligned `Samurai Run Summary` tables, while piped/CI runs preserve NDJSON compatibility.
+  - Unified worker daemon and core console logs onto structured `stderr` (`[timestamp] [worker:<name>] [LEVEL]`), honoring `SAMURAI_LOG_LEVEL`.
+
+### Changed
+- Bumped canonical SemVer across package, `npm/package.json`, Helm `appVersion`, citation metadata, MCP server, and documentation to `3.3.2`.
+
 ## [3.3.1] - 2026-11-22
 
 ### Added
@@ -165,7 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Kenjaku` is retained as codename.
 - Previous codename: `Ronin`.
 
-[Unreleased]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.3.1...HEAD
+[Unreleased]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.3.2...HEAD
+[3.3.2]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/Mehmet8-Dev/Samurai/compare/v3.1.1...v3.2.0

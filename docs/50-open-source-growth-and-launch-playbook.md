@@ -1,4 +1,4 @@
-# 50 - Open-Source Growth & Viral Launch Playbook (Samurai v3.3.1)
+# 50 - Open-Source Growth & Viral Launch Playbook (Samurai v3.3.2)
 
 This playbook translates the proven open-source viral distribution mechanics behind breakthrough developer repositories (such as REA's outcome-first positioning, 1-command onboarding, MCP agent integration, visual proof, and segmented multi-community engineering launches) into a concrete execution plan for **Samurai (`Mehmet8-Dev/Samurai`)**.
 
@@ -19,8 +19,8 @@ Before publishing any external post, configure these in **GitHub → Settings**:
   - `Benchmarks & Hardware Results` (Pin a thread: *"Community 1M TCP Flow Leaderboard — run `docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp` and post your CPU!"*)
   - `Architecture & RFCs`
   - `Show & Tell` (Lab topologies, WAF/BNG/5G UPF test setups)
-- **Publish a `v3.3.1` Tag After Pushing:**
-  Pushing a `v3.3.1` tag triggers `.github/workflows/release.yml`, automatically rebuilding `ghcr.io/mehmet8-dev/samurai:latest` so it includes:
+- **Publish a `v3.3.2` Tag After Pushing:**
+  Pushing a `v3.3.2` tag triggers `.github/workflows/release.yml`, automatically rebuilding `ghcr.io/mehmet8-dev/samurai:latest` so it includes:
   - Auto-discovered worker binaries (no `--worker-dir` required)
   - Native C++17 `samurai_mcp` (22 tools, 5 skill resources, 5 workflow prompts) + `/usr/local/share/samurai/skills`
   - Built-in `samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, and `samurai_bench_l7` commands inside the GHCR image!
@@ -69,7 +69,7 @@ Before publishing any external post, configure these in **GitHub → Settings**:
 
 ### Story 6 — X / Twitter Launch Thread (5-Post Viral Format)
 - **Post 1 (Hook + Visual/GIF):**
-  > I just open-sourced **Samurai v3.3.1** — a pure C++17 network resilience & line-rate stress platform.
+  > I just open-sourced **Samurai v3.3.2** — a pure C++17 network resilience & line-rate stress platform.
   >
   > One laptop (Ryzen 5 5600H + GTX 1650):
   > • 1,000,000 stateful TCP flows in 577 MiB RAM (`605 B/flow`, -63.3%)
@@ -122,7 +122,7 @@ Do **not** post to all channels on the same day. Space stories out so each wave 
 
 | Week | Primary Channel | Story / Hook | Goal |
 | :--- | :--- | :--- | :--- |
-| **Week 1 (Tue 15:00 UTC)** | GitHub `v3.3.1` release + **Show HN** + **X Thread** | 1M TCP flows in 577 MiB (`605 B/flow`) + 1-command Docker reproduction | Hit HN front page + GitHub Trending (C++) |
+| **Week 1 (Tue 15:00 UTC)** | GitHub `v3.3.2` release + **Show HN** + **X Thread** | 1M TCP flows in 577 MiB (`605 B/flow`) + 1-command Docker reproduction | Hit HN front page + GitHub Trending (C++) |
 | **Week 2 (Wed)** | **`r/cpp`** + **Lobste.rs** | Deep dive: `std::deque` slab retention & cache-line lock striping (`-63.3% RAM`) | High-signal C++ code reviews & contributors |
 | **Week 3 (Tue)** | **`r/CUDA`** + **NVIDIA Dev Forums** + YouTube Short | Consumer GeForce BAR1 P2P DMA + 129M masks/s QUIC CUDA crypto | Capture GPU/HPC developer wave |
 | **Week 4 (Thu)** | **`r/networking`** + **`r/linux`** + **LinkedIn Telecom** | Kernel `netns+veth` interop (`133.5k CPS`) + 5G CUPS + MCP AI benchmarking demo | Enterprise/carrier visibility & commercial support leads |
