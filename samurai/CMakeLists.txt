@@ -9,6 +9,23 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the build type" FORCE)
 endif()
 
+option(SAMURAI_NATIVE_ARCH "Optimize native binaries for the target host CPU (-march=native)" OFF)
+if(SAMURAI_NATIVE_ARCH)
+  include(CheckCXXCompilerFlag)
+  include(CheckCCompilerFlag)
+  check_cxx_compiler_flag("-march=native" SAMURAI_CXX_HAS_MARCH_NATIVE)
+  check_c_compiler_flag("-march=native" SAMURAI_C_HAS_MARCH_NATIVE)
+  if(SAMURAI_CXX_HAS_MARCH_NATIVE)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=native> $<$<COMPILE_LANGUAGE:CXX>:-mtune=native>)
+  endif()
+  if(SAMURAI_C_HAS_MARCH_NATIVE)
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:-march=native> $<$<COMPILE_LANGUAGE:C>:-mtune=native>)
+  endif()
+  message(STATUS "Samurai target tuning: SAMURAI_NATIVE_ARCH=ON (-march=native enabled=${SAMURAI_CXX_HAS_MARCH_NATIVE})")
+else()
+  message(STATUS "Samurai target tuning: portable release (pass -DSAMURAI_NATIVE_ARCH=ON to optimize for this CPU)")
+endif()
+
 # Exploit mitigation & binary hardening flags
 add_compile_options(
   -fvisibility=hidden

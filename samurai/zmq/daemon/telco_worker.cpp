@@ -347,8 +347,10 @@ class TelcoWireIo {
 
     int fd = ::socket(PF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL));
     if (fd < 0) {
-      std::cerr << "[TELCO_WORKER] Warning: raw socket open failed on '"
-                << iface_name << "': " << std::strerror(errno) << " (simulation loop active)" << std::endl;
+      samurai::daemon::WorkerLogWarn(
+          "telco",
+          "Raw socket open failed on '" + iface_name + "': " + std::strerror(errno) +
+              " (falling back to simulation loop)");
       return false;
     }
 
@@ -364,7 +366,7 @@ class TelcoWireIo {
     struct ifreq ifr{};
     std::strncpy(ifr.ifr_name, iface_name.c_str(), IFNAMSIZ - 1);
     if (::ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
-      std::cerr << "[TELCO_WORKER] Warning: ioctl(SIOCGIFINDEX) failed for " << iface_name << std::endl;
+      samurai::daemon::WorkerLogWarn("telco", "ioctl(SIOCGIFINDEX) failed for " + iface_name);
       ::close(fd);
       return false;
     }
@@ -375,8 +377,8 @@ class TelcoWireIo {
     sll.sll_protocol = htons(ETH_P_ALL);
 
     if (::bind(fd, reinterpret_cast<struct sockaddr*>(&sll), sizeof(sll)) < 0) {
-      std::cerr << "[TELCO_WORKER] Warning: bind failed on " << iface_name << ": "
-                << std::strerror(errno) << std::endl;
+      samurai::daemon::WorkerLogWarn(
+          "telco", "Bind failed on " + iface_name + ": " + std::strerror(errno));
       ::close(fd);
       return false;
     }
@@ -1350,8 +1352,8 @@ int main(int argc, char** argv) {
       transport_mode == "dpdk_direct") {
     if (!packet_transport->Open(iface_name)) {
       if (transport_mode == "dpdk" || transport_mode == "dpdk_direct") {
-        std::cerr << "[TELCO_WORKER] FATAL: DPDK transport requested (--transport " << transport_mode
-                  << ") but initialization failed." << std::endl;
+        samurai::daemon::WorkerLogError(
+            "telco", "DPDK transport requested (--transport " + transport_mode + ") but initialization failed.");
         return 2;
       }
     }

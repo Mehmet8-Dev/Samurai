@@ -33,9 +33,11 @@ WORKDIR /src
 COPY . .
 
 # Configure once, then build the deployable targets (CLI + daemons + commodity
-# and telco workers + reproducible benchmark harnesses). GPU/DPDK/DOCA backends
-# are gated on their toolchains and skip cleanly when absent.
-RUN cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release \
+# and telco workers + reproducible benchmark harnesses). Pass
+# `--build-arg SAMURAI_NATIVE_ARCH=ON` when building locally on the target host
+# to enable `-march=native` CPU tuning and any host-present GPU/DPDK toolchains.
+ARG SAMURAI_NATIVE_ARCH=OFF
+RUN cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release -DSAMURAI_NATIVE_ARCH=${SAMURAI_NATIVE_ARCH} \
  && cmake --build build -j "$(nproc)" --target \
       samurai \
       samurai_mcp \
@@ -44,6 +46,9 @@ RUN cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release \
       samurai_cpu_worker \
       samurai_afpacket_worker \
       samurai_afxdp_worker \
+      samurai_dpdk_worker \
+      samurai_gpu_worker \
+      samurai_doca_worker \
       samurai_l7_worker \
       samurai_scenario_worker \
       samurai_defense_worker \
@@ -85,6 +90,9 @@ COPY --from=build /src/build/control/daemon/samurai_slave  /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_cpu_worker        /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_afpacket_worker   /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_afxdp_worker      /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_dpdk_worker       /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_gpu_worker        /usr/local/bin/
+COPY --from=build /src/build/zmq/samurai_doca_worker       /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_l7_worker         /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_scenario_worker   /usr/local/bin/
 COPY --from=build /src/build/zmq/samurai_defense_worker    /usr/local/bin/

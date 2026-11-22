@@ -307,21 +307,22 @@ bool LoadXdpNative(XdpNativeBridge& out, std::string& err) {
     out.handle = h;
     out.api = api;
     out.lib_path = p;
-    std::cerr << "[afxdp_worker] loaded native lib: " << p << "\n";
+    samurai::daemon::WorkerLogInfo("afxdp", "Loaded native lib: " + p);
     return true;
   }
   err = "xdp_native_lib_unavailable";
   if (!last_dlerror.empty()) {
     err += ": " + last_dlerror;
   }
-  // Log all attempted paths for diagnostics.
-  std::cerr << "[afxdp_worker] FATAL: failed to load xdp native lib. Tried:\n";
+  std::string tried;
   for (const std::string& p : candidates) {
-    std::cerr << "  - " << p << "\n";
+    if (!tried.empty()) tried += ", ";
+    tried += p;
   }
-  if (!last_dlerror.empty()) {
-    std::cerr << "  last dlerror: " << last_dlerror << "\n";
-  }
+  samurai::daemon::WorkerLogError(
+      "afxdp",
+      "Failed to load xdp native lib (tried: " + tried + ")" +
+          (last_dlerror.empty() ? "" : "; dlerror=" + last_dlerror));
   return false;
 }
 

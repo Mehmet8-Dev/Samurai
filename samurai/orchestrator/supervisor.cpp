@@ -20,6 +20,7 @@
 #include <zmq.h>
 
 #include "json.hpp"
+#include "log.hpp"
 #include "run_summary.hpp"
 #include "wire_protocol.h"
 #include "zmq_worker_base.hpp"
@@ -277,6 +278,98 @@ void PrintSnapshot(const samurai::wire::MetricSnapshotV1& s) {
       static_cast<unsigned long long>(s.bytes_sent),
       s.actual_rps,
       s.rate_accuracy_pct);
+}
+
+OutputMode ResolveOutputMode(OutputMode requested) {
+  if (requested != OutputMode::kAuto) return requested;
+  if (const char* env = std::getenv("SAMURAI_OUTPUT_FORMAT"); env && env[0] != '\0') {
+    std::string s(env);
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (s == "pretty") return OutputMode::kPretty;
+    if (s == "ndjson" || s == "json") return OutputMode::kNdjson;
+    if (s == "quiet") return OutputMode::kQuiet;
+  }
+  return (::isatty(STDOUT_FILENO) == 1) ? OutputMode::kPretty : OutputMode::kNdjson;
+}
+
+std::string FormatBytes(std::uint64_t bytes) {
+  char buf[64];
+  if (bytes < 1024ULL) {
+    std::snprintf(buf, sizeof(buf), "%llu B", static_cast<unsigned long long>(bytes));
+  } else if (bytes < 1024ULL * 1024ULL) {
+    std::snprintf(buf, sizeof(buf), "%.2f KiB", static_cast<double>(bytes) / 1024.0);
+  } else if (bytes < 1024ULL * 1024ULL * 1024ULL) {
+    std::snprintf(buf, sizeof(buf), "%.2f MiB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+  } else {
+    std::snprintf(buf, sizeof(buf), "%.2f GiB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+  }
+  return std::string(buf);
+}
+
+void PrintPrettySnapshot(const samurai::wire::MetricSnapshotV1& s) {
+  const std::string tx = FormatBytes(s.bytes_sent);
+  std::printf("[samurai] progress  | sent=%llu  err=%llu  rps=%.2f  acc=%.2f%%  tx=%s\n",
+              static_cast<unsigned long long>(s.packets_sent),
+              static_cast<unsigned long long>(s.packets_errors),
+              s.actual_rps,
+              s.rate_accuracy_pct,
+              tx.c_str());
+}
+
+void PrintPrettySummary(const SupervisorConfig& cfg,
+                        const JobOptions& job,
+                        const RunStats& s,
+                        int status_out) {
+  const std::string tx = FormatBytes(s.bytes_sent);
+  std::printf(
+      "\nSamurai Run Summary (%s)\n"
+      "--------------------------------------------------\n"
+      "  Target            : %s:%u (%s / %s)\n"
+      "  Status            : %s\n"
+      "  Packets           : attempted=%llu  sent=%llu  errors=%llu\n"
+      "  Throughput        : %.2f RPS (accuracy %.2f%%)  |  TX=%s\n"
+      "  Wire Loss Est     : %llu pkt (%.4f%%)\n",
+      cfg.worker.name,
+      job.target_ip.c_str(),
+      static_cast<unsigned>(job.target_port),
+      job.protocol.c_str(),
+      job.attack_vector.c_str(),
+      status_out == 0 ? "OK" : "ERROR",
+      static_cast<unsigned long long>(s.attempted),
+      static_cast<unsigned long long>(s.sent),
+      static_cast<unsigned long long>(s.errors),
+      s.actual_rps,
+      s.rate_accuracy_pct,
+      tx.c_str(),
+      static_cast<unsigned long long>(s.wire_loss_est_packets),
+      s.wire_loss_est_pct);
+
+  if (s.ipfix_exported_packets > 0 || s.ipfix_exported_records > 0) {
+    std::printf("  IPFIX Telemetry   : exported_packets=%llu  exported_records=%llu\n",
+                static_cast<unsigned long long>(s.ipfix_exported_packets),
+                static_cast<unsigned long long>(s.ipfix_exported_records));
+  }
+  if (s.telco_active_sessions > 0 || s.telco_established_sessions > 0 || s.telco_failed_sessions > 0) {
+    std::printf("  Telco Telemetry   : active=%llu  established=%llu  failed=%llu  cps=%u  p99=%u us\n",
+                static_cast<unsigned long long>(s.telco_active_sessions),
+                static_cast<unsigned long long>(s.telco_established_sessions),
+                static_cast<unsigned long long>(s.telco_failed_sessions),
+                s.telco_current_cps,
+                s.telco_p99_setup_latency_us);
+  }
+  if (cfg.worker.kind != samurai::wire::WorkerKind::TELCO &&
+      (s.tls_handshakes_completed > 0 || s.dns_queries_sent > 0 || s.l7_conn_attempted > 0 || s.responses_total > 0)) {
+    std::printf("  L7 Telemetry      : conn=%llu/%llu  responses=%llu (2xx=%llu 4xx=%llu 5xx=%llu)  tls=%llu  dns=%llu\n",
+                static_cast<unsigned long long>(s.l7_conn_established),
+                static_cast<unsigned long long>(s.l7_conn_attempted),
+                static_cast<unsigned long long>(s.responses_total),
+                static_cast<unsigned long long>(s.status_2xx),
+                static_cast<unsigned long long>(s.status_4xx),
+                static_cast<unsigned long long>(s.status_5xx),
+                static_cast<unsigned long long>(s.tls_handshakes_completed),
+                static_cast<unsigned long long>(s.dns_queries_sent));
+  }
+  std::printf("--------------------------------------------------\n");
 }
 
 // Folds L7 defense-reaction signals, IPFIX export totals, and Telco
@@ -818,6 +911,17 @@ int RunJob(const SupervisorConfig& cfg,
       static_cast<std::int64_t>(std::max(1, cfg.max_idle_recvs));
   const int poll_slice_ms = std::min(50, std::max(10, cfg.recv_timeout_ms));
 
+  const OutputMode out_mode = ResolveOutputMode(cfg.output_mode);
+  if (out_mode == OutputMode::kPretty) {
+    std::printf("[samurai] job start | worker=%s  target=%s:%u  proto=%s  count=%u  rps=%.0f\n",
+                cfg.worker.name,
+                job.target_ip.c_str(),
+                static_cast<unsigned>(job.target_port),
+                job.protocol.c_str(),
+                job.packet_count,
+                job.target_rps);
+  }
+
   bool done = false;
   bool timed_out = false;
   bool cancel_sent = false;
@@ -900,27 +1004,44 @@ int RunJob(const SupervisorConfig& cfg,
               samurai::wire::MetricSnapshotV2 s2{};
               std::memcpy(&s2, pl, sizeof(s2));
               AccumulateSnapshotV2(stats, s2);
-              PrintSnapshot(s2.base);
+              if (out_mode == OutputMode::kNdjson) {
+                PrintSnapshot(s2.base);
+              } else if (out_mode == OutputMode::kPretty) {
+                PrintPrettySnapshot(s2.base);
+              }
             } else if (plen >= sizeof(samurai::wire::MetricSnapshotV1)) {
               samurai::wire::MetricSnapshotV1 s{};
               std::memcpy(&s, pl, sizeof(s));
               AccumulateSnapshot(stats, s);
-              PrintSnapshot(s);
+              if (out_mode == OutputMode::kNdjson) {
+                PrintSnapshot(s);
+              } else if (out_mode == OutputMode::kPretty) {
+                PrintPrettySnapshot(s);
+              }
             }
             break;
           case MessageType::JOB_DONE:
             if (plen > 0) {
-              std::printf("{\"event\":\"job_done\",\"detail\":%.*s}\n",
-                          static_cast<int>(plen), reinterpret_cast<const char*>(pl));
+              if (out_mode == OutputMode::kNdjson) {
+                std::printf("{\"event\":\"job_done\",\"detail\":%.*s}\n",
+                            static_cast<int>(plen), reinterpret_cast<const char*>(pl));
+              }
               FoldJobDonePayload(stats, reinterpret_cast<const char*>(pl), plen);
-            } else {
+            } else if (out_mode == OutputMode::kNdjson) {
               std::printf("{\"event\":\"job_done\"}\n");
             }
             done = true;
             break;
           case MessageType::ERROR:
-            std::printf("{\"event\":\"error\",\"detail\":\"%.*s\"}\n",
-                        static_cast<int>(plen), reinterpret_cast<const char*>(pl));
+            if (out_mode == OutputMode::kNdjson) {
+              std::printf("{\"event\":\"error\",\"detail\":\"%.*s\"}\n",
+                          static_cast<int>(plen), reinterpret_cast<const char*>(pl));
+            } else {
+              samurai::core::LogTagged(
+                  "orchestrator",
+                  samurai::core::LogLevel::kError,
+                  std::string(reinterpret_cast<const char*>(pl), plen));
+            }
             status_out = 1;
             done = true;
             break;
@@ -933,7 +1054,11 @@ int RunJob(const SupervisorConfig& cfg,
   }
 
   RecomputeLoss(stats);
-  std::printf("%s\n", SummaryJson(stats).c_str());
+  if (out_mode == OutputMode::kNdjson) {
+    std::printf("%s\n", SummaryJson(stats).c_str());
+  } else if (out_mode == OutputMode::kPretty) {
+    PrintPrettySummary(cfg, job, stats, status_out);
+  }
 
   if (cancel_sent && status_out == 0) {
     status_out = -15;

@@ -21,8 +21,9 @@ npm install -g samurai-net
 # Option B: Direct GHCR container (zero Node.js, zero build)
 docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp
 
-# Option C: Build natively from source (Linux C++17)
-cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"$(nproc)"
+# Option C: Compile natively on this host for your exact CPU (-march=native), CUDA, DPDK, AF_XDP & DOCA
+npx -y samurai-net build
+# (Or inside a cloned repo: ./build/cli/samurai build  |  or Docker: docker build --build-arg SAMURAI_NATIVE_ARCH=ON -t samurai:native .)
 ```
 
 ### 2. Connect AI Coding Agent (1-Command MCP Setup)

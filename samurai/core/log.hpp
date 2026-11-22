@@ -1,18 +1,31 @@
 #pragma once
 
-// Native logging helpers — the log_* family. Timestamped, ANSI-coloured console
-// lines (dim timestamp, accent glyph, message). Shared by the CLI, the
-// orchestrator, and the control/licensing layers.
+// Native logging helpers. Timestamped, ANSI-coloured (when stderr is a TTY)
+// console lines written strictly to stderr so stdout remains clean for JSON/NDJSON
+// reports and MCP stdio traffic.
+//
+// Respects `SAMURAI_LOG_LEVEL` (`quiet` | `error` | `warn` | `info`, default `info`).
 
 #include <string>
 
 namespace samurai::core {
 
-// "YYYY-MM-DD HH:MM:SS" in local time — mirrors utils.get_timestamp().
+enum class LogLevel {
+  kQuiet = 0,
+  kError = 1,
+  kWarn = 2,
+  kInfo = 3,
+};
+
+LogLevel CurrentLogLevel();
+
+// "YYYY-MM-DD HH:MM:SS" in local time.
 std::string Timestamp();
 
-// Info line. `protocol`, when non-empty, is upper-cased and appended as
-// " [PROTO]" — mirrors utils.log_info(msg, protocol=...).
+// Structured component logger: `[YYYY-MM-DD HH:MM:SS] [<component>] [<LEVEL>] <msg>`.
+void LogTagged(const std::string& component, LogLevel level, const std::string& msg);
+
+// Info line. `protocol`, when non-empty, is upper-cased and appended as " [PROTO]".
 void LogInfo(const std::string& msg, const std::string& protocol = "");
 void LogWarning(const std::string& msg);
 void LogError(const std::string& msg);

@@ -691,10 +691,12 @@ int main(int argc, char** argv) {
             ? std::atoi(std::getenv("SAMURAI_DPDK_BASE_CORE")) : -1;
         const int nic_socket = samurai::dpdk::port_socket_id(dpdk.handle);
         if (base_core >= 0 && nic_socket >= 0) {
-          std::fprintf(stderr,
-              "[dpdk] port %u NUMA node=%d; %d TX thread core %d'den pinlenecek. "
-              "Cross-NUMA ise: numactl --cpunodebind=%d\n",
-              static_cast<unsigned>(port_id), nic_socket, num_queues, base_core, nic_socket);
+          samurai::daemon::WorkerLogInfo(
+              "dpdk",
+              "port " + std::to_string(port_id) + " NUMA node=" + std::to_string(nic_socket) +
+                  "; pinning " + std::to_string(num_queues) + " TX thread(s) from core " +
+                  std::to_string(base_core) + " (cross-NUMA hint: numactl --cpunodebind=" +
+                  std::to_string(nic_socket) + ")");
         }
 
         // Pacing: snapshot için tam hedef; thread'ler için N'e bölünmüş hedef.

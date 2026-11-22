@@ -23,61 +23,100 @@ bool NeedsValue(int i, int argc, const char* flag) {
 
 void PrintUsage(const char* argv0) {
   std::printf(
-      "usage: %s --worker <cpu|gpu|dpdk|afxdp|afpacket|doca|l7|defense|scenario|telco> [options]\n"
+      "usage: %s --worker <cpu|afpacket|afxdp|dpdk|gpu|doca|l7|scenario|telco|defense> [options]\n"
       "       %s mcp <doctor|setup> [options]\n"
+      "       %s build [--source DIR] [--build-dir DIR] [--prefix DIR] [--jobs N] [--portable]\n"
+      "       %s --run-rfc-suite <rfc2544|rfc3511|rfc8219|all> [options]\n"
       "\n"
-      "options:\n"
-      "  --worker NAME       worker backend to run (required)\n"
-      "  --worker-dir DIR    directory containing worker binaries (default: auto-detect)\n"
-      "  --target IP         target IPv4 address (default: 127.0.0.1)\n"
-      "  --port N            target port (default: 80)\n"
-      "  --count N           packet count (default: 1000)\n"
-      "  --size N            packet size in bytes (default: 64)\n"
-      "  --rps F             target rate; 0 = as fast as possible (default: 0)\n"
-      "  --protocol NAME     l4/telco protocol, e.g. udp/tcp/pppoe/sctp/diameter/sip-rtp/gtpu (default: udp)\n"
-      "  --vector NAME       attack vector label (default: flood)\n"
-      "  --pin-cpu N         pin worker to CPU core (default: -1 = none)\n"
-      "  --timeout-ms N      per-recv timeout on the events channel (default: 5000)\n"
-      "  --profile NAME      apply a named workload profile (put before overrides)\n"
-      "  --l7-protocol NAME  L7 protocol: http1|http2|quic|dns (default: http1)\n"
-      "  --l7-profile-file PATH  L7 JSON profile used as the emu scenario (scenario_payload_ref)\n"
-      "  --l7-payload-file PATH  raw request bytes file (payload_ref)\n"
-      "  --concurrency N     L7 parallel lanes/threads (default: 1)\n"
-      "  --max-connections N L7 connection pool size (default: 1)\n"
-      "  --max-streams N     L7 H2/H3 streams per connection (default: 1)\n"
-      "  --scheme NAME       L7 scheme http|https (default: derived from protocol)\n"
-      "  --verify-tls        verify the peer TLS certificate (default: off)\n"
-      "  --keepalive         reuse L7 connections across requests (default: off)\n"
-      "  --host-header NAME  L7 Host/SNI override (default: target IP)\n"
-      "  --l7-timeout-ms N   L7 per-request timeout ms (default: 5000)\n"
-      "  --telco-subscribers N      number of Telco subscribers (default: 100)\n"
-      "  --telco-subscriber-start N starting subscriber index (default: 0)\n"
-      "  --telco-cps N              Telco subscriber/setup rate CPS (default: 50)\n"
-      "  --telco-duration-ms N      Telco bounded duration in ms (default: 5000)\n"
-      "  --vlan-s N                 Telco outer QinQ S-VLAN base (default: 100)\n"
-      "  --vlan-c N                 Telco inner C-VLAN base (default: 100)\n"
-      "  --sctp-rate N              target rate for SCTP associations/chunks\n"
-      "  --diameter-rate N          target rate for Diameter CCR transactions\n"
-      "  --diameter-ccr-rate N      alias for --diameter-rate\n"
-      "  --sip-rate N               target rate for SIP calls\n"
-      "  --enable-srtp              enable SRTP encrypted audio stream\n"
-      "  --ipfix-enabled            enable live IPFIX/NetFlow telemetry export\n"
-      "  --ipfix-collector IP       IPFIX collector IPv4 (default: 127.0.0.1)\n"
-      "  --ipfix-port N             IPFIX UDP collector port (default: 4739)\n"
-      "  --ipfix-sample-rate N      IPFIX 1-in-N packet sampling rate (default: 1000)\n"
-      "  --ipfix-netflow-v9         emit NetFlow v9 instead of IPFIX v10\n"
-      "  --ipfix-domain-id N        IPFIX observation domain id (default: 1)\n"
-      "  --list-profiles     list the available workload profiles and exit\n"
-      "  --allow-public-target        permit non-private/loopback targets\n"
-      "  --allow-target IP|CIDR       allowlist a target (repeatable)\n"
-      "  --deny-target IP|CIDR        denylist a target; always wins (repeatable)\n"
-      "  --report-json PATH  write the run report as JSON to PATH\n"
-      "  --report-text PATH  write the run report as text to PATH\n"
-      "  --kpi-min-rate-accuracy PCT  gate: rate_accuracy_pct must be >= PCT\n"
-      "  --kpi-max-loss-pct PCT       gate: wire_loss_est_pct must be <= PCT\n"
-      "  --kpi-max-errors N           gate: errors must be <= N\n"
-      "  --kpi-min-sent N             gate: sent must be >= N\n"
-      "  -h, --help          show this help\n",
+      "Core & Targeting:\n"
+      "  --worker NAME               worker backend to run (required)\n"
+      "  --worker-dir DIR            directory containing worker binaries (default: auto-detect)\n"
+      "  --target IP                 target IPv4 address (default: 127.0.0.1)\n"
+      "  --port N                    target port (default: 80)\n"
+      "  --count N                   packet/request count (default: 1000)\n"
+      "  --size N                    packet size in bytes (default: 64)\n"
+      "  --rps F                     target rate; 0 = uncapped (default: 0)\n"
+      "  --protocol NAME             L4/Telco protocol: udp|tcp|pppoe|dhcp|bfd|gtpu|pfcp|sctp|diameter|sip-rtp\n"
+      "  --vector NAME               workload/vector label (default: flood)\n"
+      "  --pin-cpu N                 pin worker to CPU core (default: -1 = none)\n"
+      "  --timeout-ms N              per-recv timeout on events channel (default: 5000)\n"
+      "  --profile NAME              apply a built-in workload profile (put before overrides)\n"
+      "  --list-profiles             list all built-in workload profiles and exit\n"
+      "  --confirm                   confirm live dataplane execution\n"
+      "\n"
+      "Output & Logging:\n"
+      "  --output MODE               auto|pretty|ndjson|quiet (default: auto = pretty on TTY, ndjson on pipe)\n"
+      "  -q, --quiet                 alias for --output quiet\n"
+      "  --report-json PATH          write final run report as JSON to PATH\n"
+      "  --report-text PATH          write final run report as text to PATH\n"
+      "\n"
+      "L7 / TLS / HTTP2 / QUIC:\n"
+      "  --l7-protocol NAME          http1|http2|quic|dns (default: http1)\n"
+      "  --l7-profile-file PATH      L7 JSON scenario/profile file\n"
+      "  --l7-payload-file PATH      raw request bytes file\n"
+      "  --concurrency N             parallel lanes/threads (default: 1)\n"
+      "  --max-connections N         L7 connection pool size (default: 1)\n"
+      "  --max-streams N             HTTP/2 or HTTP/3 streams per connection (default: 1)\n"
+      "  --scheme NAME               http|https (default: derived from protocol)\n"
+      "  --verify-tls                verify peer TLS certificate (default: off)\n"
+      "  --keepalive                 reuse L7 connections across requests (default: off)\n"
+      "  --host-header NAME          Host/SNI override (default: target IP)\n"
+      "  --l7-timeout-ms N           per-request timeout in ms (default: 5000)\n"
+      "\n"
+      "Carrier 4G/5G Telecom & GTP-U:\n"
+      "  --telco-subscribers N       subscriber count (alias: --subscriber-count, default: 100)\n"
+      "  --telco-subscriber-start N  starting subscriber index (alias: --subscriber-start, default: 0)\n"
+      "  --telco-cps N               subscriber/setup rate CPS (alias: --cps, default: 50)\n"
+      "  --telco-duration-ms N       bounded run duration in ms (default: 5000)\n"
+      "  --vlan-s N                  outer QinQ S-VLAN base (default: 100)\n"
+      "  --vlan-c N                  inner C-VLAN base (default: 100)\n"
+      "  --telco-base-ip IP          subscriber pool base IPv4\n"
+      "  --telco-gateway-ip IP       gateway/UPF peer IPv4\n"
+      "  --db-port N                 Telco DB/control port\n"
+      "  --sctp-rate N               SCTP association/chunk rate\n"
+      "  --diameter-rate N           Diameter CCR transaction rate (alias: --diameter-ccr-rate)\n"
+      "  --sip-rate N                SIP call rate\n"
+      "  --enable-srtp               enable SRTP encrypted media stream\n"
+      "  --teid-start N              GTP-U starting TEID\n"
+      "  --teid-count N              GTP-U TEID sweep count\n"
+      "  --qfi N                     5G NR QFI (QoS Flow Identifier)\n"
+      "  --ue-subnet CIDR            UE source IPv4 subnet for GTP-U inner packets\n"
+      "  --gtpu-vlan S[:C]           QinQ / VLAN tag for GTP-U frames\n"
+      "  --gtpu-inner-proto NAME     udp|tcp|icmp\n"
+      "\n"
+      "GPU CUDA / GeForce BAR1 P2P:\n"
+      "  --gpu-bar1-p2p              enable consumer/enterprise BAR1 P2P DMA path\n"
+      "  --gpu-persistent            enable persistent VRAM dataplane kernel\n"
+      "\n"
+      "IPFIX / NetFlow Telemetry:\n"
+      "  --ipfix-enabled             enable live IPFIX/NetFlow UDP telemetry export\n"
+      "  --ipfix-collector IP        collector IPv4 (default: 127.0.0.1)\n"
+      "  --ipfix-port N              collector UDP port (default: 4739)\n"
+      "  --ipfix-sample-rate N       1-in-N packet sampling rate (default: 1000)\n"
+      "  --ipfix-netflow-v9          emit NetFlow v9 instead of IPFIX v10\n"
+      "  --ipfix-domain-id N         observation domain ID (default: 1)\n"
+      "  --ipfix-export-interval-ms N export flush interval in ms\n"
+      "\n"
+      "KPI Pass/Fail Gates & RFC Compliance:\n"
+      "  --kpi-min-rate-accuracy PCT gate: rate_accuracy_pct >= PCT\n"
+      "  --kpi-max-loss-pct PCT      gate: wire_loss_est_pct <= PCT\n"
+      "  --kpi-max-errors N          gate: errors <= N\n"
+      "  --kpi-min-sent N            gate: sent >= N\n"
+      "  --kpi-min-tls-handshakes N  gate: l7_tls_handshakes >= N\n"
+      "  --kpi-min-dns-queries N     gate: l7_dns_queries >= N\n"
+      "  --kpi-min-dhcp-leases N     gate: dhcp_leases >= N\n"
+      "  --kpi-min-zc-tx-bytes N     gate: zero-copy TX bytes >= N\n"
+      "  --kpi-max-tcp-overflows N   gate: tcp_overflows <= N\n"
+      "  --run-rfc-suite SUITE       run RFC 2544 / 3511 / 8219 suite (rfc2544|rfc3511|rfc8219|all)\n"
+      "  --rfc-report-out PATH       write RFC compliance HTML report to PATH\n"
+      "\n"
+      "Target Safety Gates:\n"
+      "  --allow-public-target       permit non-private/loopback targets (explicit opt-in)\n"
+      "  --allow-target IP|CIDR      allowlist a target (repeatable)\n"
+      "  --deny-target IP|CIDR       denylist a target; always wins (repeatable)\n"
+      "  -h, --help                  show this help\n",
+      argv0,
+      argv0,
       argv0,
       argv0);
 }
@@ -307,6 +346,24 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
       out.job.gpu_bar1_p2p = true;
     } else if (a == "--gpu-persistent") {
       out.job.gpu_persistent = true;
+    } else if (a == "-q" || a == "--quiet") {
+      out.output_mode = samurai::orchestrator::OutputMode::kQuiet;
+    } else if (a == "--output") {
+      if (!NeedsValue(i, argc, "--output")) return ParseStatus::kError;
+      const std::string mode = argv[++i];
+      if (mode == "auto") {
+        out.output_mode = samurai::orchestrator::OutputMode::kAuto;
+      } else if (mode == "pretty") {
+        out.output_mode = samurai::orchestrator::OutputMode::kPretty;
+      } else if (mode == "ndjson" || mode == "json") {
+        out.output_mode = samurai::orchestrator::OutputMode::kNdjson;
+      } else if (mode == "quiet") {
+        out.output_mode = samurai::orchestrator::OutputMode::kQuiet;
+      } else {
+        std::fprintf(stderr, "samurai: invalid --output mode '%s' (expected auto|pretty|ndjson|quiet)\n",
+                     mode.c_str());
+        return ParseStatus::kError;
+      }
     } else {
       std::fprintf(stderr, "samurai: unknown argument: %s\n", a.c_str());
       return ParseStatus::kError;

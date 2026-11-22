@@ -910,10 +910,10 @@ int main(int argc, char** argv) {
     if (LoadGpuNative(api, native_err) && api.telco_attach_cups_shm_v1) {
       const int attach_rc = api.telco_attach_cups_shm_v1(cups_shm_path.c_str(), 0);
       if (attach_rc == 0) {
-        std::cout << "[gpu_worker] Attached to DPU CUPS shared memory: " << cups_shm_path << "\n";
+        samurai::daemon::WorkerLogInfo("gpu", "Attached to DPU CUPS shared memory: " + cups_shm_path);
       } else {
-        std::cerr << "[gpu_worker] Warning: Failed to attach CUPS shared memory at " << cups_shm_path
-                  << ": " << NativeLastError(api) << "\n";
+        samurai::daemon::WorkerLogWarn(
+            "gpu", "Failed to attach CUPS shared memory at " + cups_shm_path + ": " + NativeLastError(api));
       }
     }
   }

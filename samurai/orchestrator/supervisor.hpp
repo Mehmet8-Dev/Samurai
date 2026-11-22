@@ -23,6 +23,13 @@
 
 namespace samurai::orchestrator {
 
+enum class OutputMode {
+  kAuto,
+  kPretty,
+  kNdjson,
+  kQuiet,
+};
+
 inline bool EnvWireV3Enabled() noexcept {
   const char* raw = std::getenv("SAMURAI_WIRE_ABI");
   if (!raw || raw[0] == '\0') return false;
@@ -38,6 +45,7 @@ struct SupervisorConfig {
   int recv_timeout_ms = 5000;         // per-recv timeout on the events socket
   int max_idle_recvs = 24;            // give up after this many empty recvs
   bool use_wire_v3 = EnvWireV3Enabled();  // SAMURAI_WIRE_ABI=v3 uses aligned V3 frames
+  OutputMode output_mode = OutputMode::kAuto;
 };
 
 // Maintains warm persistent worker processes across sequential jobs/windows so

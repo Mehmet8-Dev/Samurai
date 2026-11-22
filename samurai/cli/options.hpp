@@ -12,6 +12,7 @@
 
 #include "job_builder.hpp"  // samurai::orchestrator::JobOptions
 #include "kpi_gate.hpp"      // samurai::cli::KpiThresholds
+#include "supervisor.hpp"    // samurai::orchestrator::OutputMode
 
 namespace samurai::cli {
 
@@ -20,6 +21,7 @@ struct CliOptions {
   std::string worker_dir = ".";         // directory containing the worker binaries
   int timeout_ms = 5000;                // per-recv timeout on the events channel
   samurai::orchestrator::JobOptions job;  // maps onto the wire JobEnvelopeV1/V2
+  samurai::orchestrator::OutputMode output_mode = samurai::orchestrator::OutputMode::kAuto;
   bool show_help = false;
   bool list_profiles = false;             // --list-profiles: print and exit
   KpiThresholds kpi;                      // KPI-gate thresholds (--kpi-*)

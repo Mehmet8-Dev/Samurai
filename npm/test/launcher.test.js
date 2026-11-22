@@ -7,11 +7,17 @@ const { spawnSync } = require("node:child_process");
 
 const {
   buildDockerArgs,
+  detectHostHardware,
   findLocalBinary,
+  getNativeCacheDir,
   resolveTargetCommand,
 } = require("../lib/launcher");
 
-test("resolveTargetCommand routes bench and mcp subcommands cleanly", () => {
+test("resolveTargetCommand routes bench, build, and mcp subcommands cleanly", () => {
+  assert.deepEqual(resolveTargetCommand("samurai", ["build", "--jobs", "4"]), {
+    binary: "__samurai_build__",
+    args: ["--jobs", "4"],
+  });
   assert.deepEqual(resolveTargetCommand("samurai", ["bench", "1m-tcp", "--help"]), {
     binary: "samurai_bench_1m_tcp",
     args: ["--help"],
@@ -54,6 +60,15 @@ test("buildDockerArgs mounts HOME for MCP setup/doctor commands", () => {
   });
   assert.ok(setupArgs.includes("/Users/dev:/Users/dev"));
   assert.ok(setupArgs.includes("HOME=/Users/dev"));
+});
+
+test("detectHostHardware and getNativeCacheDir expose host hardware fields", () => {
+  const hw = detectHostHardware();
+  assert.equal(typeof hw.cpus, "number");
+  assert.equal(typeof hw.cudaGpu, "boolean");
+  assert.equal(typeof hw.dpdk, "boolean");
+  const dir = getNativeCacheDir("3.3.1", { SAMURAI_CACHE_DIR: "/tmp/scache" });
+  assert.equal(dir, "/tmp/scache/v3.3.1-native");
 });
 
 test("bin/samurai.js executes local samurai mcp doctor --json when built", (t) => {

@@ -6,8 +6,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <string>
+#include <thread>
+#include <vector>
 
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "args.hpp"
@@ -24,6 +29,118 @@
 
 int main(int argc, char** argv) {
   using namespace samurai;
+
+  if (argc >= 2 && std::string(argv[1]) == "build") {
+    namespace fs = std::filesystem;
+    std::string source_dir = "samurai";
+    std::string build_dir = "build";
+    std::string prefix_dir;
+    bool portable = false;
+    unsigned jobs = std::max(1u, std::thread::hardware_concurrency());
+
+    for (int i = 2; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (a == "-h" || a == "--help") {
+        std::printf(
+            "usage: %s build [--source DIR] [--build-dir DIR] [--prefix DIR] [--jobs N] [--portable]\n"
+            "\n"
+            "Compiles all Samurai binaries and hardware-accelerated workers (CPU -march=native,\n"
+            "CUDA, DPDK, AF_XDP, io_uring, DOCA) natively for this machine.\n",
+            argv[0]);
+        return 0;
+      } else if (a == "--source" && i + 1 < argc) {
+        source_dir = argv[++i];
+      } else if (a == "--build-dir" && i + 1 < argc) {
+        build_dir = argv[++i];
+      } else if (a == "--prefix" && i + 1 < argc) {
+        prefix_dir = argv[++i];
+      } else if ((a == "--jobs" || a == "-j") && i + 1 < argc) {
+        jobs = static_cast<unsigned>(std::max(1L, std::strtol(argv[++i], nullptr, 10)));
+      } else if (a == "--portable") {
+        portable = true;
+      } else {
+        std::fprintf(stderr, "samurai build: unknown option '%s'\n", a.c_str());
+        return 2;
+      }
+    }
+
+    std::error_code ec;
+    if (!fs::exists(fs::path(source_dir) / "CMakeLists.txt", ec)) {
+      std::fprintf(stderr,
+                   "samurai build: '%s/CMakeLists.txt' not found.\n"
+                   "Run inside a Samurai source checkout or use 'npx -y samurai-net build' to download & compile for this machine.\n",
+                   source_dir.c_str());
+      return 2;
+    }
+
+    auto run_exec = [](const std::vector<std::string>& cmd) -> int {
+      const pid_t pid = ::fork();
+      if (pid == 0) {
+        std::vector<char*> c_args;
+        c_args.reserve(cmd.size() + 1);
+        for (const auto& s : cmd) c_args.push_back(const_cast<char*>(s.c_str()));
+        c_args.push_back(nullptr);
+        ::execvp(c_args[0], c_args.data());
+        std::fprintf(stderr, "samurai build: failed to exec '%s'\n", c_args[0]);
+        _exit(127);
+      }
+      if (pid < 0) return 1;
+      int st = 0;
+      ::waitpid(pid, &st, 0);
+      return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+    };
+
+    const std::string arch_opt = std::string("-DSAMURAI_NATIVE_ARCH=") + (portable ? "OFF" : "ON");
+    std::printf("[samurai build] Configuring (%s, jobs=%u)...\n", arch_opt.c_str(), jobs);
+    if (run_exec({"cmake", "-B", build_dir, "-S", source_dir, "-DCMAKE_BUILD_TYPE=Release", arch_opt}) != 0) {
+      return 1;
+    }
+    std::printf("[samurai build] Compiling native targets for this host...\n");
+    if (run_exec({"cmake", "--build", build_dir, "-j", std::to_string(jobs)}) != 0) {
+      return 1;
+    }
+
+    if (!prefix_dir.empty()) {
+      const fs::path bin_dst = fs::path(prefix_dir) / "bin";
+      fs::create_directories(bin_dst, ec);
+      const std::vector<std::pair<std::string, std::string>> artifacts = {
+          {"cli/samurai", "samurai"},
+          {"mcp/samurai_mcp", "samurai_mcp"},
+          {"control/daemon/samurai_master", "samurai_master"},
+          {"control/daemon/samurai_slave", "samurai_slave"},
+          {"zmq/samurai_cpu_worker", "samurai_cpu_worker"},
+          {"zmq/samurai_afpacket_worker", "samurai_afpacket_worker"},
+          {"zmq/samurai_afxdp_worker", "samurai_afxdp_worker"},
+          {"zmq/samurai_dpdk_worker", "samurai_dpdk_worker"},
+          {"zmq/samurai_gpu_worker", "samurai_gpu_worker"},
+          {"zmq/samurai_doca_worker", "samurai_doca_worker"},
+          {"zmq/samurai_l7_worker", "samurai_l7_worker"},
+          {"zmq/samurai_scenario_worker", "samurai_scenario_worker"},
+          {"zmq/samurai_defense_worker", "samurai_defense_worker"},
+          {"zmq/samurai_telco_worker", "samurai_telco_worker"},
+          {"l4/test_100k_tcp_flows", "samurai_bench_100k_tcp"},
+          {"l4/test_1m_tcp_flows", "samurai_bench_1m_tcp"},
+          {"zmq/bench_l7_stateful_userspace", "samurai_bench_l7"},
+      };
+      for (const auto& item : artifacts) {
+        const fs::path src = fs::path(build_dir) / item.first;
+        if (fs::exists(src, ec)) {
+          fs::copy_file(src, bin_dst / item.second, fs::copy_options::overwrite_existing, ec);
+        }
+      }
+      const fs::path cuda_so = fs::path(source_dir) / "libgpu_packet_cuda.so";
+      if (fs::exists(cuda_so, ec)) {
+        fs::copy_file(cuda_so, bin_dst / "libgpu_packet_cuda.so", fs::copy_options::overwrite_existing, ec);
+      }
+      const fs::path src_skills = fs::path(source_dir).parent_path() / "skills";
+      if (fs::is_directory(src_skills, ec)) {
+        fs::copy(src_skills, fs::path(prefix_dir) / "skills",
+                 fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+      }
+      std::printf("[samurai build] Installed native host binaries to %s\n", bin_dst.string().c_str());
+    }
+    return 0;
+  }
 
   if (argc >= 2 && std::string(argv[1]) == "mcp") {
     if (argc >= 3 && std::string(argv[2]) == "doctor") {
@@ -201,6 +318,7 @@ int main(int argc, char** argv) {
   cfg.jobs_endpoint = "ipc:///tmp/samurai_jobs_" + suffix;
   cfg.events_endpoint = "ipc:///tmp/samurai_events_" + suffix;
   cfg.recv_timeout_ms = opt.timeout_ms;
+  cfg.output_mode = opt.output_mode;
 
   orchestrator::RunStats stats;
   int run_status = orchestrator::RunJob(cfg, opt.job, stats);

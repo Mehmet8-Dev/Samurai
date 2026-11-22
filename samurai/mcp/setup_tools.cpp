@@ -1,5 +1,6 @@
 #include "setup_tools.hpp"
 
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace samurai::mcp {
@@ -521,7 +523,80 @@ Value BuildDoctorReport(const DoctorOptions& opts) {
   const std::string skills_dir = LocateSkillsDir();
   prereqs.set("skills_available", Value::Bool(!skills_dir.empty()));
   if (!skills_dir.empty()) prereqs.set("skills_dir", Value::Str(skills_dir));
+  const std::string cmake_path = FindInPath("cmake");
+  const std::string cxx_path = !FindInPath("g++").empty() ? FindInPath("g++") : FindInPath("clang++");
+  prereqs.set("cmake_available", Value::Bool(!cmake_path.empty()));
+  prereqs.set("cxx_available", Value::Bool(!cxx_path.empty()));
   root.set("prerequisites", std::move(prereqs));
+
+  Value hw = Value::Object();
+  utsname uts{};
+  if (::uname(&uts) == 0) {
+    hw.set("arch", Value::Str(uts.machine));
+  }
+  hw.set("logical_cores", Value::Int(static_cast<std::int64_t>(std::thread::hardware_concurrency())));
+
+  std::string cpu_model;
+  bool has_avx2 = false;
+  bool has_avx512 = false;
+  bool has_aes = false;
+  {
+    std::string cpuinfo;
+    if (ReadFileText("/proc/cpuinfo", cpuinfo)) {
+      std::istringstream cis(cpuinfo);
+      std::string line;
+      while (std::getline(cis, line)) {
+        if (cpu_model.empty() && line.rfind("model name", 0) == 0) {
+          const auto colon = line.find(':');
+          if (colon != std::string::npos) {
+            cpu_model = line.substr(colon + 1);
+            cpu_model.erase(0, cpu_model.find_first_not_of(" \t"));
+          }
+        }
+        if (line.rfind("flags", 0) == 0 || line.rfind("Features", 0) == 0) {
+          if (line.find("avx2") != std::string::npos) has_avx2 = true;
+          if (line.find("avx512f") != std::string::npos) has_avx512 = true;
+          if (line.find(" aes") != std::string::npos || line.find(": aes") != std::string::npos) has_aes = true;
+          break;
+        }
+      }
+    }
+  }
+  if (!cpu_model.empty()) hw.set("cpu_model", Value::Str(cpu_model));
+  hw.set("avx2", Value::Bool(has_avx2));
+  hw.set("avx512", Value::Bool(has_avx512));
+  hw.set("aes_ni", Value::Bool(has_aes));
+
+  std::error_code hw_ec;
+  const bool has_cuda_gpu = fs::exists("/dev/nvidia0", hw_ec);
+  const std::string nvcc_path = !FindInPath("nvcc").empty()
+                                    ? FindInPath("nvcc")
+                                    : (IsExecutable("/usr/local/cuda/bin/nvcc") ? "/usr/local/cuda/bin/nvcc" : "");
+  const bool has_io_uring = fs::exists("/usr/include/linux/io_uring.h", hw_ec) ||
+                            fs::exists("/usr/include/x86_64-linux-gnu/linux/io_uring.h", hw_ec);
+  const bool has_af_xdp = fs::exists("/usr/include/bpf/bpf.h", hw_ec) ||
+                          fs::exists("/usr/include/xdp/xsk.h", hw_ec);
+  const bool has_dpdk = fs::exists("/usr/include/rte_eal.h", hw_ec) ||
+                        fs::exists("/usr/include/dpdk/rte_config.h", hw_ec);
+  const bool has_doca = fs::exists("/opt/mellanox/doca", hw_ec);
+  const std::string self_dir = SelfExeDir();
+  const bool running_host_native =
+      self_dir.find("-native/") != std::string::npos ||
+      self_dir.find("/build/") != std::string::npos;
+
+  hw.set("cuda_gpu_present", Value::Bool(has_cuda_gpu));
+  hw.set("cuda_nvcc_available", Value::Bool(!nvcc_path.empty()));
+  hw.set("io_uring_headers", Value::Bool(has_io_uring));
+  hw.set("af_xdp_headers", Value::Bool(has_af_xdp));
+  hw.set("dpdk_headers", Value::Bool(has_dpdk));
+  hw.set("doca_sdk_present", Value::Bool(has_doca));
+  hw.set("running_host_native_build", Value::Bool(running_host_native));
+  const bool native_rec = !running_host_native && (has_cuda_gpu || !nvcc_path.empty() || has_dpdk || has_doca || has_avx512);
+  hw.set("native_build_recommended", Value::Bool(native_rec));
+  if (native_rec) {
+    hw.set("native_build_command", Value::Str("npx -y samurai-net build"));
+  }
+  root.set("host_hardware", std::move(hw));
 
   Value clients = Value::Array();
   const std::string norm_filter = opts.client.empty() ? "" : NormalizeClientId(opts.client);
@@ -762,6 +837,27 @@ int RunDoctorCli(int argc, char** argv) {
                   prereqs->find("skills_available")->as_bool(false)
                       ? prereqs->find("skills_dir")->as_string().c_str()
                       : "bundled via MCP resources://skills/*");
+    }
+    const Value* hw = report.find("host_hardware");
+    if (hw) {
+      std::printf("\nHost Hardware:\n");
+      if (const Value* cpu = hw->find("cpu_model")) {
+        std::printf("  CPU:             %s (%lld threads, avx2=%s, avx512=%s)\n",
+                    cpu->as_string().c_str(),
+                    static_cast<long long>(hw->find("logical_cores")->as_int(0)),
+                    hw->find("avx2")->as_bool(false) ? "yes" : "no",
+                    hw->find("avx512")->as_bool(false) ? "yes" : "no");
+      }
+      std::printf("  Acceleration:    cuda_gpu=%s nvcc=%s dpdk=%s af_xdp=%s io_uring=%s doca=%s\n",
+                  hw->find("cuda_gpu_present")->as_bool(false) ? "yes" : "no",
+                  hw->find("cuda_nvcc_available")->as_bool(false) ? "yes" : "no",
+                  hw->find("dpdk_headers")->as_bool(false) ? "yes" : "no",
+                  hw->find("af_xdp_headers")->as_bool(false) ? "yes" : "no",
+                  hw->find("io_uring_headers")->as_bool(false) ? "yes" : "no",
+                  hw->find("doca_sdk_present")->as_bool(false) ? "yes" : "no");
+      if (hw->find("native_build_recommended") && hw->find("native_build_recommended")->as_bool(false)) {
+        std::printf("  Optimization:    portable binary active; run 'npx -y samurai-net build' for host-native hardware tuning\n");
+      }
     }
     const Value* clients = report.find("clients");
     if (clients) {

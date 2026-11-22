@@ -20,6 +20,7 @@
 
 #include "engine.hpp"
 #include "json.hpp"
+#include "log.hpp"
 #include "pacing_engine.h"
 #if __has_include("flow_cache.hpp")
 #define SAMURAI_HAS_TELEMETRY_SINK 1
@@ -31,6 +32,18 @@
 #include "zmq_worker_base.hpp"
 
 namespace samurai::daemon {
+
+inline void WorkerLogInfo(const std::string& worker, const std::string& msg) {
+  samurai::core::LogTagged("worker:" + worker, samurai::core::LogLevel::kInfo, msg);
+}
+
+inline void WorkerLogWarn(const std::string& worker, const std::string& msg) {
+  samurai::core::LogTagged("worker:" + worker, samurai::core::LogLevel::kWarn, msg);
+}
+
+inline void WorkerLogError(const std::string& worker, const std::string& msg) {
+  samurai::core::LogTagged("worker:" + worker, samurai::core::LogLevel::kError, msg);
+}
 
 inline std::string ReadFixed(const char* raw, std::size_t n) {
   return std::string(raw, strnlen(raw, n));
@@ -61,7 +74,7 @@ inline int SendFrame(
   zmq_msg_t msg;
   const std::size_t total = sizeof(header) + payload.size();
   if (zmq_msg_init_size(&msg, total) != 0) {
-    std::cerr << "[worker_frame] zmq_msg_init_size failed: " << zmq_strerror(zmq_errno()) << "\n";
+    WorkerLogError("frame", std::string("zmq_msg_init_size failed: ") + zmq_strerror(zmq_errno()));
     return -1;
   }
   auto* p = static_cast<std::uint8_t*>(zmq_msg_data(&msg));
@@ -69,7 +82,7 @@ inline int SendFrame(
   if (!payload.empty()) std::memcpy(p + sizeof(header), payload.data(), payload.size());
   const int rc = zmq_msg_send(&msg, event_socket, send_flags);
   if (rc < 0) {
-    std::cerr << "[worker_frame] zmq_msg_send error: " << zmq_strerror(zmq_errno()) << "\n";
+    WorkerLogError("frame", std::string("zmq_msg_send error: ") + zmq_strerror(zmq_errno()));
   }
   zmq_msg_close(&msg);
   return rc;
