@@ -26,4 +26,4 @@ npx -y samurai-net mcp setup --client cursor --yes
 npx -y samurai-net --worker l7 --target 127.0.0.1 --port 8080 --l7-protocol http2 --count 10000 --confirm
 ```
 
-On **Linux x86_64**, `samurai-net` caches and SHA-256 verifies the pre-built native GitHub Release tarball in `~/.cache/samurai/` (or uses your local `build/` binaries if present). On **macOS, Windows, and ARM64**, it seamlessly routes commands through `ghcr.io/mehmet8-dev/samurai:latest` via Docker.
+On **Linux**, `samurai-net` fetches the matching GitHub source archive on first run and **automatically compiles all binaries and workers on your machine** (`-DSAMURAI_NATIVE_ARCH=ON` for `-march=native` CPU SIMD, CUDA, DPDK, AF_XDP, `io_uring`, and DOCA) into `~/.cache/samurai/<ver>-native/` (or uses your local `build/` binaries if present). On **macOS, Windows, or `SAMURAI_DOCKER=1`**, it builds a local `samurai:local-<ver>` Docker image from source on your host. *(Set `SAMURAI_PREBUILT=1` only if you explicitly want portable CI-built GitHub binaries/images instead.)*

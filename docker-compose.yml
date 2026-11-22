@@ -4,10 +4,13 @@ services:
   #   docker compose --profile cli run --rm samurai samurai --list-profiles
   #   docker compose --profile cli run --rm samurai samurai --worker cpu --target 127.0.0.1 --port 80 --count 10000 --confirm
   samurai:
-    image: ghcr.io/mehmet8-dev/samurai:latest
+    image: samurai:local
+    pull_policy: build
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SAMURAI_NATIVE_ARCH: "ON"
     container_name: samurai-cli
     profiles: ["cli"]
     cap_add:
@@ -29,10 +32,13 @@ services:
   # Example:
   #   docker compose --profile bench run --rm bench
   bench:
-    image: ghcr.io/mehmet8-dev/samurai:latest
+    image: samurai:local
+    pull_policy: build
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SAMURAI_NATIVE_ARCH: "ON"
     container_name: samurai-bench
     profiles: ["bench"]
     command: ["samurai_bench_1m_tcp"]

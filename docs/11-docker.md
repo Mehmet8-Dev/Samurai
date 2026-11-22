@@ -15,10 +15,14 @@ docker compose -f docker-compose.distributed.yml up --build --scale slave=4
 
 ---
 
-## 2. Building Production Images
+## 2. Building Host-Native Images
 
 ```bash
-docker build -f Dockerfile.prod -t samurai-runtime:latest .
+# Defaults to SAMURAI_NATIVE_ARCH=ON (optimizes for this host CPU/GPU/DPDK)
+docker build -f Dockerfile -t samurai:local .
+
+# Portable multi-host build (CI / registry distribution)
+docker build -f Dockerfile --build-arg SAMURAI_NATIVE_ARCH=OFF -t samurai:portable .
 ```
 
 ---

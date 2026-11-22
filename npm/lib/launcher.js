@@ -9,7 +9,7 @@ const { spawnSync } = require("node:child_process");
 const PKG = require("../package.json");
 
 const DEFAULT_REPO = "Mehmet8-Dev/Samurai";
-const DEFAULT_IMAGE = "ghcr.io/mehmet8-dev/samurai:latest";
+const DEFAULT_PREBUILT_IMAGE = "ghcr.io/mehmet8-dev/samurai:latest";
 
 const LOCAL_SUBDIRS = [
   "build/cli",
@@ -69,6 +69,12 @@ function getCacheRoot(env = process.env) {
 function getNativeCacheDir(version = PKG.version, env = process.env) {
   const tag = version.startsWith("v") ? version : `v${version}`;
   return path.join(getCacheRoot(env), `${tag}-native`);
+}
+
+function getLocalImageTag(version = PKG.version, env = process.env) {
+  if (env.SAMURAI_IMAGE) return env.SAMURAI_IMAGE;
+  const tag = version.startsWith("v") ? version : `v${version}`;
+  return `samurai:local-${tag}`;
 }
 
 function pkgConfigExists(mod) {
@@ -184,12 +190,45 @@ async function downloadToFile(url, destPath) {
 }
 
 /**
+ * Locate local source checkout or download the tagged source archive from GitHub.
+ * Never downloads pre-compiled binaries.
+ */
+async function ensureSourceTree(version, forceDownload = false, env = process.env) {
+  const tag = version.startsWith("v") ? version : `v${version}`;
+  const repo = env.SAMURAI_REPO || DEFAULT_REPO;
+
+  const cwdSamurai = path.join(process.cwd(), "samurai", "CMakeLists.txt");
+  const pkgRepoSamurai = path.resolve(__dirname, "..", "..", "samurai", "CMakeLists.txt");
+  if (!forceDownload && fs.existsSync(cwdSamurai)) return process.cwd();
+  if (!forceDownload && fs.existsSync(pkgRepoSamurai)) return path.resolve(__dirname, "..", "..");
+
+  const srcRoot = path.join(getCacheRoot(env), "src", tag);
+  if (forceDownload || !fs.existsSync(path.join(srcRoot, "samurai", "CMakeLists.txt"))) {
+    fs.rmSync(srcRoot, { recursive: true, force: true });
+    fs.mkdirSync(srcRoot, { recursive: true });
+    const archiveUrl = `https://github.com/${repo}/archive/refs/tags/${tag}.tar.gz`;
+    const tarTmp = path.join(os.tmpdir(), `samurai-src-${tag}-${process.pid}.tar.gz`);
+    try {
+      process.stderr.write(`[samurai-net] Downloading source archive ${archiveUrl}...\n`);
+      await downloadToFile(archiveUrl, tarTmp);
+      const ex = spawnSync("tar", ["-xzf", tarTmp, "--strip-components=1", "-C", srcRoot], {
+        stdio: ["ignore", process.stderr, process.stderr],
+      });
+      if (ex.status !== 0) throw new Error(`tar exited with ${ex.status}`);
+    } finally {
+      fs.rmSync(tarTmp, { force: true });
+    }
+  }
+  return srcRoot;
+}
+
+/**
  * Compile all Samurai binaries + workers natively on the target host so CPU SIMD
  * (`-march=native`), CUDA, DPDK, AF_XDP, io_uring, and DOCA match this machine.
+ * All build logs go strictly to stderr so MCP stdio remains clean.
  */
 async function buildNativeForHost(version, rawArgs = [], env = process.env) {
   const tag = version.startsWith("v") ? version : `v${version}`;
-  const repo = env.SAMURAI_REPO || DEFAULT_REPO;
   const hw = detectHostHardware();
 
   let portable = false;
@@ -205,19 +244,11 @@ async function buildNativeForHost(version, rawArgs = [], env = process.env) {
     else if (a === "-h" || a === "--help") {
       process.stdout.write(
         "Usage: samurai-net build [--jobs N] [--portable] [--force] [--docker]\n\n" +
-          "Compiles Samurai natively for this host's CPU (-march=native), CUDA, DPDK,\n" +
-          "AF_XDP, io_uring, and DOCA hardware into ~/.cache/samurai/<ver>-native/.\n"
+          "Downloads Samurai source code and compiles all binaries & hardware workers\n" +
+          "(CPU -march=native, CUDA, DPDK, AF_XDP, io_uring, DOCA) natively on this host.\n"
       );
       return 0;
     }
-  }
-
-  const nativeDir = getNativeCacheDir(version, env);
-  const nativeBinDir = path.join(nativeDir, "bin");
-  const marker = path.join(nativeBinDir, ".native-verified");
-  if (!force && !dockerLocalBuild && fs.existsSync(marker) && isExecutable(path.join(nativeBinDir, "samurai"))) {
-    process.stderr.write(`[samurai-net] Host-native build already present at ${nativeBinDir} (pass --force to rebuild).\n`);
-    return 0;
   }
 
   if (dockerLocalBuild) {
@@ -226,66 +257,50 @@ async function buildNativeForHost(version, rawArgs = [], env = process.env) {
       process.stderr.write("[samurai-net] 'docker' is required for `build --docker`.\n");
       return 1;
     }
-    const localRepoCmake = path.resolve(__dirname, "..", "..", "samurai", "CMakeLists.txt");
-    if (!fs.existsSync(localRepoCmake)) {
-      process.stderr.write("[samurai-net] Run `build --docker` from a cloned Samurai repository containing Dockerfile.\n");
-      return 1;
-    }
-    const repoRoot = path.resolve(__dirname, "..", "..");
+    const srcRoot = await ensureSourceTree(version, force, env);
+    const imageTag = getLocalImageTag(version, env);
     const archArg = portable ? "OFF" : "ON";
-    process.stderr.write(`[samurai-net] Building Docker image locally on target host (SAMURAI_NATIVE_ARCH=${archArg})...\n`);
-    return execBinary(
-      dockerBin,
-      ["build", "--build-arg", `SAMURAI_NATIVE_ARCH=${archArg}`, "-t", env.SAMURAI_IMAGE || DEFAULT_IMAGE, repoRoot],
-      null
+    process.stderr.write(
+      `[samurai-net] Building Docker image '${imageTag}' from source on this host (SAMURAI_NATIVE_ARCH=${archArg})...\n`
     );
+    const res = spawnSync(
+      dockerBin,
+      ["build", "--build-arg", `SAMURAI_NATIVE_ARCH=${archArg}`, "-t", imageTag, srcRoot],
+      { stdio: ["ignore", process.stderr, process.stderr] }
+    );
+    return typeof res.status === "number" ? res.status : 1;
+  }
+
+  const nativeDir = getNativeCacheDir(version, env);
+  const nativeBinDir = path.join(nativeDir, "bin");
+  const marker = path.join(nativeBinDir, ".native-verified");
+  if (!force && fs.existsSync(marker) && isExecutable(path.join(nativeBinDir, "samurai"))) {
+    return 0;
   }
 
   if (process.platform !== "linux") {
     process.stderr.write(
-      `[samurai-net] Native host build targets Linux hosts. On ${process.platform}, Samurai runs via Docker or 'build --docker'.\n`
+      `[samurai-net] Native ELF build targets Linux hosts. On ${process.platform}, Samurai compiles inside a local Docker container.\n`
     );
     return 1;
   }
 
   if (!hw.cmake || !hw.cxx) {
     process.stderr.write(
-      "[samurai-net] Missing build tools (cmake and g++/clang++).\n" +
+      "[samurai-net] Missing C++17 build tools (cmake and g++/clang++) to compile for this host's hardware.\n" +
         "Install prerequisites on Ubuntu/Debian:\n" +
         "  sudo apt update && sudo apt install -y build-essential cmake pkg-config libzmq3-dev libssl-dev " +
-        "libhiredis-dev libpcap-dev libnghttp2-dev libngtcp2-dev libngtcp2-crypto-gnutls-dev libnghttp3-dev libgnutls28-dev liburing-dev\n"
+        "libhiredis-dev libpcap-dev libnghttp2-dev libngtcp2-dev libngtcp2-crypto-gnutls-dev libnghttp3-dev libgnutls28-dev liburing-dev\n" +
+        "Or run inside a locally built Docker container with SAMURAI_DOCKER=1.\n"
     );
     return 1;
   }
 
-  // Locate source tree (local checkout first, otherwise download GitHub tag archive).
-  let srcRoot = null;
-  const cwdSamurai = path.join(process.cwd(), "samurai", "CMakeLists.txt");
-  const pkgRepoSamurai = path.resolve(__dirname, "..", "..", "samurai", "CMakeLists.txt");
-  if (fs.existsSync(cwdSamurai)) srcRoot = process.cwd();
-  else if (fs.existsSync(pkgRepoSamurai)) srcRoot = path.resolve(__dirname, "..", "..");
-  else {
-    srcRoot = path.join(getCacheRoot(env), "src", tag);
-    if (force || !fs.existsSync(path.join(srcRoot, "samurai", "CMakeLists.txt"))) {
-      fs.rmSync(srcRoot, { recursive: true, force: true });
-      fs.mkdirSync(srcRoot, { recursive: true });
-      const archiveUrl = `https://github.com/${repo}/archive/refs/tags/${tag}.tar.gz`;
-      const tarTmp = path.join(os.tmpdir(), `samurai-src-${tag}-${process.pid}.tar.gz`);
-      try {
-        process.stderr.write(`[samurai-net] Downloading source archive ${archiveUrl}...\n`);
-        await downloadToFile(archiveUrl, tarTmp);
-        const ex = spawnSync("tar", ["-xzf", tarTmp, "--strip-components=1", "-C", srcRoot], { stdio: "inherit" });
-        if (ex.status !== 0) throw new Error(`tar exited with ${ex.status}`);
-      } finally {
-        fs.rmSync(tarTmp, { force: true });
-      }
-    }
-  }
-
+  const srcRoot = await ensureSourceTree(version, force, env);
   const buildDir = path.join(getCacheRoot(env), "build", tag);
   process.stderr.write(
-    `[samurai-net] Host hardware: arch=${hw.arch}, cores=${hw.cpus}, avx2=${hw.avx2}, avx512=${hw.avx512}, ` +
-      `cuda_gpu=${hw.cudaGpu}, nvcc=${hw.nvcc}, dpdk=${hw.dpdk}, af_xdp=${hw.afXdp}, io_uring=${hw.ioUring}, doca=${hw.doca}\n`
+    `[samurai-net] Compiling natively for host hardware (arch=${hw.arch}, cores=${hw.cpus}, avx2=${hw.avx2}, ` +
+      `avx512=${hw.avx512}, cuda_gpu=${hw.cudaGpu}, nvcc=${hw.nvcc}, dpdk=${hw.dpdk}, af_xdp=${hw.afXdp}, io_uring=${hw.ioUring}, doca=${hw.doca})...\n`
   );
 
   const cmakeCfg = spawnSync(
@@ -298,14 +313,12 @@ async function buildNativeForHost(version, rawArgs = [], env = process.env) {
       "-DCMAKE_BUILD_TYPE=Release",
       `-DSAMURAI_NATIVE_ARCH=${portable ? "OFF" : "ON"}`,
     ],
-    { stdio: "inherit" }
+    { stdio: ["ignore", process.stderr, process.stderr] }
   );
   if (cmakeCfg.status !== 0) return cmakeCfg.status || 1;
 
-  // Build core targets plus whichever hardware backends this host supports.
-  const targetsToBuild = [...NATIVE_BUILD_TARGETS];
-  const cmakeBuild = spawnSync("cmake", ["--build", buildDir, "-j", jobs, "--target", ...targetsToBuild], {
-    stdio: "inherit",
+  const cmakeBuild = spawnSync("cmake", ["--build", buildDir, "-j", jobs, "--target", ...NATIVE_BUILD_TARGETS], {
+    stdio: ["ignore", process.stderr, process.stderr],
   });
   if (cmakeBuild.status !== 0) return cmakeBuild.status || 1;
 
@@ -351,8 +364,7 @@ async function buildNativeForHost(version, rawArgs = [], env = process.env) {
 }
 
 /**
- * Ensure the Linux x86_64 GitHub Release bundle is cached and verified by SHA-256.
- * Returns the extracted `bin/` directory on success, or null if unavailable.
+ * Opt-in only (`SAMURAI_PREBUILT=1`): fetch portable GitHub Release binaries.
  */
 async function ensureCachedLinuxRelease(version, env = process.env) {
   const tag = version.startsWith("v") ? version : `v${version}`;
@@ -389,7 +401,7 @@ async function ensureCachedLinuxRelease(version, env = process.env) {
 
     fs.mkdirSync(cacheDir, { recursive: true });
     const extract = spawnSync("tar", ["-xzf", tarPath, "--strip-components=1", "-C", cacheDir], {
-      stdio: "inherit",
+      stdio: ["ignore", process.stderr, process.stderr],
     });
     if (extract.status !== 0) {
       throw new Error(`tar extraction exited with status ${extract.status}`);
@@ -401,9 +413,29 @@ async function ensureCachedLinuxRelease(version, env = process.env) {
   }
 }
 
+async function ensureLocalDockerImage(dockerBin, version, env = process.env) {
+  const imageTag = getLocalImageTag(version, env);
+  const inspect = spawnSync(dockerBin, ["image", "inspect", imageTag], { stdio: "ignore" });
+  if (inspect.status === 0) return imageTag;
+
+  const srcRoot = await ensureSourceTree(version, false, env);
+  process.stderr.write(
+    `[samurai-net] Building Docker image '${imageTag}' locally from source (SAMURAI_NATIVE_ARCH=ON)...\n`
+  );
+  const buildRes = spawnSync(
+    dockerBin,
+    ["build", "--build-arg", "SAMURAI_NATIVE_ARCH=ON", "-t", imageTag, srcRoot],
+    { stdio: ["ignore", process.stderr, process.stderr] }
+  );
+  if (buildRes.status !== 0) {
+    throw new Error(`docker build exited with status ${buildRes.status}`);
+  }
+  return imageTag;
+}
+
 function buildDockerArgs(binary, args, opts = {}) {
   const platform = opts.platform || process.platform;
-  const image = opts.image || process.env.SAMURAI_IMAGE || DEFAULT_IMAGE;
+  const image = opts.image || getLocalImageTag(PKG.version);
   const cwd = opts.cwd || process.cwd();
   const home = opts.home || os.homedir();
   const isMcpConfigCmd =
@@ -444,18 +476,6 @@ function execBinary(binPath, args, extraBinDir) {
   return typeof res.status === "number" ? res.status : 1;
 }
 
-function maybeHintNativeHardware(binary, args) {
-  if (!process.stderr.isTTY) return;
-  if (binary === "samurai_mcp" && args.length === 0) return;  // keep MCP stdio quiet
-  const hw = detectHostHardware();
-  if (hw.cudaGpu || hw.nvcc || hw.dpdk || hw.doca || hw.avx512) {
-    process.stderr.write(
-      "[samurai-net] Host acceleration detected (CUDA/DPDK/DOCA/AVX-512). " +
-        "Run 'npx -y samurai-net build' to compile hardware-optimized binaries for this machine.\n"
-    );
-  }
-}
-
 async function runCli(defaultBinary, rawArgv) {
   const { binary, args } = resolveTargetCommand(defaultBinary, rawArgv);
   if (binary === "__samurai_build__") {
@@ -463,49 +483,52 @@ async function runCli(defaultBinary, rawArgv) {
   }
 
   const forceDocker = process.env.SAMURAI_DOCKER === "1";
-  const wantNativeAuto = process.env.SAMURAI_BUILD_NATIVE === "1";
+  const allowPrebuilt = process.env.SAMURAI_PREBUILT === "1";
 
   if (!forceDocker) {
+    // 1. Existing host-native build (~/.cache/samurai/v<ver>-native/bin or local repo build/)
     const localBin = findLocalBinary(binary);
     if (localBin) {
       return execBinary(localBin, args, path.dirname(localBin));
     }
 
-    if (wantNativeAuto && process.platform === "linux") {
+    // 2. Default on Linux: fetch source code and compile natively for this machine's hardware.
+    if (process.platform === "linux" && !allowPrebuilt) {
       const brc = await buildNativeForHost(PKG.version, []);
       if (brc === 0) {
         const builtBin = findLocalBinary(binary);
         if (builtBin) return execBinary(builtBin, args, path.dirname(builtBin));
       }
+      return brc || 1;
     }
 
-    if (process.platform === "linux" && process.arch === "x64") {
-      try {
-        const cachedBinDir = await ensureCachedLinuxRelease(PKG.version);
-        if (cachedBinDir) {
-          const cachedBin = path.join(cachedBinDir, binary);
-          if (isExecutable(cachedBin)) {
-            maybeHintNativeHardware(binary, args);
-            return execBinary(cachedBin, args, cachedBinDir);
-          }
+    // 3. Explicit opt-in only (`SAMURAI_PREBUILT=1`) for portable GitHub Release binaries.
+    if (process.platform === "linux" && process.arch === "x64" && allowPrebuilt) {
+      const cachedBinDir = await ensureCachedLinuxRelease(PKG.version);
+      if (cachedBinDir) {
+        const cachedBin = path.join(cachedBinDir, binary);
+        if (isExecutable(cachedBin)) {
+          return execBinary(cachedBin, args, cachedBinDir);
         }
-      } catch (err) {
-        process.stderr.write(`[samurai-net] Native release unavailable (${err.message}); falling back to Docker...\n`);
       }
     }
   }
 
+  // 4. Docker path (macOS/Windows or SAMURAI_DOCKER=1): build image locally from source by default.
   const dockerBin = findInPath("docker");
   if (!dockerBin) {
     process.stderr.write(
-      `[samurai-net] Could not locate native '${binary}' binary and 'docker' was not found in PATH.\n` +
-        `Compile natively on this host with:\n` +
-        `  npx -y samurai-net build\n`
+      `[samurai-net] Could not build native '${binary}' on ${process.platform}/${process.arch} and 'docker' was not found in PATH.\n` +
+        `Install Docker or Linux C++17 build dependencies and re-run.\n`
     );
     return 1;
   }
 
-  const dockerArgs = buildDockerArgs(binary, args);
+  let imageTag = process.env.SAMURAI_IMAGE || DEFAULT_PREBUILT_IMAGE;
+  if (!allowPrebuilt) {
+    imageTag = await ensureLocalDockerImage(dockerBin, PKG.version);
+  }
+  const dockerArgs = buildDockerArgs(binary, args, { image: imageTag });
   return execBinary(dockerBin, dockerArgs, null);
 }
 
@@ -514,7 +537,10 @@ module.exports = {
   buildNativeForHost,
   detectHostHardware,
   ensureCachedLinuxRelease,
+  ensureLocalDockerImage,
+  ensureSourceTree,
   findLocalBinary,
+  getLocalImageTag,
   getNativeCacheDir,
   resolveTargetCommand,
   runCli,

@@ -8,22 +8,22 @@ Samurai (v3.3.1) bridges the gap between scripting load tools (`k6`, `Locust`) a
 
 ## Quick Start
 
-### 1. Run Immediately (`npx` or Docker — Zero Build)
-One package (`samurai-net`) pulls the entire Samurai runtime (CLI, MCP server, `samurai_master`/`samurai_slave`, all 10 dataplane workers, and benchmark binaries):
+### 1. Run & Compile Natively for Your Hardware (`npx` or `docker`)
+`samurai-net` downloads the Samurai source code and **automatically compiles all binaries and workers on your target machine** (`-march=native`, CUDA, DPDK, AF_XDP, `io_uring`, DOCA) into `~/.cache/samurai/` on first run:
 
 ```bash
-# Option A: Run 1M stateful TCP flows (605 B/flow) via npx (Linux native cache or Docker fallback)
+# Option A: Compile natively on this machine & run the 1M stateful TCP flow benchmark (605 B/flow)
 npx -y samurai-net bench 1m-tcp
 
-# Or install all binaries globally into your PATH:
-npm install -g samurai-net
+# Or install globally and trigger/refresh the host-native build explicitly:
+npm install -g samurai-net && samurai-net build
 
-# Option B: Direct GHCR container (zero Node.js, zero build)
-docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp
+# Option B: Build the Docker runtime locally from source for your host hardware
+docker build -t samurai:local .
+docker run --rm samurai:local samurai_bench_1m_tcp
 
-# Option C: Compile natively on this host for your exact CPU (-march=native), CUDA, DPDK, AF_XDP & DOCA
-npx -y samurai-net build
-# (Or inside a cloned repo: ./build/cli/samurai build  |  or Docker: docker build --build-arg SAMURAI_NATIVE_ARCH=ON -t samurai:native .)
+# Option C: Build directly from a cloned repo (Linux C++17)
+cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release -DSAMURAI_NATIVE_ARCH=ON && cmake --build build -j"$(nproc)"
 ```
 
 ### 2. Connect AI Coding Agent (1-Command MCP Setup)

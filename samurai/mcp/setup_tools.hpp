@@ -22,7 +22,7 @@ struct DoctorOptions {
 struct SetupOptions {
   std::string client;            // required: client ID
   std::string scope = "user";    // "user" or "project"
-  std::string image = "ghcr.io/mehmet8-dev/samurai:latest";
+  std::string image = "samurai:local";
   bool docker = false;
   bool npx = false;
   bool dry_run = false;

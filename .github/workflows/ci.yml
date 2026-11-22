@@ -234,7 +234,7 @@ jobs:
 
       - name: Build Native Docker image
         run: |
-          docker build -f Dockerfile -t samurai:ci .
+          docker build -f Dockerfile --build-arg SAMURAI_NATIVE_ARCH=OFF -t samurai:ci .
 
       - name: Container Smoke Check (samurai_master help)
         run: |

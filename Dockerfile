@@ -33,10 +33,11 @@ WORKDIR /src
 COPY . .
 
 # Configure once, then build the deployable targets (CLI + daemons + commodity
-# and telco workers + reproducible benchmark harnesses). Pass
-# `--build-arg SAMURAI_NATIVE_ARCH=ON` when building locally on the target host
-# to enable `-march=native` CPU tuning and any host-present GPU/DPDK toolchains.
-ARG SAMURAI_NATIVE_ARCH=OFF
+# and telco workers + reproducible benchmark harnesses). Defaults to
+# `SAMURAI_NATIVE_ARCH=ON` so local `docker build` compiles for the host CPU and
+# any host-present GPU/DPDK toolchains. Pass `--build-arg SAMURAI_NATIVE_ARCH=OFF`
+# for portable multi-host CI images.
+ARG SAMURAI_NATIVE_ARCH=ON
 RUN cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release -DSAMURAI_NATIVE_ARCH=${SAMURAI_NATIVE_ARCH} \
  && cmake --build build -j "$(nproc)" --target \
       samurai \

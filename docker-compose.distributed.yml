@@ -5,7 +5,7 @@
 #   curl -s http://127.0.0.1:8089/healthz
 #   docker compose -f docker-compose.distributed.yml logs -f master
 #
-# Uses the pre-built GHCR image by default; run with `--build` to compile from source.
+# Compiles locally from source on the host (`SAMURAI_NATIVE_ARCH=ON`).
 
 services:
   redis:
@@ -23,10 +23,13 @@ services:
       - samurai-net
 
   master:
-    image: ghcr.io/mehmet8-dev/samurai:latest
+    image: samurai:local
+    pull_policy: build
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SAMURAI_NATIVE_ARCH: "ON"
     container_name: samurai-master
     environment:
       SAMURAI_CLUSTER_SECRET: "samurai-cluster-secret"
@@ -86,10 +89,13 @@ services:
       - samurai-net
 
   slave:
-    image: ghcr.io/mehmet8-dev/samurai:latest
+    image: samurai:local
+    pull_policy: build
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SAMURAI_NATIVE_ARCH: "ON"
     environment:
       SAMURAI_CLUSTER_SECRET: "samurai-cluster-secret"
       SAMURAI_TENANT_NAMESPACE: "default"
