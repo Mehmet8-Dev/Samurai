@@ -2,7 +2,7 @@
 
 **1,000,000 stateful TCP flows in 577 MiB (`605 B/flow`) · Stateful HTTP/2 & QUIC/H3 (`io_uring`/kTLS) · Consumer GeForce BAR1 P2P CUDA · 5G CUPS Telecom · Native C++17 MCP Server (`samurai_mcp`)**
 
-Samurai (v3.3.2) bridges the gap between scripting load tools (`k6`, `Locust`) and raw stateless packet generators (`pktgen`, `TRex`) in a single compiled **C++17** runtime with zero Python dataplane overhead — strictly scoped for authorized lab and infrastructure validation.
+Samurai (v3.3.3) bridges the gap between scripting load tools (`k6`, `Locust`) and raw stateless packet generators (`pktgen`, `TRex`) in a single compiled **C++17** runtime with zero Python dataplane overhead — strictly scoped for authorized lab and infrastructure validation.
 
 ---
 
@@ -281,7 +281,7 @@ docker run --rm --add-host host.docker.internal:host-gateway samurai:local \
   samurai --worker l7 --target "$(python3 -c 'import socket; print(socket.gethostbyname("host.docker.internal"))')" --port 8080 --l7-protocol http2 --count 1000 --confirm
 ```
 
-> **Note:** The local container build packages `samurai`, `samurai_mcp`, `samurai_master`, `samurai_slave`, reproducible benchmark harnesses (`samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, `samurai_bench_l7`), and every worker whose host toolchain (`CUDA`, `DPDK`, `AF_XDP`, `DOCA`, `l7`, `scenario`, `telco`, `defense`) is present during the build under `/usr/local/bin`. *(Optional portable CI images are also published at `ghcr.io/mehmet8-dev/samurai:v3.3.2` when `SAMURAI_PREBUILT=1` is desired.)* See [`docs/11-docker.md`](docs/11-docker.md) for Docker Desktop networking details.
+> **Note:** The local container build packages `samurai`, `samurai_mcp`, `samurai_master`, `samurai_slave`, reproducible benchmark harnesses (`samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, `samurai_bench_l7`), and every worker whose host toolchain (`CUDA`, `DPDK`, `AF_XDP`, `DOCA`, `l7`, `scenario`, `telco`, `defense`) is present during the build under `/usr/local/bin`. *(Optional portable CI images are also published at `ghcr.io/mehmet8-dev/samurai:v3.3.3` when `SAMURAI_PREBUILT=1` is desired.)* See [`docs/11-docker.md`](docs/11-docker.md) for Docker Desktop networking details.
 
 ### 4) Docker Compose Deployment
 

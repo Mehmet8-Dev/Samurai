@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.3] - 2026-11-23
+
+### Fixed
+- **Host-Native Optional Hardware Backends (`samurai/optional/CMakeLists.txt`, `npm/lib/launcher.js`)**:
+  - Added the `gpu_packet_cuda_defense` CMake `nvcc` target to compile `libgpu_packet_cuda_defense.so` alongside `libgpu_packet_cuda.so` when CUDA is available.
+  - Updated `samurai-net build` to auto-detect and build all CMake-configured optional hardware targets (`gpu_packet_cuda`, `gpu_packet_cuda_defense`, `xdp_sender`) and copy their `.so` libraries into `~/.cache/samurai/v<ver>-native/bin/`.
+  - Wired `SAMURAI_GPU_NATIVE_LIB`, `SAMURAI_GPU_DEFENSE_LIB`, `SAMURAI_XDP_NATIVE_LIB`, and `LD_LIBRARY_PATH` automatically in `samurai-net` execution so workers locate native hardware libraries from any working directory.
+
+### Changed
+- Bumped canonical SemVer across package, `npm/package.json`, Helm `appVersion`, citation metadata, MCP server, and documentation to `3.3.3`.
+
 ## [3.3.2] - 2026-11-22
 
 ### Added
