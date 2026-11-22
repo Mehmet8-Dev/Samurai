@@ -2,11 +2,15 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const {
   buildDockerArgs,
+  buildExecEnv,
+  detectConfiguredOptionalTargets,
   detectHostHardware,
   findLocalBinary,
   getLocalImageTag,
@@ -87,4 +91,40 @@ test("bin/samurai.js executes local samurai mcp doctor --json when built", (t) =
   assert.equal(res.status, 0);
   const parsed = JSON.parse(res.stdout);
   assert.equal(parsed.core_binaries.samurai_mcp.available, true);
+});
+
+test("detectConfiguredOptionalTargets discovers CUDA and AF_XDP targets configured by CMake", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "samurai-opt-"));
+  try {
+    fs.mkdirSync(path.join(tmpDir, "optional", "CMakeFiles", "gpu_packet_cuda.dir"), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, "optional", "CMakeFiles", "gpu_packet_cuda_defense.dir"), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, "optional", "CMakeFiles", "xdp_sender.dir"), { recursive: true });
+    assert.deepEqual(detectConfiguredOptionalTargets(tmpDir), [
+      "gpu_packet_cuda",
+      "gpu_packet_cuda_defense",
+      "xdp_sender",
+    ]);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("buildExecEnv wires native GPU, defense CUDA, and AF_XDP shared libraries when present", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "samurai-env-"));
+  try {
+    fs.writeFileSync(path.join(tmpDir, "libgpu_packet_cuda.so"), "");
+    fs.writeFileSync(path.join(tmpDir, "libgpu_packet_cuda_defense.so"), "");
+    fs.writeFileSync(path.join(tmpDir, "xdp_sender.so"), "");
+
+    const env = buildExecEnv(tmpDir, { PATH: "/usr/bin" });
+    assert.equal(env.SAMURAI_GPU_NATIVE_LIB, path.join(tmpDir, "libgpu_packet_cuda.so"));
+    assert.equal(env.SAMURAI_GPU_DEFENSE_LIB, path.join(tmpDir, "libgpu_packet_cuda_defense.so"));
+    assert.equal(env.SAMURAI_XDP_NATIVE_LIB, path.join(tmpDir, "xdp_sender.so"));
+    assert.ok(env.LD_LIBRARY_PATH.startsWith(tmpDir));
+
+    const preserved = buildExecEnv(tmpDir, { PATH: "/usr/bin", SAMURAI_GPU_NATIVE_LIB: "/custom/gpu.so" });
+    assert.equal(preserved.SAMURAI_GPU_NATIVE_LIB, "/custom/gpu.so");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

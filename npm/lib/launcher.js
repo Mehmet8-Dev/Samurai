@@ -39,6 +39,23 @@ const NATIVE_BUILD_TARGETS = [
   "bench_l7_stateful_userspace",
 ];
 
+const OPTIONAL_NATIVE_BUILD_TARGETS = [
+  "gpu_packet_cuda",
+  "gpu_packet_cuda_defense",
+  "xdp_sender",
+];
+
+function detectConfiguredOptionalTargets(buildDir) {
+  const configured = [];
+  for (const target of OPTIONAL_NATIVE_BUILD_TARGETS) {
+    const dir = path.join(buildDir, "optional", "CMakeFiles", `${target}.dir`);
+    if (fs.existsSync(dir)) {
+      configured.push(target);
+    }
+  }
+  return configured;
+}
+
 function isExecutable(filePath) {
   try {
     fs.accessSync(filePath, fs.constants.X_OK);
@@ -317,7 +334,13 @@ async function buildNativeForHost(version, rawArgs = [], env = process.env) {
   );
   if (cmakeCfg.status !== 0) return cmakeCfg.status || 1;
 
-  const cmakeBuild = spawnSync("cmake", ["--build", buildDir, "-j", jobs, "--target", ...NATIVE_BUILD_TARGETS], {
+  const optionalTargets = detectConfiguredOptionalTargets(buildDir);
+  const buildTargets = [...NATIVE_BUILD_TARGETS, ...optionalTargets];
+  if (optionalTargets.length > 0) {
+    process.stderr.write(`[samurai-net] Building optional hardware backends: ${optionalTargets.join(", ")}\n`);
+  }
+
+  const cmakeBuild = spawnSync("cmake", ["--build", buildDir, "-j", jobs, "--target", ...buildTargets], {
     stdio: ["ignore", process.stderr, process.stderr],
   });
   if (cmakeBuild.status !== 0) return cmakeBuild.status || 1;
@@ -350,9 +373,15 @@ async function buildNativeForHost(version, rawArgs = [], env = process.env) {
       fs.chmodSync(dst, 0o755);
     }
   }
-  const cudaSo = path.join(srcRoot, "samurai", "libgpu_packet_cuda.so");
-  if (fs.existsSync(cudaSo)) {
-    fs.copyFileSync(cudaSo, path.join(nativeBinDir, "libgpu_packet_cuda.so"));
+  const optionalLibs = [
+    [path.join(srcRoot, "samurai", "libgpu_packet_cuda.so"), "libgpu_packet_cuda.so"],
+    [path.join(srcRoot, "samurai", "libgpu_packet_cuda_defense.so"), "libgpu_packet_cuda_defense.so"],
+    [path.join(srcRoot, "samurai", "xdp", "xdp_sender.so"), "xdp_sender.so"],
+  ];
+  for (const [srcLib, name] of optionalLibs) {
+    if (fs.existsSync(srcLib)) {
+      fs.copyFileSync(srcLib, path.join(nativeBinDir, name));
+    }
   }
   const srcSkills = path.join(srcRoot, "skills");
   if (fs.existsSync(srcSkills)) {
@@ -458,12 +487,31 @@ function buildDockerArgs(binary, args, opts = {}) {
   return dockerArgs;
 }
 
-function execBinary(binPath, args, extraBinDir) {
-  const env = { ...process.env };
+function buildExecEnv(extraBinDir, baseEnv = process.env) {
+  const env = { ...baseEnv };
   if (extraBinDir) {
     env.SAMURAI_BIN_DIR = extraBinDir;
     env.PATH = `${extraBinDir}${path.delimiter}${env.PATH || ""}`;
+    env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH
+      ? `${extraBinDir}${path.delimiter}${env.LD_LIBRARY_PATH}`
+      : extraBinDir;
+    const libEnvMap = [
+      ["SAMURAI_GPU_NATIVE_LIB", "libgpu_packet_cuda.so"],
+      ["SAMURAI_GPU_DEFENSE_LIB", "libgpu_packet_cuda_defense.so"],
+      ["SAMURAI_XDP_NATIVE_LIB", "xdp_sender.so"],
+    ];
+    for (const [key, filename] of libEnvMap) {
+      const candidate = path.join(extraBinDir, filename);
+      if (!env[key] && fs.existsSync(candidate)) {
+        env[key] = candidate;
+      }
+    }
   }
+  return env;
+}
+
+function execBinary(binPath, args, extraBinDir) {
+  const env = buildExecEnv(extraBinDir, process.env);
   const res = spawnSync(binPath, args, { stdio: "inherit", env });
   if (res.error) {
     process.stderr.write(`[samurai-net] Failed to execute ${binPath}: ${res.error.message}\n`);
@@ -533,8 +581,11 @@ async function runCli(defaultBinary, rawArgv) {
 }
 
 module.exports = {
+  OPTIONAL_NATIVE_BUILD_TARGETS,
   buildDockerArgs,
+  buildExecEnv,
   buildNativeForHost,
+  detectConfiguredOptionalTargets,
   detectHostHardware,
   ensureCachedLinuxRelease,
   ensureLocalDockerImage,

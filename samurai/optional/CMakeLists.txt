@@ -4,9 +4,10 @@ project(samurai_optional_backends LANGUAGES C CXX)
 # Optional native backend libraries — toolchain-gated builds that produce the
 # runtime .so libraries the corresponding ZMQ workers dlopen at runtime:
 #
-#   libgpu_packet_cuda.so  (nvcc)      -> gpu worker
-#   xdp/xdp_sender.so      (libbpf)    -> afxdp worker
-#   DOCA backends          (DOCA SDK)  -> doca worker
+#   libgpu_packet_cuda.so          (nvcc)      -> gpu worker
+#   libgpu_packet_cuda_defense.so  (nvcc)      -> defense worker
+#   xdp/xdp_sender.so              (libbpf)    -> afxdp worker
+#   DOCA backends                  (DOCA SDK)  -> doca worker
 #
 # NOT: DPDK artık burada üretilmez; native çekirdek (dpdk/dpdk_core) doğrudan
 # samurai_dpdk_worker'a derlenir (zmq/CMakeLists.txt).
@@ -45,6 +46,24 @@ if(NOT DEFINED ENV{SAMURAI_SKIP_CUDA_BUILD})
     endif()
   else()
     message(STATUS "optional: nvcc/gpu_packet_cuda.cu not found -> skipping libgpu_packet_cuda.so")
+  endif()
+
+  set(_cuda_def_src ${SAMURAI_PKG_DIR}/gpu_packet_cuda/gpu_packet_cuda_defense.cu)
+  if(SAMURAI_NVCC AND EXISTS ${_cuda_def_src})
+    file(GLOB _cuda_def_hdrs CONFIGURE_DEPENDS ${SAMURAI_PKG_DIR}/gpu_packet_cuda/kernels_defense_*.cuh)
+    set(_cuda_def_out ${SAMURAI_PKG_DIR}/libgpu_packet_cuda_defense.so)
+    add_custom_command(
+      OUTPUT ${_cuda_def_out}
+      COMMAND ${SAMURAI_NVCC} -std=c++20 -O3 -Xcompiler -fPIC -diag-suppress=177
+              -I ${SAMURAI_PKG_DIR}/gpu_packet_cuda -I ${SAMURAI_PKG_DIR}/..
+              -c ${_cuda_def_src} -o ${CMAKE_CURRENT_BINARY_DIR}/gpu_packet_cuda_defense.o
+      COMMAND ${SAMURAI_NVCC} -shared ${CMAKE_CURRENT_BINARY_DIR}/gpu_packet_cuda_defense.o -ldl -o ${_cuda_def_out}
+      DEPENDS ${_cuda_def_src} ${_cuda_def_hdrs}
+      COMMENT "Building libgpu_packet_cuda_defense.so (nvcc)"
+      VERBATIM)
+    add_custom_target(gpu_packet_cuda_defense ALL DEPENDS ${_cuda_def_out})
+  else()
+    message(STATUS "optional: nvcc/gpu_packet_cuda_defense.cu not found -> skipping libgpu_packet_cuda_defense.so")
   endif()
 else()
   message(STATUS "optional: SAMURAI_SKIP_CUDA_BUILD set -> skipping CUDA backend")
