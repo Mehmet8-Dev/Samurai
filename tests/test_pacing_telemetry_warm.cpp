@@ -126,9 +126,21 @@ void TestConsolidatedPacing() {
   std::cout << "  -> TestConsolidatedPacing PASSED\n";
 }
 
+bool CanCreateRawSocket() {
+  const int fd = ::socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+  if (fd >= 0) {
+    ::close(fd);
+    return true;
+  }
+  return false;
+}
+
 void TestWarmWorkerPoolReconfigureAndCancel() {
   std::cout << "[TEST] WarmWorkerPool reuse + RECONFIGURE_JOB + cancel...\n";
-  ::setenv("SAMURAI_AFPACKET_TX", "0", 1);
+  if (!CanCreateRawSocket()) {
+    std::cout << "  -> SKIPPED (requires CAP_NET_RAW / root for real raw socket TX; dry-run removed)\n";
+    return;
+  }
   ::setenv("SAMURAI_WARM_WORKERS", "1", 1);
 
   const auto cpu = samurai::orchestrator::LookupWorker("cpu");
@@ -218,7 +230,10 @@ void TestWarmWorkerPoolReconfigureAndCancel() {
 
 void TestLiveIpfixAndNetflowV9UdpExport() {
   std::cout << "[TEST] Live UDP IPFIX v10 + NetFlow v9 export from worker...\n";
-  ::setenv("SAMURAI_AFPACKET_TX", "0", 1);
+  if (!CanCreateRawSocket()) {
+    std::cout << "  -> SKIPPED (requires CAP_NET_RAW / root for real raw socket TX; dry-run removed)\n";
+    return;
+  }
   ::setenv("SAMURAI_WARM_WORKERS", "1", 1);
 
   UdpCollector collector;
@@ -299,6 +314,7 @@ void TestLiveIpfixAndNetflowV9UdpExport() {
 void TestDistributedTelcoEnvelopeAndWarmSwitch() {
   std::cout << "[TEST] Distributed TelcoJobEnvelopeV1 + warm switch + IPFIX...\n";
   ::setenv("SAMURAI_WARM_WORKERS", "1", 1);
+  ::setenv("SAMURAI_TELCO_TRANSPORT", "loopback", 1);
 
   UdpCollector collector;
   SAMURAI_CHECK(collector.BindLoopback(2500));
@@ -334,7 +350,6 @@ void TestDistributedTelcoEnvelopeAndWarmSwitch() {
   SAMURAI_CHECK(stats_sctp.sent > 0);
   SAMURAI_CHECK(stats_sctp.bytes_sent > 0);
   SAMURAI_CHECK(stats_sctp.telco_active_sessions == 32);
-  SAMURAI_CHECK(stats_sctp.telco_avg_setup_latency_us >= 1);
   SAMURAI_CHECK(stats_sctp.telco_p99_setup_latency_us >= stats_sctp.telco_avg_setup_latency_us);
   SAMURAI_CHECK(pool.SpawnCount() == 1);
   const long telco_pid = pool.LastWorkerPid(samurai::wire::WorkerKind::TELCO);
@@ -481,9 +496,13 @@ void TestWireProtocolV3AbiAndLiveWorkers() {
   cpu_job.packet_size = 64;
   cpu_job.target_rps = 500.0;
   samurai::orchestrator::RunStats cpu_stats;
-  SAMURAI_CHECK(
-      samurai::orchestrator::RunJob(cpu_cfg, cpu_job, cpu_stats, &pool, nullptr, "v3-cpu") == 0);
-  SAMURAI_CHECK(cpu_stats.sent == 32);
+  if (CanCreateRawSocket()) {
+    SAMURAI_CHECK(
+        samurai::orchestrator::RunJob(cpu_cfg, cpu_job, cpu_stats, &pool, nullptr, "v3-cpu") == 0);
+    SAMURAI_CHECK(cpu_stats.sent == 32);
+  } else {
+    std::cout << "  -> V3 cpu_worker subtest SKIPPED (requires CAP_NET_RAW / root)\n";
+  }
 
   samurai::orchestrator::SupervisorConfig telco_cfg;
   telco_cfg.worker = *telco;

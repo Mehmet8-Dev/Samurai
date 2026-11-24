@@ -44,6 +44,14 @@ void PrintUsage(const char* argv0) {
       "  --list-profiles             list all built-in workload profiles and exit\n"
       "  --confirm                   confirm live dataplane execution\n"
       "\n"
+      "Dataplane, Transport & Config (CLI > Env > samurai.conf):\n"
+      "  --config PATH               load tuning config file (default: ./samurai.conf or ~/.config/samurai/samurai.conf)\n"
+      "  --iface NAME                network interface / DPDK port for worker TX/RX\n"
+      "  --transport MODE            transport backend (af_packet|dpdk|dpdk_direct|loopback|custom_tcp|kernel_socket|geforce_p2p)\n"
+      "  --dpdk-port N               DPDK port ID override\n"
+      "  --dpdk-queue N              DPDK TX queue ID override\n"
+      "  --log-level LEVEL           log verbosity (trace|debug|info|warn|error)\n"
+      "\n"
       "Output & Logging:\n"
       "  --output MODE               auto|pretty|ndjson|quiet (default: auto = pretty on TTY, ndjson on pipe)\n"
       "  -q, --quiet                 alias for --output quiet\n"
@@ -346,6 +354,24 @@ ParseStatus ParseArgs(int argc, char** argv, CliOptions& out) {
       out.job.gpu_bar1_p2p = true;
     } else if (a == "--gpu-persistent") {
       out.job.gpu_persistent = true;
+    } else if (a == "--config") {
+      if (!NeedsValue(i, argc, "--config")) return ParseStatus::kError;
+      out.config_path = argv[++i];
+    } else if (a == "--iface") {
+      if (!NeedsValue(i, argc, "--iface")) return ParseStatus::kError;
+      out.iface = argv[++i];
+    } else if (a == "--transport") {
+      if (!NeedsValue(i, argc, "--transport")) return ParseStatus::kError;
+      out.transport = argv[++i];
+    } else if (a == "--dpdk-port") {
+      if (!NeedsValue(i, argc, "--dpdk-port")) return ParseStatus::kError;
+      out.dpdk_port = std::stoi(argv[++i]);
+    } else if (a == "--dpdk-queue") {
+      if (!NeedsValue(i, argc, "--dpdk-queue")) return ParseStatus::kError;
+      out.dpdk_queue = std::stoi(argv[++i]);
+    } else if (a == "--log-level") {
+      if (!NeedsValue(i, argc, "--log-level")) return ParseStatus::kError;
+      out.log_level = argv[++i];
     } else if (a == "-q" || a == "--quiet") {
       out.output_mode = samurai::orchestrator::OutputMode::kQuiet;
     } else if (a == "--output") {

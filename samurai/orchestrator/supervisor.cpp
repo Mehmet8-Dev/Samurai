@@ -31,6 +31,10 @@ struct WarmWorkerPool::Slot {
   samurai::wire::WorkerKind kind{samurai::wire::WorkerKind::CPU};
   std::string worker_binary;
   std::string worker_dir;
+  std::string iface;
+  std::string transport;
+  int dpdk_port = -1;
+  int dpdk_queue = -1;
   std::string jobs_endpoint;
   std::string events_endpoint;
   void* zmq_ctx = nullptr;
@@ -177,10 +181,38 @@ pid_t SpawnWorker(
     const std::string& worker_dir,
     const std::string& binary,
     const std::string& jobs_endpoint,
-    const std::string& events_endpoint) {
+    const std::string& events_endpoint,
+    const SupervisorConfig* opt_cfg = nullptr) {
   const std::string resolved = ResolveWorkerPath(worker_dir, binary);
   const pid_t pid = fork();
   if (pid == 0) {
+    if (opt_cfg) {
+      if (!opt_cfg->iface.empty()) {
+        ::setenv("SAMURAI_TELCO_IFACE", opt_cfg->iface.c_str(), 1);
+        ::setenv("SAMURAI_AFPACKET_IFACE", opt_cfg->iface.c_str(), 1);
+        ::setenv("SAMURAI_XDP_IFACE", opt_cfg->iface.c_str(), 1);
+        ::setenv("SAMURAI_GPU_DOCA_IFACE", opt_cfg->iface.c_str(), 1);
+      }
+      if (!opt_cfg->transport.empty()) {
+        ::setenv("SAMURAI_TELCO_TRANSPORT", opt_cfg->transport.c_str(), 1);
+        ::setenv("SAMURAI_L7_TRANSPORT", opt_cfg->transport.c_str(), 1);
+        if (opt_cfg->transport == "custom_tcp" || opt_cfg->transport == "kernel_socket" ||
+            opt_cfg->transport == "dpdk") {
+          ::setenv("SAMURAI_CUSTOM_TCP_MODE", opt_cfg->transport.c_str(), 1);
+        } else if (opt_cfg->transport == "geforce_p2p") {
+          ::setenv("SAMURAI_GPU_TX_BACKEND", "geforce_p2p", 1);
+        }
+      }
+      if (opt_cfg->dpdk_port >= 0) {
+        const std::string p = std::to_string(opt_cfg->dpdk_port);
+        ::setenv("SAMURAI_DPDK_PORT_ID", p.c_str(), 1);
+        ::setenv("SAMURAI_GEFORCE_P2P_DPDK_PORT", p.c_str(), 1);
+      }
+      if (opt_cfg->dpdk_queue >= 0) {
+        const std::string q = std::to_string(opt_cfg->dpdk_queue);
+        ::setenv("SAMURAI_DPDK_QUEUE_ID", q.c_str(), 1);
+      }
+    }
     if (!resolved.empty()) {
       execl(
           resolved.c_str(),
@@ -543,7 +575,9 @@ std::shared_ptr<WarmWorkerPool::Slot> WarmWorkerPool::AcquireSlot(
       std::lock_guard<std::mutex> lk(mu_);
       for (const auto& s : slots_) {
         if (!s->busy && !s->retire_on_release &&
-            s->kind == cfg.worker.kind && s->worker_dir == cfg.worker_dir) {
+            s->kind == cfg.worker.kind && s->worker_dir == cfg.worker_dir &&
+            s->iface == cfg.iface && s->transport == cfg.transport &&
+            s->dpdk_port == cfg.dpdk_port && s->dpdk_queue == cfg.dpdk_queue) {
           s->busy = true;
           s->active_shard_id = shard_id;
           {
@@ -588,6 +622,10 @@ std::shared_ptr<WarmWorkerPool::Slot> WarmWorkerPool::AcquireSlot(
   slot->kind = cfg.worker.kind;
   slot->worker_binary = cfg.worker.binary;
   slot->worker_dir = cfg.worker_dir;
+  slot->iface = cfg.iface;
+  slot->transport = cfg.transport;
+  slot->dpdk_port = cfg.dpdk_port;
+  slot->dpdk_queue = cfg.dpdk_queue;
   slot->busy = true;
   slot->active_shard_id = shard_id;
   const std::uint64_t seq = next_slot_seq_.fetch_add(1);
@@ -618,7 +656,7 @@ std::shared_ptr<WarmWorkerPool::Slot> WarmWorkerPool::AcquireSlot(
     return nullptr;
   }
 
-  slot->pid = SpawnWorker(slot->worker_dir, slot->worker_binary, slot->jobs_endpoint, slot->events_endpoint);
+  slot->pid = SpawnWorker(slot->worker_dir, slot->worker_binary, slot->jobs_endpoint, slot->events_endpoint, &cfg);
   if (slot->pid < 0) {
     std::fprintf(stderr, "orchestrator: fork failed\n");
     DestroySlot(slot, false, false);
@@ -776,7 +814,7 @@ int RunJob(const SupervisorConfig& cfg,
       return -1;
     }
 
-    oneshot_pid = SpawnWorker(cfg.worker_dir, cfg.worker.binary, cfg.jobs_endpoint, cfg.events_endpoint);
+    oneshot_pid = SpawnWorker(cfg.worker_dir, cfg.worker.binary, cfg.jobs_endpoint, cfg.events_endpoint, &cfg);
     if (oneshot_pid < 0) {
       std::fprintf(stderr, "orchestrator: fork failed\n");
       zmq_close(oneshot_events);

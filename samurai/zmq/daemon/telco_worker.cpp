@@ -1181,12 +1181,13 @@ void EmitTelcoSnapshotDelta(
     const std::string& job_id,
     uint64_t corr_id,
     uint64_t tx_packets_total,
+    uint64_t tx_errors_total,
     uint64_t rx_packets_total,
     uint64_t tx_bytes_total,
     uint64_t rx_bytes_total,
     uint64_t& last_reported_tx,
     uint64_t& last_reported_bytes,
-    uint64_t& last_reported_failed,
+    uint64_t& last_reported_tx_errors,
     uint32_t active_sessions,
     uint32_t established_sessions,
     uint32_t failed_sessions,
@@ -1201,16 +1202,16 @@ void EmitTelcoSnapshotDelta(
       tx_packets_total >= last_reported_tx ? (tx_packets_total - last_reported_tx) : 0;
   const uint64_t delta_bytes =
       tx_bytes_total >= last_reported_bytes ? (tx_bytes_total - last_reported_bytes) : 0;
-  const uint64_t delta_failed =
-      failed_sessions >= last_reported_failed ? (failed_sessions - last_reported_failed) : 0;
+  const uint64_t delta_tx_errors =
+      tx_errors_total >= last_reported_tx_errors ? (tx_errors_total - last_reported_tx_errors) : 0;
   last_reported_tx = tx_packets_total;
   last_reported_bytes = tx_bytes_total;
-  last_reported_failed = failed_sessions;
+  last_reported_tx_errors = tx_errors_total;
 
   MetricSnapshotV1 snap{};
   snap.timestamp_ns = samurai_pacing_monotonic_now_ns();
   snap.packets_sent = delta_tx;
-  snap.packets_errors = delta_failed;
+  snap.packets_errors = delta_tx_errors;
   snap.bytes_sent = delta_bytes;
   snap.actual_rps = actual_rps;
   snap.rate_accuracy_pct = rate_accuracy_pct;
@@ -1423,17 +1424,19 @@ int main(int argc, char** argv) {
     const std::uint64_t start_corr = frame.correlation_id;
     zmq_msg_close(&msg);
 
+    if (!packet_transport || !packet_transport->IsOpen()) {
+      SendFrame(events_sock, static_cast<std::uint8_t>(MessageType::ERROR),
+                start_corr, WorkerKind::TELCO, job_id,
+                JsonError("telco_transport_not_open: set --iface / SAMURAI_TELCO_IFACE or --transport dpdk|loopback"));
+      continue;
+    }
+
     if (spec.pin_cpu >= 0) {
       ApplyAffinity(spec.pin_cpu);
     }
 
     runtime.reset();
     runtime = std::make_unique<TelcoRuntime>(spec, tsc_hz, cups_shm_path);
-    for (uint32_t i = 0; i < spec.sub_count; ++i) {
-      if (TelcoSessionContext* ctx = runtime->session_mgr.GetSessionByIndex(i)) {
-        ctx->state = SessionState::ESTABLISHED;
-      }
-    }
 
     if (cups_gpu_sock && runtime->cups_controller.GetActiveSessions() > 0) {
       std::vector<uint8_t> upsert_payload = runtime->cups_controller.BuildZmqUpsertPayload(
@@ -1467,12 +1470,13 @@ int main(int argc, char** argv) {
         spec.duration_ms > 0 ? static_cast<std::uint64_t>(spec.duration_ms) * 1000000ULL : 0ULL;
 
     uint64_t tx_packets_total = 0;
+    uint64_t tx_errors_total = 0;
     uint64_t rx_packets_total = 0;
     uint64_t tx_bytes_total = 0;
     uint64_t rx_bytes_total = 0;
     uint64_t last_reported_tx = 0;
     uint64_t last_reported_bytes = 0;
-    uint64_t last_reported_failed = 0;
+    uint64_t last_reported_tx_errors = 0;
     uint32_t active_sub_cursor = 0;
     uint64_t last_snapshot_ns = job_start_ns;
     LatencyRing latency_ring;
@@ -1549,50 +1553,31 @@ int main(int argc, char** argv) {
         batch_limit = static_cast<uint32_t>(std::min<uint64_t>(batch_limit, rem));
       }
 
-      const auto t_gen0 = std::chrono::steady_clock::now();
       tx_packets_batch.clear();
       runtime->active_driver->GenerateTraffic(
           runtime->session_mgr, active_sub_cursor, batch_limit, tx_packets_batch);
-      const auto t_gen1 = std::chrono::steady_clock::now();
-      const uint32_t gen_us = static_cast<uint32_t>(std::max<long long>(
-          1, std::chrono::duration_cast<std::chrono::microseconds>(t_gen1 - t_gen0).count()));
-      latency_ring.RecordUs(gen_us);
 
-      if (packet_transport && packet_transport->IsOpen()) {
-        std::vector<const uint8_t*> ptrs;
-        std::vector<uint16_t> lens;
-        ptrs.reserve(tx_packets_batch.size());
-        lens.reserve(tx_packets_batch.size());
-        for (const auto& pkt : tx_packets_batch) {
-          if (pkt.empty() || pkt.size() > 65535u) continue;
-          ptrs.push_back(pkt.data());
-          lens.push_back(static_cast<uint16_t>(pkt.size()));
-        }
-        const size_t sent = packet_transport->TransmitBurst(ptrs.data(), lens.data(), ptrs.size());
-        for (size_t i = 0; i < sent; ++i) {
-          ++tx_packets_total;
-          tx_bytes_total += lens[i];
-          if (telemetry.Enabled()) {
-            const uint32_t sidx = (active_sub_cursor + static_cast<uint32_t>(i)) % spec.sub_count;
-            if (TelcoSessionContext* c = runtime->session_mgr.GetSessionByIndex(sidx)) {
-              telemetry.RecordPacketHost(c->client_ip, c->peer_ip, c->client_port, c->peer_port,
-                                         c->ip_proto, lens[i], 0x10u, c->s_vlan, now_ns);
-            }
-          }
-        }
-      } else {
-        for (size_t i = 0; i < tx_packets_batch.size(); ++i) {
-          const auto& pkt = tx_packets_batch[i];
-          if (pkt.empty()) continue;
-          ++tx_packets_total;
-          tx_bytes_total += pkt.size();
-          if (telemetry.Enabled()) {
-            const uint32_t sidx = (active_sub_cursor + static_cast<uint32_t>(i)) % spec.sub_count;
-            if (TelcoSessionContext* c = runtime->session_mgr.GetSessionByIndex(sidx)) {
-              telemetry.RecordPacketHost(c->client_ip, c->peer_ip, c->client_port, c->peer_port,
-                                         c->ip_proto, static_cast<uint32_t>(pkt.size()),
-                                         0x10u, c->s_vlan, now_ns);
-            }
+      std::vector<const uint8_t*> ptrs;
+      std::vector<uint16_t> lens;
+      ptrs.reserve(tx_packets_batch.size());
+      lens.reserve(tx_packets_batch.size());
+      for (const auto& pkt : tx_packets_batch) {
+        if (pkt.empty() || pkt.size() > 65535u) continue;
+        ptrs.push_back(pkt.data());
+        lens.push_back(static_cast<uint16_t>(pkt.size()));
+      }
+      const size_t sent = packet_transport->TransmitBurst(ptrs.data(), lens.data(), ptrs.size());
+      if (ptrs.size() > sent) {
+        tx_errors_total += (ptrs.size() - sent);
+      }
+      for (size_t i = 0; i < sent; ++i) {
+        ++tx_packets_total;
+        tx_bytes_total += lens[i];
+        if (telemetry.Enabled()) {
+          const uint32_t sidx = (active_sub_cursor + static_cast<uint32_t>(i)) % spec.sub_count;
+          if (TelcoSessionContext* c = runtime->session_mgr.GetSessionByIndex(sidx)) {
+            telemetry.RecordPacketHost(c->client_ip, c->peer_ip, c->client_port, c->peer_port,
+                                       c->ip_proto, lens[i], 0x10u, c->s_vlan, now_ns);
           }
         }
       }
@@ -1614,8 +1599,8 @@ int main(int argc, char** argv) {
 
         EmitTelcoSnapshotDelta(
             events_sock, job_id, start_corr,
-            tx_packets_total, rx_packets_total, tx_bytes_total, rx_bytes_total,
-            last_reported_tx, last_reported_bytes, last_reported_failed,
+            tx_packets_total, tx_errors_total, rx_packets_total, tx_bytes_total, rx_bytes_total,
+            last_reported_tx, last_reported_bytes, last_reported_tx_errors,
             sess.active_sessions, sess.established_sessions, sess.failed_sessions,
             spec.rate_cps, actual_rps, acc,
             avg_us, p99_us,
@@ -1678,8 +1663,8 @@ int main(int argc, char** argv) {
 
     EmitTelcoSnapshotDelta(
         events_sock, job_id, start_corr,
-        tx_packets_total, rx_packets_total, tx_bytes_total, rx_bytes_total,
-        last_reported_tx, last_reported_bytes, last_reported_failed,
+        tx_packets_total, tx_errors_total, rx_packets_total, tx_bytes_total, rx_bytes_total,
+        last_reported_tx, last_reported_bytes, last_reported_tx_errors,
         final_sess.active_sessions, final_sess.established_sessions, final_sess.failed_sessions,
         spec.rate_cps, final_actual_rps, final_acc,
         final_avg_us, final_p99_us,

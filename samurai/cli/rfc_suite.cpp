@@ -26,12 +26,11 @@ Rfc2544Result RfcSuiteEngine::Run2544BinarySearchMeasured(
       trial.iteration = iter;
       if (trial.rate_rps <= 0.0) trial.rate_rps = mid_rps;
     } else {
-      const double loss_pct = (mid_rps > 800000.0) ? ((mid_rps - 800000.0) / 10000.0) : 0.0;
       trial.iteration = iter;
       trial.rate_rps = mid_rps;
-      trial.sent_packets = static_cast<uint64_t>(mid_rps * cfg.trial_duration_s);
-      trial.loss_pct = loss_pct;
-      trial.received_packets = static_cast<uint64_t>(trial.sent_packets * (1.0 - (loss_pct / 100.0)));
+      trial.sent_packets = 0;
+      trial.received_packets = 0;
+      trial.loss_pct = 100.0;
     }
     trial.passed = (trial.loss_pct <= cfg.tolerance_loss_pct) && (trial.sent_packets > 0);
     res.trials.push_back(trial);
@@ -54,13 +53,14 @@ Rfc2544Result RfcSuiteEngine::Run2544BinarySearchMeasured(
 Rfc2544Result RfcSuiteEngine::Run2544BinarySearch(
     const Rfc2544Config& cfg,
     std::function<double(double trial_rps)> trial_runner) {
+  if (!trial_runner) {
+    return Run2544BinarySearchMeasured(cfg, {});
+  }
   return Run2544BinarySearchMeasured(
       cfg,
       [cfg, trial_runner](double mid_rps) -> Rfc2544Trial {
         Rfc2544Trial trial;
-        const double loss_pct = trial_runner
-            ? trial_runner(mid_rps)
-            : ((mid_rps > 800000.0) ? ((mid_rps - 800000.0) / 10000.0) : 0.0);
+        const double loss_pct = trial_runner(mid_rps);
         trial.rate_rps = mid_rps;
         trial.sent_packets = static_cast<uint64_t>(mid_rps * cfg.trial_duration_s);
         trial.loss_pct = loss_pct;
@@ -83,10 +83,10 @@ Rfc3511Result RfcSuiteEngine::Run3511BenchmarkMeasured(
     res.passed = sample.ok && (res.max_cps >= (cfg.target_cps * 0.9)) &&
                  (cfg.latency_cap_ms <= 0.0 || res.p99_latency_ms <= cfg.latency_cap_ms);
   } else {
-    res.max_cps = cfg.target_cps;
-    res.max_concurrent_connections = cfg.max_concurrency;
-    res.p99_latency_ms = 0.0;  // Dry-run: no dataplane latency measured
-    res.passed = (res.max_cps >= (cfg.target_cps * 0.9));
+    res.max_cps = 0.0;
+    res.max_concurrent_connections = 0;
+    res.p99_latency_ms = 0.0;
+    res.passed = false;
   }
   return res;
 }
@@ -120,9 +120,9 @@ Rfc8219Result RfcSuiteEngine::Run8219BenchmarkMeasured(
     res.passed = sample.ok && (res.inspection_pass_rate_pct >= 99.0) &&
                  (res.ipv6_zero_loss_gbps > 0.0);
   } else {
-    res.inspection_pass_rate_pct = 100.0;
-    res.ipv6_zero_loss_gbps = cfg.target_gbps;
-    res.passed = true;
+    res.inspection_pass_rate_pct = 0.0;
+    res.ipv6_zero_loss_gbps = 0.0;
+    res.passed = false;
   }
   return res;
 }

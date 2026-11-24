@@ -626,7 +626,7 @@ struct NativeResult {
   int packets_sent{0};
   int packets_errors{0};
   bool transmitted_on_wire{false};
-  std::string tx_note{"simulated:dry_run"};
+  std::string tx_note;
 };
 
 bool RunGpuNativeBatch(
@@ -770,11 +770,8 @@ bool RunGpuNativeBatch(
       err = "bar1_p2p_tx_bar1_batch_symbol_missing";
       return false;
     }
-    out.packets_sent = 0;
-    out.packets_errors = 0;
-    out.transmitted_on_wire = false;
-    out.tx_note = "gpu_native_capi+bar1_p2p_zero_copy:dry_run";
-    return true;
+    err = "tx_disabled_dry_run_removed";
+    return false;
   }
 
   if (tx_enabled) {
@@ -832,10 +829,8 @@ bool RunGpuNativeBatch(
       out.tx_note = "gpu_native_capi+afpacket:l3";
     }
   } else {
-    out.packets_sent = batch_count;
-    out.packets_errors = 0;
-    out.transmitted_on_wire = false;
-    out.tx_note = "gpu_native_capi:dry_run";
+    err = "tx_disabled_dry_run_removed";
+    return false;
   }
 
   return true;

@@ -249,38 +249,10 @@ int main(int argc, char** argv) {
               }
             }
           } else {
-            done_note = "simulated:dry_run";
-            for (int i = 0; i < packet_count; ++i) {
-              // Check stop_flag / live reconfigure every iteration for <5ms latency.
-              if (stop_flag.load(std::memory_order_relaxed)) {
-                done_note = "aborted";
-                break;
-              }
-              if (__builtin_expect(reconf_pending.load(std::memory_order_acquire), 0)) {
-                std::lock_guard<std::mutex> lk(reconf_mu);
-                (void)samurai::daemon::ApplyReconfigureWindow(
-                    reinterpret_cast<const std::uint8_t*>(&pending_reconf),
-                    sizeof(pending_reconf), pace_cfg, pace_state);
-                reconf_pending.store(false, std::memory_order_release);
-              }
-              samurai_pacing_wait_next(&pace_state, &pace_cfg);
-              const std::size_t off = static_cast<std::size_t>(i) * stride;
-              if (off + stride > pool.size()) {
-                packets_errors += 1u;
-                continue;
-              }
-              packets_sent += 1u;
-              bytes_sent += static_cast<std::uint64_t>(stride);
-              if (__builtin_expect(telemetry.Enabled(), 0)) {
-                const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
-                telemetry.RecordPacketNet(
-                    src_ip_be, dst_ip_be, htons(static_cast<std::uint16_t>(1024 + (i & 0x3FF))),
-                    dst_port_be, flow_proto, static_cast<std::uint32_t>(stride), flow_tcp_flags, 0, now_ns);
-                if ((i & 0xFF) == 0) {
-                  telemetry.TickExport(now_ns);
-                }
-              }
-            }
+            packets_errors = static_cast<std::uint64_t>(packet_count);
+            tx_rc = -1;
+            tx_err_msg = "afpacket_tx_disabled_dry_run_removed";
+            done_note = "error";
           }
           worker_done.store(true, std::memory_order_release);
         });

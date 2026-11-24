@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "args.hpp"
+#include "config_loader.hpp"
 #include "kpi_gate.hpp"
 #include "options.hpp"
 #include "profiles.hpp"
@@ -174,6 +175,16 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // Load samurai.conf (with overwrite=0 so user env vars always win over file).
+  const auto cfg_res = cli::LoadConfigFile(opt.config_path);
+  if (cfg_res.error) {
+    std::fprintf(stderr, "samurai: %s\n", cfg_res.error_msg.c_str());
+    return 2;
+  }
+  if (!opt.log_level.empty()) {
+    ::setenv("SAMURAI_LOG_LEVEL", opt.log_level.c_str(), 1);
+  }
+
   const bool is_rfc_run = !opt.run_rfc_suite.empty();
   if (is_rfc_run) {
     if (opt.worker_name.empty()) {
@@ -213,6 +224,10 @@ int main(int argc, char** argv) {
         sup_cfg.jobs_endpoint = "ipc:///tmp/samurai_jobs_rfc_" + suffix;
         sup_cfg.events_endpoint = "ipc:///tmp/samurai_events_rfc_" + suffix;
         sup_cfg.recv_timeout_ms = opt.timeout_ms;
+        sup_cfg.iface = opt.iface;
+        sup_cfg.transport = opt.transport;
+        sup_cfg.dpdk_port = opt.dpdk_port;
+        sup_cfg.dpdk_queue = opt.dpdk_queue;
 
         trial_runner = [sup_cfg, opt, c2544, &rfc_pool](double trial_rps) -> cli::Rfc2544Trial {
           orchestrator::JobOptions job = opt.job;
@@ -319,6 +334,10 @@ int main(int argc, char** argv) {
   cfg.events_endpoint = "ipc:///tmp/samurai_events_" + suffix;
   cfg.recv_timeout_ms = opt.timeout_ms;
   cfg.output_mode = opt.output_mode;
+  cfg.iface = opt.iface;
+  cfg.transport = opt.transport;
+  cfg.dpdk_port = opt.dpdk_port;
+  cfg.dpdk_queue = opt.dpdk_queue;
 
   orchestrator::RunStats stats;
   int run_status = orchestrator::RunJob(cfg, opt.job, stats);

@@ -1,0 +1,100 @@
+# ==============================================================================
+# DDoSamurai Production & Performance Tuning Configuration (samurai.conf)
+# ==============================================================================
+# Precedence (highest -> lowest):
+#   1. CLI flags        (--iface, --transport, --dpdk-port, --log-level, ...)
+#   2. Env variables    (SAMURAI_*)
+#   3. This config file (--config PATH | $SAMURAI_CONFIG | ./samurai.conf |
+#                        ~/.config/samurai/samurai.conf | /etc/samurai/samurai.conf)
+#   4. Compiled defaults
+# ==============================================================================
+
+[general]
+# Log verbosity: trace | debug | info | warn | error
+log_level = info
+# Keep warm worker processes across sequential jobs/windows (1 = enabled, 0 = disabled)
+warm_workers = 1
+# Wire protocol ABI: v1 | v3
+wire_abi = v1
+
+[pacing]
+# Use hardware RDTSC for sub-microsecond pacing instead of clock_gettime (1 | 0)
+use_tsc = 1
+
+[af_packet]
+# Default L2 interface for AF_PACKET TX_RING (override per-run with --iface)
+# iface = eth0
+# TPACKET_V3 ring geometry (align block_size_kb to hugepage/L2 cache boundaries)
+block_size_kb = 1024
+frames_per_block = 256
+frame_size = 2048
+ring_target_mb = 64
+# Pin ring pages in RAM and prefault before TX start to eliminate minor page faults
+mlock_ring = 1
+prefault_ring = 1
+# Bypass kernel qdisc (tc/fq_codel) for direct NIC driver enqueue
+qdisc_bypass = 1
+# Hugepage policy for ring allocation: auto | always | never
+hugepage_mode = auto
+hugepage_size_kb = 2048
+# Busy-poll & adaptive flush tuning
+busy_poll_us = 50
+poll_timeout_ms = 1
+spin_limit = 64
+txring_adaptive = 1
+txring_flush_mode = adaptive
+
+[dpdk]
+# EAL arguments (pin isolated cores & set memory channels, e.g. "-l 2-5 -n 4")
+# eal_args = -l 2-5 -n 4
+port_id = 0
+queue_id = 0
+tx_queues = 1
+base_core = 2
+gpu_p2p = 0
+
+[telco]
+# Default Telco NIC / transport (override with --iface / --transport)
+# iface = eth0
+# transport = af_packet   # af_packet | dpdk | dpdk_direct | loopback
+
+[custom_tcp]
+# L7 userspace TCP stack mode: auto | custom_tcp | kernel_socket | dpdk
+mode = auto
+connect_timeout_ms = 2000
+idle_timeout_ms = 5000
+initial_rto_ms = 250
+max_retransmits = 3
+busy_poll = 1
+drain_ms = 50
+
+[gpu_p2p]
+# Consumer/Enterprise BAR1 P2P DMA settings
+# tx_backend = geforce_p2p
+bar1_p2p = 0
+geforce_p2p = 0
+# gpu_bdf = 0000:01:00.0
+# nic_bdf = 0000:03:00.0
+dpdk_port = 0
+
+[doca]
+# NVIDIA BlueField DPU / DOCA GPUNetIO tuning
+enable = 0
+task_slots = 4096
+progress_loops = 64
+
+[telemetry]
+# IPFIX / NetFlow v9 defaults (can also be enabled via --ipfix-enabled)
+ipfix_enabled = 0
+ipfix_collector = 127.0.0.1
+ipfix_port = 4739
+ipfix_sample_rate = 1000
+ipfix_domain_id = 1
+ipfix_export_interval_ms = 1000
+ipfix_flow_capacity = 65536
+ipfix_netflow_v9 = 0
+
+[cluster]
+# Distributed master/slave settings
+# secret = change-me-in-production
+rl_policy = mahoraga

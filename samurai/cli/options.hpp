@@ -35,6 +35,13 @@ struct CliOptions {
   std::vector<std::string> deny_targets;   // --deny-target IP|CIDR (repeatable)
   bool confirm = false;                    // --confirm: confirm live dataplane execution
   bool vector_explicit = false;            // internal: true when --vector was explicitly supplied
+  // Dataplane, transport & config overrides (CLI > env > samurai.conf > default)
+  std::string config_path;                // --config PATH
+  std::string iface;                      // --iface NAME
+  std::string transport;                  // --transport MODE
+  int dpdk_port = -1;                     // --dpdk-port N
+  int dpdk_queue = -1;                    // --dpdk-queue N
+  std::string log_level;                  // --log-level LEVEL
   // Telecom rate and protocol controls
   uint32_t sctp_rate = 0;                  // --sctp-rate N
   uint32_t diameter_rate = 0;              // --diameter-rate N / --diameter-ccr-rate N

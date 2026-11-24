@@ -721,51 +721,15 @@ int main(int argc, char** argv) {
             bytes_sent = tx.bytes_sent;
             scenario_backend += "+" + tx.note;  // surface the af_packet path taken
           } else {
-            samurai::daemon::ControlPollState ctrl{};
-            for (int i = 0; i < packet_count; ++i) {
-              samurai::daemon::PollControlNonBlocking(
-                  pull, push, samurai::wire::WorkerKind::SCENARIO, &telemetry, ctrl);
-              if (ctrl.shutdown) running = false;
-              if (ctrl.stop_job) break;
-              if (ctrl.reconfigure) {
-                (void)samurai::daemon::ApplyReconfigureWindow(
-                    reinterpret_cast<const std::uint8_t*>(&ctrl.reconf),
-                    sizeof(ctrl.reconf), pace_cfg, pace_state);
-                ctrl.reconfigure = false;
-              }
-              samurai_pacing_wait_next(&pace_state, &pace_cfg);
-              const std::size_t off = static_cast<std::size_t>(i) * stride;
-              if (off + stride > pool.size()) {
-                packets_errors += 1u;
-              } else {
-                packets_sent += 1u;
-                bytes_sent += static_cast<std::uint64_t>(stride);
-              }
-
-              const std::uint64_t now_ns = samurai_pacing_monotonic_now_ns();
-              if (now_ns - last_hb_ns >= 1'000'000'000ull) {
-                (void)SendFrame(
-                    push,
-                    static_cast<std::uint8_t>(samurai::wire::MessageType::HEARTBEAT),
-                    header.correlation_id,
-                    samurai::wire::WorkerKind::SCENARIO,
-                    job_id);
-                last_hb_ns = now_ns;
-              }
-              if (now_ns - last_metric_ns >= 2'000'000'000ull) {
-                const samurai::wire::MetricSnapshotV1 snap =
-                    BuildSnapshot(now_ns, start_ns, packets_sent, packets_errors, bytes_sent, pace_cfg, pace_state);
-                (void)SendFrame(
-                    push,
-                    static_cast<std::uint8_t>(samurai::wire::MessageType::METRIC_SNAPSHOT),
-                    header.correlation_id,
-                    samurai::wire::WorkerKind::SCENARIO,
-                    job_id,
-                    SerializeSnapshot(snap));
-                last_metric_ns = now_ns;
-                last_hb_ns = now_ns;
-              }
-            }
+            telemetry.FlushEnd(samurai_pacing_monotonic_now_ns());
+            (void)SendFrame(
+                push,
+                static_cast<std::uint8_t>(samurai::wire::MessageType::ERROR),
+                header.correlation_id,
+                samurai::wire::WorkerKind::SCENARIO,
+                job_id,
+                JsonError("afpacket_tx_disabled_dry_run_removed"));
+            continue;
           }
         }
         (void)l7_rps;

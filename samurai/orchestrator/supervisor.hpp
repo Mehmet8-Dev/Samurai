@@ -46,6 +46,10 @@ struct SupervisorConfig {
   int max_idle_recvs = 24;            // give up after this many empty recvs
   bool use_wire_v3 = EnvWireV3Enabled();  // SAMURAI_WIRE_ABI=v3 uses aligned V3 frames
   OutputMode output_mode = OutputMode::kAuto;
+  std::string iface;                  // CLI --iface override
+  std::string transport;              // CLI --transport override
+  int dpdk_port = -1;                 // CLI --dpdk-port override
+  int dpdk_queue = -1;                // CLI --dpdk-queue override
 };
 
 // Maintains warm persistent worker processes across sequential jobs/windows so
