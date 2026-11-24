@@ -725,8 +725,9 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
     return MakeToolError("Unsupported worker: " + worker);
   }
 
-  const std::string target = args.find("target") ? args.find("target")->as_string("127.0.0.1") : "127.0.0.1";
-  const auto target_check = ValidateMcpTarget(target, safety);
+  const std::string raw_target = args.find("target") ? args.find("target")->as_string("127.0.0.1") : "127.0.0.1";
+  std::string target;
+  const auto target_check = ResolveMcpTarget(raw_target, safety, target);
   if (!target_check.ok) {
     return MakeToolError("Target blocked by fail-closed MCP safety gate: " + target_check.reason);
   }
@@ -824,9 +825,15 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
     cmd.push_back(std::to_string(rps));
   }
 
-  // Core / vector / CPU pinning
+  // Core / vector / CPU pinning / dataplane transport & config
   push_str("vector", "--vector");
   push_nonneg_int("pin_cpu", "--pin-cpu");
+  push_str("config", "--config");
+  push_str("iface", "--iface");
+  push_str("transport", "--transport");
+  push_nonneg_int("dpdk_port", "--dpdk-port");
+  push_nonneg_int("dpdk_queue", "--dpdk-queue");
+  push_str("log_level", "--log-level");
 
   // L7 / TLS / HTTP2 / QUIC controls
   push_str("l7_protocol", "--l7-protocol");
@@ -867,9 +874,10 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
 
   // Live IPFIX / NetFlow v9/v10 telemetry export (collector validated fail-closed)
   if (const Value* ipfix = args.find("ipfix_enabled"); ipfix && ipfix->as_bool(false)) {
-    const std::string collector =
+    const std::string raw_collector =
         args.find("ipfix_collector") ? args.find("ipfix_collector")->as_string("127.0.0.1") : "127.0.0.1";
-    const auto cchk = ValidateMcpTarget(collector, safety);
+    std::string collector;
+    const auto cchk = ResolveMcpTarget(raw_collector, safety, collector);
     if (!cchk.ok) {
       ::unlink(report_path.c_str());
       return MakeToolError("ipfix_collector blocked by fail-closed MCP safety gate: " + cchk.reason);
@@ -938,12 +946,13 @@ ToolResult HandleRunRfcSuite(const Value& args, const SafetyConfig& safety) {
 
   std::vector<std::string> cmd = {bin, "--run-rfc-suite", suite};
   if (const Value* tgt = args.find("target"); tgt && tgt->is_string() && !tgt->as_string().empty()) {
-    const auto chk = ValidateMcpTarget(tgt->as_string(), safety);
+    std::string resolved_tgt;
+    const auto chk = ResolveMcpTarget(tgt->as_string(), safety, resolved_tgt);
     if (!chk.ok) {
       return MakeToolError("Target blocked by fail-closed MCP safety gate: " + chk.reason);
     }
     cmd.push_back("--target");
-    cmd.push_back(tgt->as_string());
+    cmd.push_back(resolved_tgt);
     if (const Value* live = args.find("live_dataplane"); live && live->as_bool(false)) {
       cmd.push_back("--confirm");
     }
@@ -1018,8 +1027,9 @@ ToolResult HandleBenchL7Userspace(const Value& args) {
 }
 
 ToolResult HandleClusterStatus(const Value& args, const SafetyConfig& safety) {
-  const std::string host = args.find("host") ? args.find("host")->as_string("127.0.0.1") : "127.0.0.1";
-  const auto chk = ValidateMcpTarget(host, safety);
+  const std::string raw_host = args.find("host") ? args.find("host")->as_string("127.0.0.1") : "127.0.0.1";
+  std::string host;
+  const auto chk = ResolveMcpTarget(raw_host, safety, host);
   if (!chk.ok) {
     return MakeToolError("Cluster host blocked by fail-closed MCP safety gate: " + chk.reason);
   }

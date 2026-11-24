@@ -97,4 +97,20 @@ sudo ./build/cli/samurai \
   --pin-cpu 4 \
   --target 10.0.0.10 \
   --confirm
+
+# 4. Dağıtık Master/Slave + Scenario JSON + Mahoraga RL² çalıştırma:
+./build/control/daemon/samurai_master \
+  --worker scenario \
+  --l7-profile-file my-api-scenario.json \
+  --target 127.0.0.1 --port 8080 --count 5000 \
+  --closed-loop --cl-strategy rl --rl-policy mahoraga-rl2.srlp
 ```
+
+---
+
+## 5. Mahoraga RL Ağırlıkları, Dağıtık Senaryo ve MCP Eşitlemesi
+
+* **Paketli `.srlp` Politikaları:** Kanonik Mahoraga ağırlıkları (`artifacts/rl/mahoraga-*.srlp` ve Docker imajında `/usr/local/share/samurai/rl/`) otomatik çözümlenir (`ResolveRlPolicyPath`: önce verilen yol, sonra `$SAMURAI_RL_POLICY_DIR`, `./artifacts/rl/`, ikili dizini göreli `artifacts/rl/` ve `/usr/local/share/samurai/rl/`).
+* **Dağıtık Scenario JSON Aktarımı:** `samurai_master` (`--l7-profile-file` / `--l7-profile-json`) ve MCP `samurai_cluster_run_job` (`scenario` / `scenario_file`) senaryo JSON içeriğini doğrudan ZMQ shard argümanlarıyla `samurai_slave` düğümlerine taşır; slave kendi geçici dosyasını oluşturup `samurai_scenario_worker`'a verir ve shard bitince temizler.
+* **MCP Araç Eşitlemesi:** `samurai_run_benchmark`, `samurai_scenario_run`, `samurai_autopilot_run_window` ve `samurai_cluster_run_job` artık `iface`, `transport`, `config`, `dpdk_port`, `dpdk_queue`, `scenario` ve `host.docker.internal` IPv4 çözümlemesini doğrudan destekler.
+

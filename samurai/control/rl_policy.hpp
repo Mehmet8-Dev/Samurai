@@ -76,6 +76,12 @@ struct RlStateInputs {
 // EWMA smoothing for ban_pressure — MUST match RLConfig.ban_ewma_alpha (Python).
 inline constexpr double kBanEwmaAlpha = 0.5;
 
+// Resolve an SRLP weight path (or bare filename such as "mahoraga-rl2.srlp")
+// across direct path, $SAMURAI_RL_POLICY_DIR, ./artifacts/rl/, exe-relative
+// artifacts/rl/, and /usr/local/share/samurai/rl/. Empty input resolves the
+// default Mahoraga RL^2 policy if present on disk.
+std::string ResolveRlPolicyPath(const std::string& requested_path);
+
 class RlPolicy {
  public:
   RlPolicy() = default;

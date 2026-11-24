@@ -56,7 +56,9 @@ RUN cmake -S samurai -B build -DCMAKE_BUILD_TYPE=Release -DSAMURAI_NATIVE_ARCH=$
       samurai_telco_worker \
       test_100k_tcp_flows \
       test_1m_tcp_flows \
-      bench_l7_stateful_userspace
+      bench_l7_stateful_userspace \
+ && mkdir -p /opt/samurai_rl \
+ && find /src/artifacts/rl -maxdepth 1 -name '*.srlp' ! -name '*.bak.srlp' ! -name '*.prev.srlp' -exec cp {} /opt/samurai_rl/ \;
 
 # ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -102,6 +104,7 @@ COPY --from=build /src/build/l4/test_100k_tcp_flows               /usr/local/bin
 COPY --from=build /src/build/l4/test_1m_tcp_flows                 /usr/local/bin/samurai_bench_1m_tcp
 COPY --from=build /src/build/zmq/bench_l7_stateful_userspace      /usr/local/bin/samurai_bench_l7
 COPY --from=build /src/skills                                     /usr/local/share/samurai/skills
+COPY --from=build /opt/samurai_rl                                 /usr/local/share/samurai/rl
 
 USER 10001:10001
 WORKDIR /home/samurai

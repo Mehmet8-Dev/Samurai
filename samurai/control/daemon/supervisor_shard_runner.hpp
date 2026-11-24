@@ -26,7 +26,8 @@ class SupervisorShardRun : public samurai::control::ShardRun {
   SupervisorShardRun(samurai::orchestrator::SupervisorConfig cfg,
                      samurai::orchestrator::JobOptions job,
                      std::shared_ptr<samurai::orchestrator::WarmWorkerPool> pool = nullptr,
-                     std::string shard_id = "");
+                     std::string shard_id = "",
+                     std::string temp_scenario_path = "");
   ~SupervisorShardRun() override;
 
   bool IsAlive() override { return !done_.load(); }
@@ -55,6 +56,7 @@ class SupervisorShardRun : public samurai::control::ShardRun {
   int exit_code_ = 0;
   std::atomic<bool> done_{false};
   std::atomic<bool> terminated_{false};
+  std::string temp_scenario_path_;
   std::thread thread_;
 };
 

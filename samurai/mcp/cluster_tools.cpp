@@ -18,7 +18,9 @@
 #include <thread>
 
 #include "autoscale.hpp"
+#include "rl_policy.hpp"
 #include "runtime_tools.hpp"
+#include "scenario_tools.hpp"
 #include "shard.hpp"
 
 namespace samurai::mcp {
@@ -227,8 +229,9 @@ ClusterManager::~ClusterManager() {
 }
 
 ToolResult ClusterManager::HandleDiscover(const Value& args, const SafetyConfig& safety) const {
-  const std::string host = OptStr(args, "host", "127.0.0.1");
-  const auto chk = ValidateMcpTarget(host, safety);
+  const std::string raw_host = OptStr(args, "host", "127.0.0.1");
+  std::string host;
+  const auto chk = ResolveMcpTarget(raw_host, safety, host);
   if (!chk.ok) {
     return MakeToolError("Cluster host blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -257,8 +260,9 @@ ToolResult ClusterManager::HandleDiscover(const Value& args, const SafetyConfig&
 }
 
 ToolResult ClusterManager::HandleProvisionNode(const Value& args, const SafetyConfig& safety) const {
-  const std::string master_host = OptStr(args, "host", "127.0.0.1");
-  const auto mchk = ValidateMcpTarget(master_host, safety);
+  const std::string raw_master = OptStr(args, "host", "127.0.0.1");
+  std::string master_host;
+  const auto mchk = ResolveMcpTarget(raw_master, safety, master_host);
   if (!mchk.ok) {
     return MakeToolError("Master host blocked by fail-closed MCP safety gate: " + mchk.reason);
   }
@@ -307,8 +311,9 @@ ToolResult ClusterManager::HandleProvisionNode(const Value& args, const SafetyCo
 }
 
 ToolResult ClusterManager::HandleReconfigure(const Value& args, const SafetyConfig& safety) const {
-  const std::string host = OptStr(args, "host", "127.0.0.1");
-  const auto chk = ValidateMcpTarget(host, safety);
+  const std::string raw_host = OptStr(args, "host", "127.0.0.1");
+  std::string host;
+  const auto chk = ResolveMcpTarget(raw_host, safety, host);
   if (!chk.ok) {
     return MakeToolError("Master host blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -342,8 +347,9 @@ ToolResult ClusterManager::HandleReconfigure(const Value& args, const SafetyConf
 }
 
 ToolResult ClusterManager::HandleAbort(const Value& args, const SafetyConfig& safety) const {
-  const std::string host = OptStr(args, "host", "127.0.0.1");
-  const auto chk = ValidateMcpTarget(host, safety);
+  const std::string raw_host = OptStr(args, "host", "127.0.0.1");
+  std::string host;
+  const auto chk = ResolveMcpTarget(raw_host, safety, host);
   if (!chk.ok) {
     return MakeToolError("Master host blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -660,13 +666,28 @@ ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
     return MakeToolError("samurai_master binary not found. Build via CMake first.");
   }
 
-  const std::string worker = LowerCopy(OptStr(args, "worker", "cpu"));
+  const bool has_scenario_input =
+      args.find("scenario") != nullptr ||
+      !OptStr(args, "scenario_file", "").empty() ||
+      !OptStr(args, "l7_profile_file", "").empty();
+
+  const std::string worker = LowerCopy(OptStr(args, "worker", has_scenario_input ? "scenario" : "cpu"));
   if (!IsAllowedWorker(worker)) {
     return MakeToolError("Unsupported worker: " + worker);
   }
 
-  const std::string target = OptStr(args, "target", "127.0.0.1");
-  const auto chk = ValidateMcpTarget(target, safety);
+  std::string scenario_json;
+  std::string scenario_src_path;
+  if (has_scenario_input) {
+    const std::string serr = LoadAndValidateScenarioJson(args, scenario_json, scenario_src_path);
+    if (!serr.empty()) {
+      return MakeToolError(serr);
+    }
+  }
+
+  const std::string raw_target = OptStr(args, "target", "127.0.0.1");
+  std::string target;
+  const auto chk = ResolveMcpTarget(raw_target, safety, target);
   if (!chk.ok) {
     return MakeToolError("Target blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -765,6 +786,25 @@ ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
     }
   };
 
+  // Distributed Scenario / L7 / dataplane transport controls
+  if (!scenario_json.empty()) {
+    cmd.push_back("--l7-profile-json");
+    cmd.push_back(scenario_json);
+  }
+  if (!scenario_src_path.empty()) {
+    cmd.push_back("--l7-profile-file");
+    cmd.push_back(scenario_src_path);
+  }
+  push_str("iface", "--iface");
+  push_str("transport", "--transport");
+  push_pos_int("concurrency", "--concurrency");
+  push_pos_int("max_connections", "--max-connections");
+  push_pos_int("l7_timeout_ms", "--l7-timeout-ms");
+  push_str("scheme", "--scheme");
+  push_str("host_header", "--host-header");
+  if (OptBool(args, "keepalive", false)) cmd.push_back("--keepalive");
+  if (OptBool(args, "verify_tls", false)) cmd.push_back("--verify-tls");
+
   // Distributed 4G/5G Telecom workload options
   push_pos_int("telco_subscribers", "--telco-subscribers");
   push_pos_int("telco_cps", "--telco-cps");
@@ -786,8 +826,9 @@ ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
 
   // Distributed Live IPFIX / NetFlow export
   if (OptBool(args, "ipfix_enabled", false)) {
-    const std::string collector = OptStr(args, "ipfix_collector", "127.0.0.1");
-    const auto cchk = ValidateMcpTarget(collector, safety);
+    const std::string raw_collector = OptStr(args, "ipfix_collector", "127.0.0.1");
+    std::string collector;
+    const auto cchk = ResolveMcpTarget(raw_collector, safety, collector);
     if (!cchk.ok) {
       return MakeToolError("ipfix_collector blocked by fail-closed MCP safety gate: " + cchk.reason);
     }
@@ -819,7 +860,14 @@ ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
     push_num("cl_slo_max_pushback_pct", "--cl-slo-max-pushback-pct");
     push_pos_int("cl_aimd_max_windows", "--cl-aimd-max-windows");
     push_pos_int("cl_binsearch_max_windows", "--cl-binsearch-max-windows");
-    push_str("rl_policy", "--rl-policy");
+    {
+      const std::string raw_pol = OptStr(args, "rl_policy", "");
+      const std::string resolved_pol = samurai::control::ResolveRlPolicyPath(raw_pol);
+      if (!resolved_pol.empty()) {
+        cmd.push_back("--rl-policy");
+        cmd.push_back(resolved_pol);
+      }
+    }
     push_num("cl_rl_max_jump_factor", "--cl-rl-max-jump-factor");
     if (const Value* ls = args.find("cl_lever_shield"); ls && ls->is_bool()) {
       cmd.push_back("--cl-lever-shield");

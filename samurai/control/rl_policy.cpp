@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <unistd.h>
 
 namespace samurai::control {
 
@@ -469,6 +472,43 @@ std::vector<double> RlPolicy::ProposeFor(const RlStateInputs& in) {
 void RlPolicy::ResetContext() {
   hidden_.assign(static_cast<std::size_t>(hidden_dim_), 0.0f);
   prev_token_.clear();
+}
+
+std::string ResolveRlPolicyPath(const std::string& requested_path) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const std::string target = requested_path.empty() ? "mahoraga-rl2.srlp" : requested_path;
+
+  if (!requested_path.empty() && fs::is_regular_file(target, ec)) {
+    return target;
+  }
+
+  const fs::path base = fs::path(target).filename();
+  std::vector<fs::path> search_dirs;
+  if (const char* env_dir = std::getenv("SAMURAI_RL_POLICY_DIR"); env_dir && env_dir[0] != '\0') {
+    search_dirs.emplace_back(env_dir);
+  }
+  search_dirs.emplace_back("artifacts/rl");
+
+  char buf[4096] = {0};
+  const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (n > 0) {
+    const fs::path exe_dir = fs::path(std::string(buf, static_cast<std::size_t>(n))).parent_path();
+    search_dirs.push_back(exe_dir / "rl");
+    search_dirs.push_back(exe_dir / "../rl");
+    search_dirs.push_back(exe_dir / "../share/samurai/rl");
+    search_dirs.push_back(exe_dir / "../../artifacts/rl");
+    search_dirs.push_back(exe_dir / "../../../artifacts/rl");
+  }
+  search_dirs.emplace_back("/usr/local/share/samurai/rl");
+
+  for (const auto& dir : search_dirs) {
+    const fs::path cand = dir / base;
+    if (fs::is_regular_file(cand, ec)) {
+      return cand.string();
+    }
+  }
+  return requested_path;
 }
 
 }  // namespace samurai::control

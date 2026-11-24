@@ -1,5 +1,7 @@
 #include "autopilot_tools.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -7,6 +9,7 @@
 #include <sstream>
 
 #include "runtime_tools.hpp"
+#include "scenario_tools.hpp"
 
 namespace samurai::mcp {
 
@@ -146,13 +149,14 @@ ToolResult AutopilotManager::HandleCreate(const Value& args) {
   sess->step_horizon = std::max(1.0, OptDouble(args, "step_horizon", 32.0));
 
   // Optional SRLP native RL policy (MLP or RL^2 GRU).
-  const std::string policy_path = OptStr(args, "policy_path", "");
-  if (!policy_path.empty()) {
+  const std::string raw_policy_path = OptStr(args, "policy_path", "");
+  if (!raw_policy_path.empty()) {
+    const std::string resolved_policy = samurai::control::ResolveRlPolicyPath(raw_policy_path);
     std::string load_err;
-    if (!sess->policy.Load(policy_path, &load_err)) {
-      return MakeToolError("Failed to load SRLP RL policy '" + policy_path + "': " + load_err);
+    if (!sess->policy.Load(resolved_policy, &load_err)) {
+      return MakeToolError("Failed to load SRLP RL policy '" + raw_policy_path + "': " + load_err);
     }
-    sess->policy_path = policy_path;
+    sess->policy_path = resolved_policy;
     sess->policy.ResetContext();
   }
 
@@ -360,16 +364,43 @@ ToolResult AutopilotManager::HandleRunWindow(const Value& args, const SafetyConf
       1,
       static_cast<std::int64_t>(safety.max_packet_count));
 
+  const bool has_scenario_input =
+      args.find("scenario") != nullptr ||
+      !OptStr(args, "scenario_file", "").empty() ||
+      !OptStr(args, "l7_profile_file", "").empty();
+
+  std::string temp_scenario_path;
+  std::string effective_worker = OptStr(args, "worker", has_scenario_input ? "scenario" : "l7");
+
   Value bench_args = Value::Object();
-  bench_args.set("worker", Value::Str(OptStr(args, "worker", "l7")));
+  bench_args.set("worker", Value::Str(effective_worker));
   bench_args.set("target", Value::Str(OptStr(args, "target", "127.0.0.1")));
   bench_args.set("port", Value::Int(OptInt(args, "port", 8080)));
   bench_args.set("protocol", Value::Str(OptStr(args, "protocol", "http1")));
   bench_args.set("count", Value::Int(OptInt(args, "count", computed_count)));
   bench_args.set("size", Value::Int(OptInt(args, "size", 64)));
   bench_args.set("rps", Value::Double(target_rps));
-  if (const Value* l7p = args.find("l7_protocol"); l7p && l7p->is_string()) {
-    bench_args.set("l7_protocol", *l7p);
+  if (has_scenario_input) {
+    std::string raw_json;
+    std::string src_path;
+    const std::string serr = LoadAndValidateScenarioJson(args, raw_json, src_path);
+    if (!serr.empty()) {
+      return MakeToolError(serr);
+    }
+    if (!src_path.empty()) {
+      bench_args.set("l7_profile_file", Value::Str(src_path));
+    } else {
+      temp_scenario_path = WriteTempScenarioFile(raw_json);
+      if (temp_scenario_path.empty()) {
+        return MakeToolError("Failed to materialize inline scenario JSON for autopilot window");
+      }
+      bench_args.set("l7_profile_file", Value::Str(temp_scenario_path));
+    }
+  }
+  for (const char* k : {"l7_protocol", "iface", "transport"}) {
+    if (const Value* v = args.find(k); v && v->is_string() && !v->as_string().empty()) {
+      bench_args.set(k, *v);
+    }
   }
   if (const Value* conc = args.find("concurrency"); conc && conc->is_number()) {
     bench_args.set("concurrency", *conc);
@@ -380,6 +411,9 @@ ToolResult AutopilotManager::HandleRunWindow(const Value& args, const SafetyConf
   bench_args.set("timeout_s", Value::Int(OptInt(args, "timeout_s", 30)));
 
   const ToolResult run_res = HandleRunBenchmark(bench_args, safety);
+  if (!temp_scenario_path.empty()) {
+    ::unlink(temp_scenario_path.c_str());
+  }
   if (run_res.is_error) return run_res;
 
   // Derive LoadSample from the structured JSON report returned by samurai CLI.

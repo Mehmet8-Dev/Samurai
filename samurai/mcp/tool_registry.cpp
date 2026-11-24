@@ -149,6 +149,12 @@ void RegisterAllTools(McpServer& server,
     props.set("rps", PropNum("Target rate in packets/requests per second (0 = max speed)."));
     props.set("pin_cpu", PropInt("Pin dataplane worker to a specific CPU core index."));
     props.set("profile", PropStr("Optional built-in profile name from samurai_list_profiles."));
+    props.set("config", PropStr("Optional tuning config file path (--config PATH, e.g. samurai.conf)."));
+    props.set("iface", PropStr("Network interface / DPDK port for worker TX/RX (--iface NAME)."));
+    props.set("transport", PropStr("Dataplane transport override (--transport MODE: af_packet|dpdk|dpdk_direct|loopback|custom_tcp|kernel_socket|geforce_p2p)."));
+    props.set("dpdk_port", PropInt("DPDK port ID override (--dpdk-port)."));
+    props.set("dpdk_queue", PropInt("DPDK TX queue ID override (--dpdk-queue)."));
+    props.set("log_level", PropStr("Log verbosity override (--log-level).", {"trace", "debug", "info", "warn", "error"}));
     // L7 / TLS / HTTP2 / QUIC
     props.set("l7_protocol", PropStr("L7 protocol override.", {"http1", "http2", "quic", "dns"}));
     props.set("l7_profile_file", PropStr("Optional L7/Scenario JSON profile file path (--l7-profile-file)."));
@@ -390,6 +396,24 @@ void RegisterAllTools(McpServer& server,
     props.set("wait_workers_s", PropInt("Max seconds to wait for slave workers (default: 15)."));
     props.set("shard_strategy", PropStr("Multi-worker sharding strategy.", {"equal", "capability", "region"}));
     props.set("target_region", PropStr("Target region for region-aware shard routing."));
+    props.set("iface", PropStr("Network interface / DPDK port forwarded to worker shards."));
+    props.set("transport", PropStr("Dataplane transport forwarded to workers (kernel_socket|custom_tcp|dpdk|af_xdp|af_packet|loopback)."));
+    // Distributed Scenario / L7 JSON
+    {
+      Value sc_obj = Value::Object();
+      sc_obj.set("type", Value::Str("object"));
+      sc_obj.set("description", Value::Str("Inline Scenario Engine JSON spec distributed to all cluster workers."));
+      props.set("scenario", std::move(sc_obj));
+    }
+    props.set("scenario_file", PropStr("Path to a Scenario Engine JSON file (read on master and distributed inline to all workers)."));
+    props.set("l7_profile_file", PropStr("Alias for scenario_file."));
+    props.set("concurrency", PropInt("L7/Scenario concurrency per shard."));
+    props.set("max_connections", PropInt("L7 connection pool size per shard."));
+    props.set("l7_timeout_ms", PropInt("L7/Scenario per-request timeout in ms."));
+    props.set("scheme", PropStr("L7 URL scheme override.", {"http", "https"}));
+    props.set("host_header", PropStr("L7 Host header / TLS SNI override."));
+    props.set("keepalive", PropBool("Reuse L7 connections across requests."));
+    props.set("verify_tls", PropBool("Verify peer TLS certificate."));
     // Distributed Telco & IPFIX
     props.set("telco_subscribers", PropInt("Total 4G/5G subscribers partitioned across workers."));
     props.set("telco_cps", PropInt("Cluster-wide subscriber setup CPS."));
@@ -507,6 +531,16 @@ void RegisterAllTools(McpServer& server,
     props.set("port", PropInt("Target port (default: 8080)."));
     props.set("protocol", PropStr("Protocol (default: http1).", AllowedProtocols()));
     props.set("l7_protocol", PropStr("Optional L7 protocol override.", {"http1", "http2", "quic", "dns"}));
+    {
+      Value sc_obj = Value::Object();
+      sc_obj.set("type", Value::Str("object"));
+      sc_obj.set("description", Value::Str("Optional inline Scenario Engine JSON spec executed for this autopilot window."));
+      props.set("scenario", std::move(sc_obj));
+    }
+    props.set("scenario_file", PropStr("Optional Scenario Engine JSON file path for this autopilot window."));
+    props.set("l7_profile_file", PropStr("Alias for scenario_file."));
+    props.set("iface", PropStr("Optional network interface override (--iface)."));
+    props.set("transport", PropStr("Optional dataplane transport override (--transport)."));
     props.set("window_s", PropNum("Window duration in seconds used to compute packet count from setpoint_rps (0.2-15s, default: 1.0)."));
     props.set("count", PropInt("Optional explicit packet/request count override."));
     props.set("concurrency", PropInt("L7 concurrency."));
@@ -576,6 +610,9 @@ void RegisterAllTools(McpServer& server,
     props.set("count", PropInt("Bounded request/session budget (default: 100)."));
     props.set("rps", PropNum("Optional target RPS pacing cap."));
     props.set("concurrency", PropInt("Optional concurrency override."));
+    props.set("iface", PropStr("Optional network interface override (--iface)."));
+    props.set("transport", PropStr("Optional dataplane transport override (--transport)."));
+    props.set("config", PropStr("Optional tuning config file path (--config)."));
     AddCustomTcpSchemaProps(props);
     props.set("timeout_s", PropInt("Subprocess wall-clock timeout in seconds (5-120)."));
     server.RegisterTool({

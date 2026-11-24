@@ -1,8 +1,10 @@
 #include "supervisor_shard_runner.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <unistd.h>
 
@@ -229,11 +231,13 @@ samurai::wire::ReconfigureWindowV1 ReconfigureWindowFromJson(const Value& a) {
 SupervisorShardRun::SupervisorShardRun(samurai::orchestrator::SupervisorConfig cfg,
                                        samurai::orchestrator::JobOptions job,
                                        std::shared_ptr<samurai::orchestrator::WarmWorkerPool> pool,
-                                       std::string shard_id)
+                                       std::string shard_id,
+                                       std::string temp_scenario_path)
     : cfg_(std::move(cfg)),
       job_(std::move(job)),
       pool_(std::move(pool)),
-      shard_id_(std::move(shard_id)) {
+      shard_id_(std::move(shard_id)),
+      temp_scenario_path_(std::move(temp_scenario_path)) {
   thread_ = std::thread([this]() {
     exit_code_ = samurai::orchestrator::RunJob(
         cfg_, job_, stats_, pool_.get(), &terminated_, shard_id_);
@@ -243,6 +247,9 @@ SupervisorShardRun::SupervisorShardRun(samurai::orchestrator::SupervisorConfig c
 
 SupervisorShardRun::~SupervisorShardRun() {
   if (thread_.joinable()) thread_.join();
+  if (!temp_scenario_path_.empty()) {
+    ::unlink(temp_scenario_path_.c_str());
+  }
 }
 
 void SupervisorShardRun::Join() {
@@ -329,11 +336,47 @@ std::shared_ptr<samurai::control::ShardRun> SupervisorShardRunner::Start(
   samurai::orchestrator::SupervisorConfig cfg;
   cfg.worker = ResolveWorker(args);
   cfg.worker_dir = worker_dir_;
+  cfg.iface = StrArg(args, "iface", "");
+  cfg.transport = StrArg(args, "transport", "");
+  if (cfg.transport.empty()) {
+    if (const Value* ct = args.find("connection_template"); ct && ct->is_object()) {
+      cfg.transport = StrArg(*ct, "transport_backend", "");
+    }
+  }
   const std::string suffix = shard_id + "_" + std::to_string(static_cast<long>(::getpid()));
   cfg.jobs_endpoint = "ipc:///tmp/samurai_jobs_" + suffix;
   cfg.events_endpoint = "ipc:///tmp/samurai_events_" + suffix;
   cfg.recv_timeout_ms = 5000;
-  return std::make_shared<SupervisorShardRun>(std::move(cfg), JobFromArgs(args), pool_, shard_id);
+  JobOptions job = JobFromArgs(args);
+
+  // Materialize inline scenario JSON (passed across cluster master -> slave RPCs)
+  // into a per-shard temp file so remote/containerized slaves never rely on a
+  // master-local filesystem path.
+  std::string temp_scenario_path;
+  std::string inline_json = StrArg(args, "l7_profile_json", "");
+  if (inline_json.empty()) {
+    if (const Value* scn = args.find("scenario"); scn && scn->is_object()) {
+      inline_json = scn->dump();
+    }
+  }
+  if (!inline_json.empty()) {
+    static std::atomic<std::uint64_t> seq{1};
+    const std::uint64_t id = seq.fetch_add(1, std::memory_order_relaxed);
+    temp_scenario_path = "/tmp/samurai_shard_scn_" +
+                         std::to_string(static_cast<long>(::getpid())) + "_" +
+                         std::to_string(id) + ".json";
+    std::ofstream out(temp_scenario_path, std::ios::binary | std::ios::trunc);
+    if (out.is_open()) {
+      out.write(inline_json.data(), static_cast<std::streamsize>(inline_json.size()));
+      out.close();
+      job.l7_profile_file = temp_scenario_path;
+    } else {
+      temp_scenario_path.clear();
+    }
+  }
+
+  return std::make_shared<SupervisorShardRun>(
+      std::move(cfg), std::move(job), pool_, shard_id, std::move(temp_scenario_path));
 }
 
 bool SupervisorShardRunner::ReconfigureShard(

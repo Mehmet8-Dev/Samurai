@@ -25,6 +25,13 @@ SafetyConfig LoadSafetyConfigFromEnv();
 samurai::core::TargetSafetyResult ValidateMcpTarget(const std::string& target_ip,
                                                     const SafetyConfig& cfg);
 
+// Resolves Docker Desktop's "host.docker.internal" alias (case-insensitive) to
+// an IPv4 address if requested, then applies ValidateMcpTarget fail-closed on
+// the resulting IPv4. All other hostnames still fail ValidateMcpTarget.
+samurai::core::TargetSafetyResult ResolveMcpTarget(const std::string& target_or_alias,
+                                                   const SafetyConfig& cfg,
+                                                   std::string& resolved_ip_out);
+
 bool IsAllowedWorker(const std::string& worker);
 bool IsAllowedProtocol(const std::string& proto);
 

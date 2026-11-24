@@ -1,8 +1,13 @@
 #include "safety.hpp"
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 
 namespace samurai::mcp {
@@ -46,6 +51,37 @@ samurai::core::TargetSafetyResult ValidateMcpTarget(const std::string& target_ip
   // Defense-in-depth: allow_public is ALWAYS false in MCP mode.
   return samurai::core::ValidateTargetSafety(
       target_ip, cfg.allow_targets, /*allow_public=*/false, cfg.deny_targets);
+}
+
+samurai::core::TargetSafetyResult ResolveMcpTarget(const std::string& target_or_alias,
+                                                   const SafetyConfig& cfg,
+                                                   std::string& resolved_ip_out) {
+  std::string low = target_or_alias;
+  for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+  if (low == "host.docker.internal") {
+    struct addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    const int gai = ::getaddrinfo("host.docker.internal", nullptr, &hints, &res);
+    if (gai != 0 || res == nullptr) {
+      if (res) ::freeaddrinfo(res);
+      return {false, "Unable to resolve host.docker.internal to IPv4 (pass explicit private IPv4 or --add-host host.docker.internal:host-gateway)."};
+    }
+    char buf[INET_ADDRSTRLEN] = {0};
+    const auto* sin = reinterpret_cast<const struct sockaddr_in*>(res->ai_addr);
+    const char* ok = ::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+    ::freeaddrinfo(res);
+    if (!ok || buf[0] == '\0') {
+      return {false, "Failed to format resolved host.docker.internal IPv4 address."};
+    }
+    resolved_ip_out = std::string(buf);
+    return ValidateMcpTarget(resolved_ip_out, cfg);
+  }
+
+  resolved_ip_out = target_or_alias;
+  return ValidateMcpTarget(resolved_ip_out, cfg);
 }
 
 const std::vector<std::string>& AllowedWorkers() {

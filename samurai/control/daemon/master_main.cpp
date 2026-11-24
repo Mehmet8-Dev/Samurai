@@ -550,7 +550,9 @@ bool ResolveTelcoPoolProfileArg(const std::string& spec,
 // the local and cross-region delegated paths build a JobConfig the same way.
 Value JobSpecFromArgs(int argc, char** argv,
                       const samurai::control::RegionTopology* preloaded_topo = nullptr,
-                      const samurai::control::TelcoLabSizingProfile* preloaded_pool = nullptr) {
+                      const samurai::control::TelcoLabSizingProfile* preloaded_pool = nullptr,
+                      const std::string& preloaded_scenario_json = "",
+                      const std::string& preloaded_scenario_file = "") {
   using namespace samurai::control::daemon;
   Value s = Value::Object();
   s.set("count", Value::Int(OptInt(argc, argv, "--count", 0)));
@@ -559,7 +561,26 @@ Value JobSpecFromArgs(int argc, char** argv,
   s.set("protocol", Value::Str(Opt(argc, argv, "--protocol", "udp")));
   s.set("size", Value::Int(OptInt(argc, argv, "--size", 64)));
   s.set("worker", Value::Str(Opt(argc, argv, "--worker", "cpu")));
+  s.set("iface", Value::Str(Opt(argc, argv, "--iface", "")));
   s.set("transport", Value::Str(Opt(argc, argv, "--transport", "")));
+  if (!preloaded_scenario_json.empty()) {
+    s.set("l7_profile_json", Value::Str(preloaded_scenario_json));
+  }
+  if (!preloaded_scenario_file.empty()) {
+    s.set("l7_profile_file", Value::Str(preloaded_scenario_file));
+  }
+  const long conc = OptInt(argc, argv, "--concurrency", 0);
+  if (conc > 0) s.set("concurrency", Value::Int(conc));
+  const long max_conns = OptInt(argc, argv, "--max-connections", 0);
+  if (max_conns > 0) s.set("max_connections", Value::Int(max_conns));
+  if (Flag(argc, argv, "--keepalive")) s.set("keepalive", Value::Bool(true));
+  const long l7_to = OptInt(argc, argv, "--l7-timeout-ms", 0);
+  if (l7_to > 0) s.set("l7_timeout_ms", Value::Int(l7_to));
+  const std::string scheme = Opt(argc, argv, "--scheme", "");
+  if (!scheme.empty()) s.set("scheme", Value::Str(scheme));
+  const std::string host_hdr = Opt(argc, argv, "--host-header", "");
+  if (!host_hdr.empty()) s.set("host_header", Value::Str(host_hdr));
+  if (Flag(argc, argv, "--verify-tls")) s.set("verify_tls", Value::Bool(true));
   s.set("target_region", Value::Str(Opt(argc, argv, "--target-region", "")));
   s.set("target_asn", Value::Int(OptInt(argc, argv, "--target-asn", 0)));
   s.set("shard_strategy", Value::Str(Opt(argc, argv, "--shard-strategy", "")));
@@ -727,6 +748,29 @@ samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leade
   if (trps > 0.0) {
     job.base_args.set("target_rps", Value::Double(trps));
   }
+  if (const Value* lpf = spec.find("l7_profile_file"); lpf && lpf->is_string() && !lpf->as_string().empty()) {
+    job.base_args.set("l7_profile_file", *lpf);
+  }
+  if (const Value* lpj = spec.find("l7_profile_json"); lpj && lpj->is_string() && !lpj->as_string().empty()) {
+    job.base_args.set("l7_profile_json", *lpj);
+  } else if (const Value* scn = spec.find("scenario"); scn && scn->is_object()) {
+    job.base_args.set("l7_profile_json", Value::Str(scn->dump()));
+  }
+  for (const char* k : {"concurrency", "max_connections", "l7_timeout_ms"}) {
+    if (const Value* v = spec.find(k); v && v->is_number() && v->as_int(0) > 0) {
+      job.base_args.set(k, *v);
+    }
+  }
+  for (const char* k : {"keepalive", "verify_tls"}) {
+    if (const Value* v = spec.find(k); v && v->is_bool() && v->as_bool(false)) {
+      job.base_args.set(k, *v);
+    }
+  }
+  for (const char* k : {"scheme", "host_header"}) {
+    if (const Value* v = spec.find(k); v && v->is_string() && !v->as_string().empty()) {
+      job.base_args.set(k, *v);
+    }
+  }
   job.base_args.set("ipfix_enabled", Value::Bool(job.ipfix_enabled));
   job.base_args.set("ipfix_collector", Value::Str(job.ipfix_collector));
   job.base_args.set("ipfix_port", Value::Int(job.ipfix_port));
@@ -755,8 +799,13 @@ samurai::control::JobConfig BuildJobConfig(const Value& spec, std::int64_t leade
   // the worker's SAMURAI_L7_TRANSPORT env) so master and worker agree on a single
   // source of truth and the RL corpus can record it — the flow-level IPS features
   // are only meaningful on a flow-capable (userspace-TCP) transport.
+  const std::string iface = gets("iface", "");
+  if (!iface.empty()) {
+    job.base_args.set("iface", Value::Str(iface));
+  }
   const std::string transport = gets("transport", "");
   if (!transport.empty()) {
+    job.base_args.set("transport", Value::Str(transport));
     Value conn = Value::Object();
     conn.set("transport_backend", Value::Str(transport));
     job.base_args.set("connection_template", conn);
@@ -812,6 +861,10 @@ void Usage(const char* argv0) {
       "                            dpdk|af_xdp|af_packet); recorded in the RL corpus\n"
       "                            and gates the flow-level IPS features (custom_tcp\n"
       "                            et al. expose the flow counters; kernel_socket does not)\n"
+      "  --l7-profile-file PATH    Scenario/L7 JSON spec path (alias: --scenario-file)\n"
+      "  --l7-profile-json JSON    Inline Scenario/L7 JSON spec distributed to all shards\n"
+      "  --concurrency N / --max-connections N / --keepalive / --l7-timeout-ms N\n"
+      "  --scheme S / --host-header H / --verify-tls\n"
       "  --shard-unit-count N      packets per shard (0 = auto)\n"
       "  --job-timeout-s N         wait cap for the job (default 120)\n"
       "  --poll-interval-ms N      master dispatch poll (default 250)\n"
@@ -1025,6 +1078,27 @@ int main(int argc, char** argv) {
   }
   const std::uint32_t cli_target_asn =
       static_cast<std::uint32_t>(std::max<long>(0, OptInt(argc, argv, "--target-asn", 0)));
+
+  std::string cli_scenario_file = Opt(argc, argv, "--l7-profile-file", "");
+  if (cli_scenario_file.empty()) {
+    cli_scenario_file = Opt(argc, argv, "--scenario-file", "");
+  }
+  std::string cli_scenario_json = Opt(argc, argv, "--l7-profile-json", "");
+  if (!cli_scenario_file.empty() && cli_scenario_json.empty()) {
+    Value scn_val;
+    std::string serr;
+    if (!LoadJsonFileValue(cli_scenario_file, scn_val, serr)) {
+      std::fprintf(stderr, "samurai_master: scenario file error: %s\n", serr.c_str());
+      return 2;
+    }
+    cli_scenario_json = scn_val.dump();
+  } else if (!cli_scenario_json.empty()) {
+    const auto parsed = samurai::core::json::Parse(cli_scenario_json);
+    if (!parsed.ok || !parsed.value.is_object()) {
+      std::fprintf(stderr, "samurai_master: --l7-profile-json error: invalid JSON object\n");
+      return 2;
+    }
+  }
 
   // Consent gate for the local job's target. The closed-loop / RL serving path
   // never went through cli::Validate, so it previously skipped the same safety
@@ -1645,7 +1719,8 @@ int main(int argc, char** argv) {
   // Primary job: run it on this region's workers, or delegate the whole job to a
   // peer region when --target-region names a different region.
   if (has_local_job) {
-    const Value spec = JobSpecFromArgs(argc, argv, &cli_region_topo, &cli_telco_pool);
+    const Value spec = JobSpecFromArgs(
+        argc, argv, &cli_region_topo, &cli_telco_pool, cli_scenario_json, cli_scenario_file);
     const std::string tr = cli_region_topo.ResolveRegion(
         cli_target_asn, Opt(argc, argv, "--target-region", ""));
     if (mm && mm->active() && !tr.empty() && tr != master_region) {
@@ -1685,6 +1760,7 @@ int main(int argc, char** argv) {
           if (rl_path.empty()) {
             if (const char* env = std::getenv("SAMURAI_RL_POLICY")) rl_path = env;
           }
+          rl_path = samurai::control::ResolveRlPolicyPath(rl_path);
           std::string rl_err;
           if (rl_path.empty()) {
             std::fprintf(stderr,

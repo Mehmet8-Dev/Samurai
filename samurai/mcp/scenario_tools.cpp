@@ -53,7 +53,8 @@ std::string LoadScenarioDoc(const Value& args, Value& out_doc, std::string* out_
     if (out_raw_json) *out_raw_json = sc_str->as_string();
     return "";
   }
-  if (const Value* sf = args.find("scenario_file"); sf && sf->is_string() && !sf->as_string().empty()) {
+  if (const Value* sf = args.find("scenario_file") ? args.find("scenario_file") : args.find("l7_profile_file");
+      sf && sf->is_string() && !sf->as_string().empty()) {
     bool ok = false;
     const std::string raw = ReadFileToString(sf->as_string(), &ok);
     if (!ok) {
@@ -155,14 +156,58 @@ ToolResult HandleScenarioCompile(const Value& args) {
   }
 }
 
+std::string LoadAndValidateScenarioJson(const Value& args,
+                                        std::string& out_raw_json,
+                                        std::string& out_source_path,
+                                        Value* out_summary) {
+  Value doc;
+  const std::string load_err = LoadScenarioDoc(args, doc, &out_raw_json);
+  if (!load_err.empty()) return load_err;
+
+  try {
+    const auto spec = samurai::scenario_native::parse_spec(doc);
+    if (spec.flows.empty()) {
+      return "Scenario spec has 0 flows.";
+    }
+    if (out_summary) *out_summary = SummarizeSpec(spec);
+  } catch (const std::exception& ex) {
+    return std::string("Scenario validation failed: ") + ex.what();
+  }
+
+  out_source_path.clear();
+  if (!args.find("scenario")) {
+    if (const Value* sf = args.find("scenario_file") ? args.find("scenario_file") : args.find("l7_profile_file");
+        sf && sf->is_string() && !sf->as_string().empty()) {
+      out_source_path = sf->as_string();
+    }
+  }
+  return "";
+}
+
+std::string WriteTempScenarioFile(const std::string& raw_json) {
+  char stm[] = "/tmp/samurai_mcp_scenario_XXXXXX";
+  const int sfd = ::mkstemp(stm);
+  if (sfd < 0) return "";
+  ::close(sfd);
+  std::ofstream out_f(stm, std::ios::binary | std::ios::trunc);
+  if (!out_f.is_open()) {
+    ::unlink(stm);
+    return "";
+  }
+  out_f.write(raw_json.data(), static_cast<std::streamsize>(raw_json.size()));
+  out_f.close();
+  return std::string(stm);
+}
+
 ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
   const std::string bin = FindNativeBinary({"samurai"});
   if (bin.empty()) {
     return MakeToolError("samurai CLI binary not found. Build via CMake first.");
   }
 
-  const std::string target = args.find("target") ? args.find("target")->as_string("127.0.0.1") : "127.0.0.1";
-  const auto chk = ValidateMcpTarget(target, safety);
+  const std::string raw_target = args.find("target") ? args.find("target")->as_string("127.0.0.1") : "127.0.0.1";
+  std::string target;
+  const auto chk = ResolveMcpTarget(raw_target, safety, target);
   if (!chk.ok) {
     return MakeToolError("Target blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -270,6 +315,13 @@ ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
   if (const Value* conc = args.find("concurrency"); conc && conc->is_number() && conc->as_int(0) > 0) {
     cmd.push_back("--concurrency");
     cmd.push_back(std::to_string(conc->as_int(1)));
+  }
+  for (const auto& pair : std::vector<std::pair<const char*, const char*>>{
+           {"iface", "--iface"}, {"transport", "--transport"}, {"config", "--config"}}) {
+    if (const Value* v = args.find(pair.first); v && v->is_string() && !v->as_string().empty()) {
+      cmd.push_back(pair.second);
+      cmd.push_back(v->as_string());
+    }
   }
 
   const auto res = RunSubprocess(cmd, timeout_s, tcp_env.env_overrides);

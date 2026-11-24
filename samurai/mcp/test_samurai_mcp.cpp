@@ -423,8 +423,54 @@ int main() {
     Check(has_prop("samurai_run_benchmark", "custom_tcp_wire") &&
               has_prop("samurai_run_benchmark", "xdp_mode") &&
               has_prop("samurai_run_benchmark", "custom_tcp_iface") &&
-              has_prop("samurai_run_benchmark", "custom_tcp_dst_mac"),
-          "samurai_run_benchmark schema exposes custom_tcp/AF_XDP params");
+              has_prop("samurai_run_benchmark", "custom_tcp_dst_mac") &&
+              has_prop("samurai_run_benchmark", "iface") &&
+              has_prop("samurai_run_benchmark", "transport") &&
+              has_prop("samurai_run_benchmark", "config") &&
+              has_prop("samurai_run_benchmark", "dpdk_port"),
+          "samurai_run_benchmark schema exposes custom_tcp, iface, transport, config, dpdk_port");
+    Check(has_prop("samurai_cluster_run_job", "scenario") &&
+              has_prop("samurai_cluster_run_job", "scenario_file") &&
+              has_prop("samurai_cluster_run_job", "l7_profile_file") &&
+              has_prop("samurai_cluster_run_job", "iface") &&
+              has_prop("samurai_cluster_run_job", "transport"),
+          "samurai_cluster_run_job schema exposes distributed scenario, iface, transport");
+    Check(has_prop("samurai_autopilot_run_window", "scenario") &&
+              has_prop("samurai_autopilot_run_window", "scenario_file") &&
+              has_prop("samurai_autopilot_run_window", "iface") &&
+              has_prop("samurai_autopilot_run_window", "transport"),
+          "samurai_autopilot_run_window schema exposes scenario, iface, transport");
+  }
+
+  // 8b. ResolveMcpTarget fail-closed safety & bundled Mahoraga RL policy resolution
+  {
+    std::string resolved;
+    const auto r_loop = samurai::mcp::ResolveMcpTarget("127.0.0.1", safety, resolved);
+    Check(r_loop.ok && resolved == "127.0.0.1", "ResolveMcpTarget passes 127.0.0.1");
+
+    const auto r_pub = samurai::mcp::ResolveMcpTarget("8.8.8.8", safety, resolved);
+    Check(!r_pub.ok, "ResolveMcpTarget blocks public IPv4");
+
+    const auto r_host = samurai::mcp::ResolveMcpTarget("example.com", safety, resolved);
+    Check(!r_host.ok, "ResolveMcpTarget blocks arbitrary hostnames fail-closed");
+
+    Value pol_args = Value::Object();
+    pol_args.set("strategy", Value::Str("rl"));
+    pol_args.set("min_rps", Value::Double(50.0));
+    pol_args.set("max_rps", Value::Double(5000.0));
+    pol_args.set("policy_path", Value::Str("mahoraga-rl2.srlp"));
+    bool is_err = false;
+    const Value pol_res = ParseToolPayload(
+        CallTool(server, 39, "samurai_autopilot_create", std::move(pol_args)), &is_err);
+    Check(!is_err && pol_res.find("policy_loaded")->as_bool(false) == true &&
+              pol_res.find("policy_recurrent")->as_bool(false) == true,
+          "samurai_autopilot_create resolves and loads bundled mahoraga-rl2.srlp");
+    if (!is_err && pol_res.find("session_id")) {
+      Value del = Value::Object();
+      del.set("session_id", Value::Str(pol_res.find("session_id")->as_string()));
+      del.set("delete", Value::Bool(true));
+      (void)CallTool(server, 40, "samurai_autopilot_reset", std::move(del));
+    }
   }
 
   // 8. MCP setup/doctor client diagnostics & safe JSON/TOML registration
