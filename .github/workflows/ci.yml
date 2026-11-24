@@ -148,10 +148,53 @@ jobs:
         run: |
           ./samurai/l7_emu_native/run_kernel_threaded_h3_e2e.sh ./build/l7_emu_native/test_kernel_threaded_h3
 
-      - name: Run CLI RFC Benchmark Suite
+      - name: Run CLI RFC Benchmark Suite (Live Loopback L7)
         run: |
           mkdir -p artifacts
-          ./build/cli/samurai --run-rfc-suite all --rfc-report-out artifacts/rfc_benchmark.html
+          python3 - <<'PY'
+          import http.server, socketserver, subprocess, sys, threading
+
+          class OkHandler(http.server.BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+              disable_nagle_algorithm = True
+              def do_GET(self):
+                  body = b"ok\n"
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.send_header("Connection", "keep-alive")
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+
+          class ReusableServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+              daemon_threads = True
+              allow_reuse_address = True
+
+          srv = ReusableServer(("127.0.0.1", 0), OkHandler)
+          port = srv.server_address[1]
+          t = threading.Thread(target=srv.serve_forever, daemon=True)
+          t.start()
+          try:
+              rc = subprocess.call([
+                  "./build/cli/samurai",
+                  "--run-rfc-suite", "all",
+                  "--worker", "l7",
+                  "--protocol", "http1",
+                  "--keepalive",
+                  "--concurrency", "4",
+                  "--target", "127.0.0.1",
+                  "--port", str(port),
+                  "--rps", "200",
+                  "--count", "40",
+                  "--confirm",
+                  "--rfc-report-out", "artifacts/rfc_benchmark.html",
+              ])
+              sys.exit(rc)
+          finally:
+              srv.shutdown()
+              srv.server_close()
+          PY
 
       - name: Upload RFC & Benchmark Artifacts
         if: always()

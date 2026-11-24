@@ -2,7 +2,7 @@
 
 **1,000,000 stateful TCP flows in 577 MiB (`605 B/flow`) · Stateful HTTP/2 & QUIC/H3 (`io_uring`/kTLS) · Consumer GeForce BAR1 P2P CUDA · 5G CUPS Telecom · Native C++17 MCP Server (`samurai_mcp`)**
 
-Samurai (v3.3.3) bridges the gap between scripting load tools (`k6`, `Locust`) and raw stateless packet generators (`pktgen`, `TRex`) in a single compiled **C++17** runtime with zero Python dataplane overhead — strictly scoped for authorized lab and infrastructure validation.
+Samurai (v3.4.0) bridges the gap between scripting load tools (`k6`, `Locust`) and raw stateless packet generators (`pktgen`, `TRex`) in a single compiled **C++17** runtime with zero Python dataplane overhead — strictly scoped for authorized lab and infrastructure validation.
 
 ---
 
@@ -32,14 +32,13 @@ Automatically diagnose binaries and register Samurai MCP across **Claude Code, C
 # Check binaries, workers, and MCP client registration status
 npx -y samurai-net mcp doctor
 
-# Preview (dry-run) or register every detected IDE / coding CLI in one command (.bak backup created automatically):
+# Register every detected IDE / coding CLI in one command (.bak backup created automatically, omit --yes to inspect without modifying files):
 # Supported clients: claude_code, claude_desktop, cursor, codex, gemini_cli, antigravity, windsurf, vscode, opencode, copilot_cli
 npx -y samurai-net mcp setup --client all --yes
-npx -y samurai-net mcp setup --client cursor --dry-run
 npx -y samurai-net mcp setup --client claude_code --yes
 
 # Windows PowerShell (Docker Desktop + native %APPDATA% / %USERPROFILE% paths + local host-built image):
-# Automatically builds `samurai:local-v3.3.3` on your machine (`SAMURAI_NATIVE_ARCH=ON`) and injects `--add-host host.docker.internal:host-gateway`.
+# Automatically builds `samurai:local-v3.4.0` on your machine (`SAMURAI_NATIVE_ARCH=ON`) and injects `--add-host host.docker.internal:host-gateway`.
 npx -y samurai-net mcp setup --client antigravity --yes
 npx -y samurai-net mcp setup --client vscode --yes
 npx -y samurai-net mcp setup --client claude_desktop --yes
@@ -75,8 +74,7 @@ Samurai includes a modular, zero-Python **Model Context Protocol (MCP)** stdio s
 # Diagnose local binaries, workers, and MCP client registration status
 samurai_mcp doctor --json
 
-# Preview (dry-run) or apply MCP registration (creates a .bak backup automatically)
-samurai_mcp setup --client cursor --dry-run
+# Apply MCP registration (creates a .bak backup automatically; omit --yes to check plan without writing)
 samurai_mcp setup --client cursor --yes          # native binary
 samurai_mcp setup --client claude_code --docker --yes         # local Docker image
 samurai_mcp setup --client claude_code --docker --ghcr --yes  # GHCR source-runtime (compiles natively on first run)
@@ -236,9 +234,17 @@ sudo ./build/cli/samurai \
   --telco-duration-ms 5000 \
   --confirm
 
-# RFC 2544 / 3511 / 8219 compliance suite
+# RFC 2544 / 3511 / 8219 compliance suite (live dataplane target)
 ./build/cli/samurai \
   --run-rfc-suite all \
+  --worker l7 \
+  --protocol http1 \
+  --keepalive \
+  --target 127.0.0.1 \
+  --port 8080 \
+  --rps 1000 \
+  --count 200 \
+  --confirm \
   --rfc-report-out reports/rfc_report.html
 ```
 

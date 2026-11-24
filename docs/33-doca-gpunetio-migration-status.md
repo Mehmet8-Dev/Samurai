@@ -73,7 +73,7 @@ To prevent accidental silent fallback to slower SKB/kernel networking during hig
 
 ## 4. Verification & Operational Commands
 
-### A) Dry-Run & Unit Contract Testing
+### A) ZMQ ABI & Unit Contract Testing
 Verify the ZMQ ABI, DPU state layout, and backend facade contracts without hardware fixtures:
 
 ```bash

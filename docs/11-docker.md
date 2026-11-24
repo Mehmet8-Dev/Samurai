@@ -23,7 +23,7 @@ GitHub Releases publish `ghcr.io/mehmet8-dev/samurai:latest` as an **uncompiled 
 # Option A: Use GHCR source image (compiles once on YOUR host on first run, cached across runs)
 docker run --rm -v samurai-build-cache:/var/cache/samurai ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp
 
-# Option B: Automatic 1-command host Docker build via npx (compiles samurai:local-v3.3.3 with SAMURAI_NATIVE_ARCH=ON)
+# Option B: Automatic 1-command host Docker build via npx (compiles samurai:local-v3.4.0 with SAMURAI_NATIVE_ARCH=ON)
 npx -y samurai-net build --docker
 
 # Option C: Build directly with Docker CLI (defaults to SAMURAI_NATIVE_ARCH=ON)

@@ -288,7 +288,7 @@ function executeSetup(opts) {
     newContent = `${JSON.stringify(doc, null, 2)}\n`;
   }
 
-  const apply = Boolean(opts.yes) && !Boolean(opts.dryRun);
+  const apply = Boolean(opts.yes);
   const backupPath = `${configPath}.bak`;
   let backupCreated = false;
   if (apply) {
@@ -306,7 +306,6 @@ function executeSetup(opts) {
     report: {
       ok: true,
       applied: apply,
-      dry_run: !apply,
       host_os: hostOs,
       client: spec.id,
       display_name: spec.displayName,
@@ -384,7 +383,7 @@ function printSetupUsage() {
   process.stdout.write(
     "Usage:\n" +
       "  samurai-net mcp doctor [--client <id>] [--host-os <linux|macos|windows>] [--json]\n" +
-      "  samurai-net mcp setup --client <id|all> [--scope <user|project>] [--docker | --npx] [--ghcr] [--image <tag>] [--host-os <linux|macos|windows>] [--no-build] [--dry-run] [--yes] [--json]\n\n" +
+      "  samurai-net mcp setup --client <id|all> [--scope <user|project>] [--docker | --npx] [--ghcr] [--image <tag>] [--host-os <linux|macos|windows>] [--no-build] [--yes] [--json]\n\n" +
       `Supported clients: ${CLIENT_SPECS.map((c) => c.id).join(", ")}, all\n`
   );
 }
@@ -438,7 +437,6 @@ async function runHostMcpConfigCmd(sub, args, ctx) {
     imageTag: ctx.defaultImageTag,
     docker: false,
     npx: false,
-    dryRun: false,
     yes: false,
     json: false,
     noBuild: false,
@@ -466,8 +464,6 @@ async function runHostMcpConfigCmd(sub, args, ctx) {
       opts.docker = true;
     } else if (a === "--npx") {
       opts.npx = true;
-    } else if (a === "--dry-run") {
-      opts.dryRun = true;
     } else if (a === "--yes" || a === "-y") {
       opts.yes = true;
     } else if (a === "--json") {
@@ -553,7 +549,7 @@ async function runHostMcpConfigCmd(sub, args, ctx) {
       }
       process.stdout.write(
         `Samurai MCP Setup (${r.display_name})\n` +
-          `  Status:     ${r.applied ? "APPLIED" : "DRY-RUN PLAN (no files modified)"}\n` +
+          `  Status:     ${r.applied ? "APPLIED" : "NOT WRITTEN (pass --yes to apply)"}\n` +
           `  Host OS:    ${r.host_os}\n` +
           `  Mode:       ${r.transport_mode}${r.image ? ` (${r.image})` : ""}\n` +
           `  Config:     ${r.config_path}\n` +

@@ -944,18 +944,46 @@ ToolResult HandleRunRfcSuite(const Value& args, const SafetyConfig& safety) {
     return MakeToolError("suite must be one of: all, rfc2544, rfc3511, rfc8219");
   }
 
-  std::vector<std::string> cmd = {bin, "--run-rfc-suite", suite};
-  if (const Value* tgt = args.find("target"); tgt && tgt->is_string() && !tgt->as_string().empty()) {
-    std::string resolved_tgt;
-    const auto chk = ResolveMcpTarget(tgt->as_string(), safety, resolved_tgt);
-    if (!chk.ok) {
-      return MakeToolError("Target blocked by fail-closed MCP safety gate: " + chk.reason);
-    }
-    cmd.push_back("--target");
-    cmd.push_back(resolved_tgt);
-    if (const Value* live = args.find("live_dataplane"); live && live->as_bool(false)) {
-      cmd.push_back("--confirm");
-    }
+  const Value* tgt = args.find("target");
+  if (!tgt || !tgt->is_string() || tgt->as_string().empty()) {
+    return MakeToolError(
+        "target is required for samurai_run_rfc_suite (simulated dry-run mode was removed).");
+  }
+  const Value* live = args.find("live_dataplane");
+  if (!live || !live->as_bool(false)) {
+    return MakeToolError(
+        "live_dataplane=true is required for samurai_run_rfc_suite against an authorized target.");
+  }
+
+  std::string resolved_tgt;
+  const auto chk = ResolveMcpTarget(tgt->as_string(), safety, resolved_tgt);
+  if (!chk.ok) {
+    return MakeToolError("Target blocked by fail-closed MCP safety gate: " + chk.reason);
+  }
+
+  std::vector<std::string> cmd = {bin, "--run-rfc-suite", suite, "--target", resolved_tgt, "--confirm"};
+  if (const Value* worker = args.find("worker"); worker && worker->is_string() && !worker->as_string().empty()) {
+    cmd.push_back("--worker");
+    cmd.push_back(worker->as_string());
+  }
+  if (const Value* port = args.find("port"); port && port->as_int(0) > 0) {
+    cmd.push_back("--port");
+    cmd.push_back(std::to_string(port->as_int(80)));
+  }
+  if (const Value* proto = args.find("protocol"); proto && proto->is_string() && !proto->as_string().empty()) {
+    cmd.push_back("--protocol");
+    cmd.push_back(proto->as_string());
+  }
+  if (const Value* rps = args.find("rps"); rps && rps->as_double(0.0) > 0.0) {
+    cmd.push_back("--rps");
+    cmd.push_back(std::to_string(rps->as_double(0.0)));
+  }
+  if (const Value* cnt = args.find("count"); cnt && cnt->as_int(0) > 0) {
+    cmd.push_back("--count");
+    cmd.push_back(std::to_string(cnt->as_int(100)));
+  }
+  if (const Value* ka = args.find("keepalive"); ka && ka->as_bool(false)) {
+    cmd.push_back("--keepalive");
   }
 
   const auto res = RunSubprocess(cmd, 60);

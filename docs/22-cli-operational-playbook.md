@@ -29,31 +29,30 @@ Every rigorous performance engagement must proceed through the following phases:
 
 1. Parameter and scope validation
 2. Authorization and boundary verification
-3. Dry-run execution to clear parser and preflight checks
-4. Short baseline verification run
+3. Profile & CLI flag verification (`--help`, `--list-profiles`)
+4. Short baseline verification run (`--count` bounded)
 5. Controlled benchmark or longevity soak execution
 6. Report and artifact aggregation
 7. Statistical reproducibility validation
 
 Key Operational Rules:
 
-- Never launch a live execution without completing a successful `--dry-run`.
+- Validate parameters with `--help` and `--list-profiles` before launching sustained runs, and start with a short bounded smoke test against your authorized lab target (`--count 100 --confirm`).
 - Execute privileged kernel-bypass paths (AF_XDP, TX_RING, DPDK) exclusively on dedicated lab infrastructure.
-- Never certify long-running benchmarks without archiving formal run reports via `--run-report`.
-- For authoritative benchmark scoring, always enforce `--lab-profile dedicated` coupled with strict KPI gates.
+- Never certify long-running benchmarks without archiving formal run reports via `--report-json` / `--report-text`.
+- For authoritative benchmark scoring, always enforce explicit transport backends coupled with strict KPI gates (`--kpi-*`).
 
 ## Workflow Selection Matrix
 
 | Operational Need | Recommended Workflow |
 |---|---|
-| Verify flags and validate configuration syntax without traffic | Dry-run validation |
-| Ensure codebase and local environment dependencies are healthy | Automated self-test |
+| Verify flags and validate configuration syntax | `--help`, `--list-profiles`, and short bounded smoke test |
+| Ensure codebase and local environment dependencies are healthy | Automated CTest / pytest verification suite |
 | Measure baseline application Layer 7 HTTP/HTTPS throughput | Layer 7 baseline |
 | Measure raw line-rate packet transmission and driver efficiency | Dataplane benchmark |
 | Evaluate memory stability, RSS drift, and packet rate degradation | Soak longevity run |
 | Generate synthetic PCAP datasets on hardware accelerators | GPU PCAP generator |
 | Replay historical network capture traces with precise timing | PCAP replay engine |
-| Validate neural traffic model integration without network output | Traffic-model dry-validate |
 | Drive maximum line-rate load using CUDA kernel batching | GPU compute backend workflow |
 
 ## Environment Preparation Checklist
@@ -87,56 +86,49 @@ Inspect available profiles and command flags:
 ./build/cli/samurai --list-profiles
 ```
 
-## Tier 1: Parse and Preflight Validation
+## Tier 1: Parse and Bounded Smoke Validation
 
-Preflight operations transmit zero packets over the wire. This step acts as the primary gate for verifying configuration syntax, flag combinations, and worker thread mapping before engaging network devices.
+Every traffic run exercises real worker codepaths against an authorized target. Verify CLI flags with `--help` and run a tightly bounded smoke test (`--count 100`) against an authorized loopback or staging target before scaling load.
 
-### Example 1: Basic TCP Dry-Run
+### Example 1: Bounded TCP Smoke Run
 
 ```bash
 ./build/cli/samurai \
+  --worker cpu \
   --target 10.10.20.15 \
   --port 443 \
   --protocol tcp \
-  --attack-vector basic \
-  --count 5000 \
-  --workers 8 \
-  --dry-run \
+  --count 100 \
   --confirm \
-  --log artifacts/logs/basic_dry_run.log
+  --report-json artifacts/reports/basic_smoke.json
 ```
 
 Validation objectives:
 
-- Validate parameter parsing, profile resolution, and schema validation.
-- Review worker process core allocations.
-- Confirm target IP, port, and transport protocol bindings are accepted.
+- Validate parameter parsing, profile resolution, and target-safety checks.
+- Confirm target IP, port, and transport protocol execution against a bounded packet count.
 
-### Example 2: HTTP/2 Preflight Check
+### Example 2: Bounded HTTP/2 Smoke Check
 
 ```bash
 ./build/cli/samurai \
+  --worker l7 \
   --target 10.10.30.25 \
   --port 443 \
-  --attack-vector http2 \
-  --http-scheme https \
-  --http-path /health /api/status \
-  --http-method GET \
-  --http2-concurrency 200 \
-  --http2-connections 4 \
-  --http2-streams-per-conn 50 \
-  --tls-profile chrome_120 \
-  --h2-profile chrome_120 \
-  --h2-transport auto \
-  --dry-run \
+  --l7-protocol http2 \
+  --scheme https \
+  --concurrency 4 \
+  --max-connections 2 \
+  --max-streams 10 \
+  --count 100 \
   --confirm \
-  --log artifacts/logs/http2_dry_run.log
+  --report-json artifacts/reports/http2_smoke.json
 ```
 
 Validation objectives:
 
-- Validate Layer 7 scenario configuration prior to live execution.
-- Validate HTTP/2 transport engine selection and TLS fingerprint compatibility.
+- Validate Layer 7 scenario configuration against a live lab endpoint.
+- Validate HTTP/2 transport engine selection and connection reuse (`--keepalive`).
 
 ## Tier 2: Configuration File Workflows
 
@@ -168,16 +160,7 @@ run_report_dir: artifacts/reports
 log: artifacts/logs/web_stress_dev.log
 ```
 
-Execute dry-run from configuration file:
-
-```bash
-./build/cli/samurai \
-  --config artifacts/configs/web_stress_dev.yaml \
-  --dry-run \
-  --confirm
-```
-
-Execute live run from configuration file:
+Execute live run using a configuration file (`samurai.conf` + bounded `--count`):
 
 ```bash
 ./build/cli/samurai \
@@ -391,28 +374,19 @@ Setting `--compute-backend cuda` activates the GPU hardware packet generation pi
 - Combined throughput behavior across the sender and hardware dataplane
 
 Execution Progression:
-Dry-Run -> Short Smoke Run -> Baseline -> Parameter Tuning -> Longevity Soak -> CPU vs GPU A/B Comparison
+Bounded Smoke Run -> Baseline -> Parameter Tuning -> Longevity Soak -> CPU vs GPU A/B Comparison
 
-### Flow A: GPU Readiness Dry-Run
+### Flow A: GPU Bounded Smoke Check
 
 ```bash
 ./build/cli/samurai \
+  --worker gpu \
   --target 10.21.10.10 \
   --port 443 \
   --protocol tcp \
-  --attack-vector basic \
-  --compute-backend cuda \
-  --workers 4 \
-  --count 20000 \
-  --gpu-template-pool-size-l4 16 \
-  --gpu-ring-capacity 4 \
-  --gpu-batch-size 65536 \
-  --gpu-stream-count 2 \
-  --gpu-pipeline-depth 2 \
-  --gpu-pinned-max-mb 256 \
-  --dry-run \
+  --count 1000 \
   --confirm \
-  --log artifacts/logs/gpu_readiness_dry_run.log
+  --report-json artifacts/reports/gpu_smoke.json
 ```
 
 Validation objectives:
@@ -905,7 +879,7 @@ Because runtime traffic model integration is constrained, initial validation sho
 ### Pattern 1: Prior to Introducing New Workload Scenarios
 
 1. Review `--help` and `--list-profiles`.
-2. Execute `--dry-run` to validate schema and arguments.
+2. Execute a tightly bounded smoke run (`--count 100 --confirm`) against a lab loopback/staging endpoint.
 3. Execute a short baseline run.
 4. Inspect the resulting run report.
 5. Proceed to formal benchmark or soak runs.
@@ -926,10 +900,10 @@ Because runtime traffic model integration is constrained, initial validation sho
 
 ## Common Operational Pitfalls
 
-### Skipping Dry-Run Validation
+### Skipping Bounded Smoke Validation
 
 Consequences:
-- Configuration and syntax errors surface mid-run during live execution.
+- Argument, transport, or endpoint reachability errors surface mid-run during large benchmark windows.
 - Benchmark validity is compromised, wasting test windows.
 
 ### Benchmarking with Permissive Fallback (`allow`)
@@ -971,7 +945,7 @@ Recommended filename elements:
 
 The Samurai Network Resilience Platform delivers optimal, reproducible results when operators select workflows matching their operational tier:
 
-1. Always execute `--dry-run` first.
+1. Always execute a bounded smoke check first (`--count 100 --confirm`).
 2. Establish a short reference baseline.
 3. Perform controlled benchmark or longevity soak runs.
 4. Archive artifacts via `--run-report`.

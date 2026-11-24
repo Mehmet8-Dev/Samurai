@@ -472,7 +472,7 @@ void PrintSetupUsage() {
   std::printf(
       "Usage:\n"
       "  samurai_mcp doctor [--client <id>] [--host-os <linux|macos|windows>] [--json]\n"
-      "  samurai_mcp setup --client <id> [--dry-run] [--yes] [--docker | --npx] [--ghcr] [--image <ref>] [--host-os <linux|macos|windows>] [--scope user|project] [--json]\n"
+      "  samurai_mcp setup --client <id> [--yes] [--docker | --npx] [--ghcr] [--image <ref>] [--host-os <linux|macos|windows>] [--scope user|project] [--json]\n"
       "\n"
       "Supported --client IDs:\n"
       "  claude_code, claude_desktop, cursor, codex, gemini_cli,\n"
@@ -772,7 +772,7 @@ SetupResult ExecuteSetup(const SetupOptions& opts) {
     new_content = DumpPretty(doc);
   }
 
-  const bool apply = opts.yes && !opts.dry_run;
+  const bool apply = opts.yes;
   bool backed_up = false;
   if (apply) {
     if (exists) {
@@ -801,7 +801,6 @@ SetupResult ExecuteSetup(const SetupOptions& opts) {
   Value out = Value::Object();
   out.set("ok", Value::Bool(true));
   out.set("applied", Value::Bool(apply));
-  out.set("dry_run", Value::Bool(!apply));
   out.set("host_os", Value::Str(host_os));
   out.set("client", Value::Str(spec->id));
   out.set("display_name", Value::Str(spec->display_name));
@@ -956,8 +955,6 @@ int RunSetupCli(int argc, char** argv) {
       opts.image = "ghcr.io/mehmet8-dev/samurai:latest";
     } else if (a == "--npx") {
       opts.npx = true;
-    } else if (a == "--dry-run") {
-      opts.dry_run = true;
     } else if (a == "--yes" || a == "-y") {
       opts.yes = true;
     } else if (a == "--json") {
@@ -988,7 +985,7 @@ int RunSetupCli(int argc, char** argv) {
   } else {
     const bool applied = res.report.find("applied")->as_bool(false);
     std::printf("Samurai MCP Setup (%s)\n", res.report.find("display_name")->as_string().c_str());
-    std::printf("  Status:     %s\n", applied ? "APPLIED" : "DRY-RUN PLAN (no files modified)");
+    std::printf("  Status:     %s\n", applied ? "APPLIED" : "NOT WRITTEN (pass --yes to apply)");
     std::printf("  Mode:       %s\n", res.report.find("transport_mode")->as_string().c_str());
     std::printf("  Config:     %s\n", res.report.find("config_path")->as_string().c_str());
     if (res.report.find("config_existed")->as_bool(false)) {

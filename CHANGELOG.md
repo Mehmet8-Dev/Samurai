@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-11-25
+
+### Added
+- **Host-Compiled `source-runtime` GHCR Image & Windows 1-Command MCP Setup (`Dockerfile`, `docker/samurai-entrypoint.sh`, `npm/lib/mcp_setup.js`, `samurai/mcp/setup_tools.*`)**:
+  - Added `--target source-runtime` and `docker/samurai-entrypoint.sh` so GitHub Releases push uncompiled source code + C++17 build toolchain to `ghcr.io/mehmet8-dev/samurai:latest` without compiling on GitHub Actions; first container startup compiles natively (`-DSAMURAI_NATIVE_ARCH=ON`) into `-v samurai-build-cache:/var/cache/samurai` while keeping MCP JSON-RPC `stdout` clean.
+  - Added host-native cross-platform `mcp_setup.js` and C++ `--host-os <linux|macos|windows>`, `--ghcr`, `--all`, and `--preview` flags supporting Windows `%APPDATA%` / `%USERPROFILE%` paths, `npx.cmd`, and `--add-host host.docker.internal:host-gateway`.
+- **Distributed Scenario JSON Orchestration & Bundled Mahoraga RL Weights (`samurai/control/`, `samurai/mcp/`, `artifacts/rl/`)**:
+  - Added end-to-end Scenario JSON distribution (`--l7-profile-file`, `--l7-profile-json`, `samurai_cluster_run_job`, `samurai_autopilot_run_window`) from `samurai_master` to `samurai_slave` shards across ZMQ.
+  - Bundled 12 canonical Mahoraga `.srlp` weights in `artifacts/rl/` and `/usr/local/share/samurai/rl/` inside containers with `ResolveRlPolicyPath()`, plus `host.docker.internal` IPv4 safety resolution in `ResolveMcpTarget()`.
+- **Three-Tier `CLI > Env > samurai.conf` Configuration Tuning (`samurai/cli/config_loader.hpp`, `config/samurai.conf.example`)**:
+  - Added `--config`, `--iface`, `--transport`, `--dpdk-port`, `--dpdk-queue`, and `--log-level` alongside [`docs/51-configuration-and-performance-tuning.md`](docs/51-configuration-and-performance-tuning.md).
+
+### Changed & Fixed
+- **Removed Remaining Dry-Run Mocks & Fixed Live RFC Suite Benchmarking (`samurai/cli/main.cpp`, `samurai/cli/rfc_suite.*`, `samurai/zmq/daemon/`, `.github/workflows/ci.yml`)**:
+  - Removed silent dry-run/noop fallbacks across `telco_worker`, `cpu_worker`, `gpu_worker`, `scenario_worker`, and `rfc_suite`; `--run-rfc-suite` and `samurai_run_rfc_suite` now enforce live dataplane confirmation (`--confirm` + authorized target), honor `--rps`/`--count` trial bounds, support per-RFC selection (`rfc2544`/`rfc3511`/`rfc8219`/`all`), and report proportional scores.
+  - Replaced legacy `--dry-run` references across CLI usage, RFC runner, CI smoke tests, and operational docs with live loopback verification, and removed separate `--dry-run`/`--preview` flags (setup without `--yes` already avoids mutating files).
+  - Bumped canonical SemVer across package, `npm/package.json`, Helm `appVersion`, citation metadata, MCP server, Docker image examples, and documentation to `3.4.0`.
+
 ## [3.3.3] - 2026-11-23
 
 ### Fixed

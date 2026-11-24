@@ -28,7 +28,6 @@ struct SetupOptions {
   std::string host_os;           // optional override: linux | macos | windows
   bool docker = false;
   bool npx = false;
-  bool dry_run = false;
   bool yes = false;
   bool json = false;
   std::string binary_override;   // optional samurai_mcp path override
@@ -47,7 +46,7 @@ samurai::core::json::Value BuildDoctorReport(const DoctorOptions& opts);
 int RunDoctorCli(int argc, char** argv);
 
 // Plan or apply MCP server registration for a target AI client.
-// Never mutates files unless `opts.yes && !opts.dry_run`.
+// Never mutates files unless `opts.yes` is true.
 struct SetupResult {
   bool ok = false;
   int exit_code = 0;

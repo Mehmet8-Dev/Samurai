@@ -22,8 +22,9 @@ Common command examples:
 # Display profiles
 ./build/cli/samurai --list-profiles
 
-# Dry-run / safe parser and configuration check
-./build/cli/samurai --dry-run -t 10.0.0.10 -p 443 --attack-vector http
+# Display profiles or inspect CLI syntax (every traffic run targets a live endpoint with --confirm)
+./build/cli/samurai --list-profiles
+./build/cli/samurai --help
 
 # Self-test suite execution
 ./build/cli/samurai --self-test
@@ -125,8 +126,7 @@ Notes:
 | `--scenario-sla-profile` | `-` | `-` | - | SLA profile name or inline JSON SLA criteria override. |
 | `--scenario-seed` | `1337` | `-` | - | Deterministic random seed for scenario execution flow. |
 | `--role` | `standalone` | `standalone, master, slave` | - | Distributed cluster role selection. |
-| `--confirm` | `False` | `-` | - | Acknowledge terms of engagement and bypass interactive prompt. |
-| `--dry-run` | `False` | `-` | - | Validate configuration, construct sample packet buffers, and exit safely. |
+| `--confirm` | `False` | `-` | - | Confirm live dataplane execution (required for live RFC suites). |
 | `-v, --verbose` | `False` | `-` | - | Enable detailed debug logging output. |
 | `--log` | `samurai_logs.txt` | `-` | - | Destination file path for execution log events. |
 | `--workers` | `12` | `-` | - | Number of worker processes spawned (Default: 12). |

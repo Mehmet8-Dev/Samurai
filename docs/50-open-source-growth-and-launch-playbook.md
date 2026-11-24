@@ -1,4 +1,4 @@
-# 50 - Open-Source Growth & Viral Launch Playbook (Samurai v3.3.3)
+# 50 - Open-Source Growth & Viral Launch Playbook (Samurai v3.4.0)
 
 This playbook translates the proven open-source viral distribution mechanics behind breakthrough developer repositories (such as REA's outcome-first positioning, 1-command onboarding, MCP agent integration, visual proof, and segmented multi-community engineering launches) into a concrete execution plan for **Samurai (`Mehmet8-Dev/Samurai`)**.
 
@@ -19,8 +19,8 @@ Before publishing any external post, configure these in **GitHub → Settings**:
   - `Benchmarks & Hardware Results` (Pin a thread: *"Community 1M TCP Flow Leaderboard — run `docker run --rm -v samurai-build-cache:/var/cache/samurai ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp` (compiles natively on your CPU on first run) and post your CPU!"*)
   - `Architecture & RFCs`
   - `Show & Tell` (Lab topologies, WAF/BNG/5G UPF test setups)
-- **Publish a `v3.3.3` Tag After Pushing:**
-  Pushing a `v3.3.3` tag triggers `.github/workflows/release.yml`, publishing `ghcr.io/mehmet8-dev/samurai:latest` as an **uncompiled source + toolchain container** (`--target source-runtime`) so each user compiles locally (`SAMURAI_NATIVE_ARCH=ON`) on first run and gets:
+- **Publish a `v3.4.0` Tag After Pushing:**
+  Pushing a `v3.4.0` tag triggers `.github/workflows/release.yml`, publishing `ghcr.io/mehmet8-dev/samurai:latest` as an **uncompiled source + toolchain container** (`--target source-runtime`) so each user compiles locally (`SAMURAI_NATIVE_ARCH=ON`) on first run and gets:
   - Auto-discovered worker binaries (no `--worker-dir` required)
   - Native C++17 `samurai_mcp` (22 tools, 5 skill resources, 5 workflow prompts) + `/usr/local/share/samurai/skills` + bundled `artifacts/rl/*.srlp` Mahoraga weights
   - Built-in `samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, and `samurai_bench_l7` commands inside the host-compiled container!
@@ -69,7 +69,7 @@ Before publishing any external post, configure these in **GitHub → Settings**:
 
 ### Story 6 — X / Twitter Launch Thread (5-Post Viral Format)
 - **Post 1 (Hook + Visual/GIF):**
-  > I just open-sourced **Samurai v3.3.3** — a pure C++17 network resilience & line-rate stress platform.
+  > I just open-sourced **Samurai v3.4.0** — a pure C++17 network resilience & line-rate stress platform.
   >
   > One laptop (Ryzen 5 5600H + GTX 1650):
   > • 1,000,000 stateful TCP flows in 577 MiB RAM (`605 B/flow`, -63.3%)
@@ -101,8 +101,8 @@ asciinema rec /tmp/samurai_demo.cast -c "bash -c '
   echo \"$ ./build/zmq/bench_l7_stateful_userspace --proto h2 --flows 10000\"
   ./build/zmq/bench_l7_stateful_userspace --proto h2 --flows 10000
   echo \"\"
-  echo \"$ ./build/cli/samurai --run-rfc-suite all | head -n 22\"
-  ./build/cli/samurai --run-rfc-suite all | head -n 22
+  echo \"$ ./build/cli/samurai --run-rfc-suite all --worker l7 --target 127.0.0.1 --port 8080 --rps 500 --count 100 --confirm | head -n 22\"
+  ./build/cli/samurai --run-rfc-suite all --worker l7 --target 127.0.0.1 --port 8080 --rps 500 --count 100 --confirm | head -n 22
 '"
 agg --font-size 16 --theme monokai /tmp/samurai_demo.cast docs/assets/samurai_demo.gif
 ```
@@ -122,7 +122,7 @@ Do **not** post to all channels on the same day. Space stories out so each wave 
 
 | Week | Primary Channel | Story / Hook | Goal |
 | :--- | :--- | :--- | :--- |
-| **Week 1 (Tue 15:00 UTC)** | GitHub `v3.3.3` release + **Show HN** + **X Thread** | 1M TCP flows in 577 MiB (`605 B/flow`) + 1-command Docker reproduction | Hit HN front page + GitHub Trending (C++) |
+| **Week 1 (Tue 15:00 UTC)** | GitHub `v3.4.0` release + **Show HN** + **X Thread** | 1M TCP flows in 577 MiB (`605 B/flow`) + 1-command Docker reproduction | Hit HN front page + GitHub Trending (C++) |
 | **Week 2 (Wed)** | **`r/cpp`** + **Lobste.rs** | Deep dive: `std::deque` slab retention & cache-line lock striping (`-63.3% RAM`) | High-signal C++ code reviews & contributors |
 | **Week 3 (Tue)** | **`r/CUDA`** + **NVIDIA Dev Forums** + YouTube Short | Consumer GeForce BAR1 P2P DMA + 129M masks/s QUIC CUDA crypto | Capture GPU/HPC developer wave |
 | **Week 4 (Thu)** | **`r/networking`** + **`r/linux`** + **LinkedIn Telecom** | Kernel `netns+veth` interop (`133.5k CPS`) + 5G CUPS + MCP AI benchmarking demo | Enterprise/carrier visibility & commercial support leads |

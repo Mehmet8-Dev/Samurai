@@ -254,12 +254,15 @@ run_report_dir: artifacts/reports/ecommerce_preprod
 log: artifacts/logs/ecommerce_preprod_baseline.log
 ```
 
-#### Step 1: Preflight Dry-Run
+#### Step 1: Bounded Smoke Verification
 
 ```bash
 ./build/cli/samurai \
-  --config artifacts/configs/ecommerce_preprod_baseline.yaml \
-  --dry-run \
+  --config config/samurai.conf.example \
+  --worker l7 \
+  --target 10.10.40.12 \
+  --port 443 \
+  --count 100 \
   --confirm
 ```
 
@@ -343,12 +346,14 @@ run_report_dir: artifacts/reports/ecommerce_gpu_browse
 log: artifacts/logs/ecommerce_gpu_browse.log
 ```
 
-Dry-run validation:
+Bounded GPU smoke validation:
 
 ```bash
 ./build/cli/samurai \
-  --config artifacts/configs/ecommerce_gpu_browse_baseline.yaml \
-  --dry-run \
+  --worker gpu \
+  --target 10.20.30.40 \
+  --port 443 \
+  --count 1000 \
   --confirm
 ```
 
@@ -537,12 +542,15 @@ run_report_dir: artifacts/reports/defense_validation
 log: artifacts/logs/defense_validation_http2.log
 ```
 
-#### Step 1: Preflight Verification
+#### Step 1: Bounded Smoke Verification
 
 ```bash
 ./build/cli/samurai \
-  --config artifacts/configs/defense_validation_http2.yaml \
-  --dry-run \
+  --worker l7 \
+  --l7-protocol http2 \
+  --target 10.30.10.5 \
+  --port 443 \
+  --count 100 \
   --confirm
 ```
 

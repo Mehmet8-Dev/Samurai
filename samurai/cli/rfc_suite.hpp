@@ -78,10 +78,11 @@ struct RfcSuiteResult {
   Rfc2544Result rfc2544;
   Rfc3511Result rfc3511;
   Rfc8219Result rfc8219;
-  double score = 100.0;
-  bool overall_passed = true;
+  double score = 0.0;
+  bool overall_passed = false;
   bool live_dataplane = false;
-  std::string execution_mode = "SIMULATED_DRY_RUN";
+  std::string suite = "all";
+  std::string execution_mode = "REQUIRES_LIVE_TARGET";
 };
 
 class RfcSuiteEngine {
@@ -126,7 +127,8 @@ class RfcSuiteEngine {
       std::function<Rfc2544Trial(double trial_rps)> trial_runner,
       std::function<Rfc3511Sample(double cps)> cps_runner,
       std::function<Rfc8219Sample(double gbps)> inspection_runner,
-      bool live_dataplane = true);
+      bool live_dataplane = true,
+      const std::string& suite = "all");
 };
 
 class RfcReportGenerator {

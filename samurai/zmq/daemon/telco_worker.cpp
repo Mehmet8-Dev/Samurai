@@ -1553,6 +1553,7 @@ int main(int argc, char** argv) {
         batch_limit = static_cast<uint32_t>(std::min<uint64_t>(batch_limit, rem));
       }
 
+      const auto t_tx0 = std::chrono::steady_clock::now();
       tx_packets_batch.clear();
       runtime->active_driver->GenerateTraffic(
           runtime->session_mgr, active_sub_cursor, batch_limit, tx_packets_batch);
@@ -1567,6 +1568,12 @@ int main(int argc, char** argv) {
         lens.push_back(static_cast<uint16_t>(pkt.size()));
       }
       const size_t sent = packet_transport->TransmitBurst(ptrs.data(), lens.data(), ptrs.size());
+      if (sent > 0) {
+        const auto t_tx1 = std::chrono::steady_clock::now();
+        const uint32_t tx_us = static_cast<uint32_t>(std::max<long long>(
+            1, std::chrono::duration_cast<std::chrono::microseconds>(t_tx1 - t_tx0).count()));
+        latency_ring.RecordUs(tx_us);
+      }
       if (ptrs.size() > sent) {
         tx_errors_total += (ptrs.size() - sent);
       }

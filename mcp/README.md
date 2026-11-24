@@ -33,10 +33,8 @@ Exposes **22 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**,
 npx -y samurai-net mcp doctor
 # (or locally compiled: ./build/mcp/samurai_mcp doctor --client codex --json)
 
-# 2. Preview proposed config changes (safe non-mutating dry-run)
-npx -y samurai-net mcp setup --client cursor --dry-run
-
-# 3. Apply registration to a single client or every detected IDE/CLI on Windows / macOS / Linux (creates .bak backup)
+# 2. Check proposed config path without modifying files (omit --yes), then apply (.bak backup created automatically):
+npx -y samurai-net mcp setup --client cursor
 npx -y samurai-net mcp setup --client all --yes
 npx -y samurai-net mcp setup --client antigravity --yes
 npx -y samurai-net mcp setup --client vscode --yes
@@ -49,7 +47,7 @@ npx -y samurai-net mcp setup --client claude_code --docker --ghcr --yes
 ```
 
 > **Windows & macOS (Docker Desktop) — Host-Local Compile Inside Docker & Path Resolution:**
-> - **Host-local build (`--docker` or `--ghcr`):** Running `npx -y samurai-net mcp setup ... --yes` compiles C++ **for your local host CPU/GPU (`SAMURAI_NATIVE_ARCH=ON`)** — either via local `docker build` (`samurai:local-v3.3.3`) or with `--ghcr` by pulling the uncompiled `ghcr.io/mehmet8-dev/samurai:latest` source+toolchain image and compiling once into `-v samurai-build-cache:/var/cache/samurai` (pass `--no-build` to skip pre-warming). GitHub CI never pre-compiles binaries inside the GHCR image.
+> - **Host-local build (`--docker` or `--ghcr`):** Running `npx -y samurai-net mcp setup ... --yes` compiles C++ **for your local host CPU/GPU (`SAMURAI_NATIVE_ARCH=ON`)** — either via local `docker build` (`samurai:local-v3.4.0`) or with `--ghcr` by pulling the uncompiled `ghcr.io/mehmet8-dev/samurai:latest` source+toolchain image and compiling once into `-v samurai-build-cache:/var/cache/samurai` (pass `--no-build` to skip pre-warming). GitHub CI never pre-compiles binaries inside the GHCR image.
 > - **Native Windows IDE/CLI paths:** `samurai-net mcp setup` runs directly on your Windows Node.js host so `%APPDATA%\Code\User\mcp.json`, `%APPDATA%\Claude\claude_desktop_config.json`, `%USERPROFILE%\.cursor\mcp.json`, `%USERPROFILE%\.claude.json`, `%USERPROFILE%\.codex\config.toml`, `%USERPROFILE%\.gemini\antigravity\mcp_config.json`, and `%USERPROFILE%\.codeium\windsurf\mcp_config.json` resolve without container path mismatches.
 > - **Docker Desktop networking:** On non-Linux hosts, containers run inside a Linux VM so `--network host` cannot reach host `127.0.0.1`. `mcp setup` automatically emits `--add-host host.docker.internal:host-gateway` so MCP tools can target host services via `host.docker.internal` (or sibling containers on a shared Docker network).
 
@@ -93,7 +91,7 @@ claude mcp add samurai -- docker run -i --rm --network host samurai:local samura
 | `samurai_list_workers` | Discovers all 10 compiled C++17 workers (`cpu`, `afpacket`, `afxdp`, `dpdk`, `gpu`, `doca`, `l7`, `scenario`, `telco`, `defense`), daemons, and benchmarks |
 | `samurai_list_profiles` | Lists built-in L4, L7, and 4G/5G carrier-telecom profiles |
 | `samurai_run_benchmark` | Executes real live traffic against an authorized target server using any of the 10 workers (full L7/TLS/H2/QUIC, 4G/5G Telco CUPS/GTP-U/SCTP/Diameter/SIP-SRTP, GPU BAR1 P2P, IPFIX, and KPI gate controls) |
-| `samurai_run_rfc_suite` | Runs RFC 2544 / 3511 / 8219 compliance benchmarks (analytical dry-run or `live_dataplane: true` against a target) |
+| `samurai_run_rfc_suite` | Runs live RFC 2544 / 3511 / 8219 compliance benchmarks against an authorized target (`target` + `live_dataplane: true` required) |
 | `samurai_bench_tcp_flows` | Reproduces the 100k quick check or 1M active TCP flows (`605 B/flow`) internal dataplane scaling benchmark |
 | `samurai_bench_l7_userspace` | Runs the Shared-Nothing HTTP/1.1 & HTTP/2 internal userspace benchmark (`CPS`, `RPS`, `P50/P95/P99`, `VmRSS`) |
 

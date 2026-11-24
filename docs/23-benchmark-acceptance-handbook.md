@@ -61,8 +61,7 @@ Core Operational Rules:
 
 | Run Type | Operational Purpose | Evaluative Authority |
 |---|---|---|
-| Dry-run | Configuration, argument parsing, and preflight validation | Operational readiness |
-| Smoke run | Quick health check and end-to-end functionality verification | Low |
+| Preflight / Smoke run | Configuration validation and quick loopback/sandbox verification | Low (Operational readiness) |
 | Baseline | Reference performance characterization | Medium |
 | Benchmark | Rigorous, KPI-governed performance measurement | High |
 | Soak | Longevity stability, memory leak, and throughput drift tracking | High |
@@ -334,14 +333,14 @@ Corrective actions:
 
 GPU-accelerated pipelines must not be evaluated solely on peak packets-per-second:
 
-- Did the GPU readiness dry-run pass cleanly?
+- Did the bounded GPU readiness smoke run pass cleanly without silent CPU fallback?
 - Did the initial smoke run maintain stability?
 - Did throughput gains coincide with increased error rates or silent fallbacks?
 - Are tuning parameters (pipeline depth, stream count, batch size) documented in the report?
 - Was CPU vs GPU comparison conducted under identical constraints?
 
 Negative indicators in GPU evaluations:
-- Passing readiness in dry-run, but falling back to CPU during live execution.
+- Passing a bounded smoke check under low count while falling back to CPU under sustained load.
 - Rapid performance collapse under simulated fault injection.
 - High throughput accompanied by `invalid_metrics` or failed KPI gates.
 

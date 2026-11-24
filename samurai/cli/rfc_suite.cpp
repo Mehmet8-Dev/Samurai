@@ -153,13 +153,16 @@ RfcSuiteResult RfcSuiteEngine::RunAll(
     std::function<double(double gbps)> inspection_runner,
     bool live_dataplane) {
   RfcSuiteResult res;
+  res.suite = "all";
   res.live_dataplane = live_dataplane;
-  res.execution_mode = live_dataplane ? "LIVE_DATAPLANE" : "SIMULATED_DRY_RUN";
+  res.execution_mode = live_dataplane ? "LIVE_DATAPLANE" : "REQUIRES_LIVE_TARGET";
   res.rfc2544 = Run2544BinarySearch(c2544, trial_runner);
   res.rfc3511 = Run3511Benchmark(c3511, cps_runner);
   res.rfc8219 = Run8219Benchmark(c8219, inspection_runner);
-  res.overall_passed = (res.rfc2544.passed && res.rfc3511.passed && res.rfc8219.passed);
-  res.score = res.overall_passed ? 100.0 : 50.0;
+  const int passed_cnt = (res.rfc2544.passed ? 1 : 0) + (res.rfc3511.passed ? 1 : 0) +
+                         (res.rfc8219.passed ? 1 : 0);
+  res.overall_passed = (passed_cnt == 3);
+  res.score = (static_cast<double>(passed_cnt) * 100.0) / 3.0;
   return res;
 }
 
@@ -170,15 +173,37 @@ RfcSuiteResult RfcSuiteEngine::RunAllMeasured(
     std::function<Rfc2544Trial(double trial_rps)> trial_runner,
     std::function<Rfc3511Sample(double cps)> cps_runner,
     std::function<Rfc8219Sample(double gbps)> inspection_runner,
-    bool live_dataplane) {
+    bool live_dataplane,
+    const std::string& suite) {
   RfcSuiteResult res;
+  res.suite = suite.empty() ? "all" : suite;
   res.live_dataplane = live_dataplane;
-  res.execution_mode = live_dataplane ? "LIVE_DATAPLANE" : "SIMULATED_DRY_RUN";
-  res.rfc2544 = Run2544BinarySearchMeasured(c2544, trial_runner);
-  res.rfc3511 = Run3511BenchmarkMeasured(c3511, cps_runner);
-  res.rfc8219 = Run8219BenchmarkMeasured(c8219, inspection_runner);
-  res.overall_passed = (res.rfc2544.passed && res.rfc3511.passed && res.rfc8219.passed);
-  res.score = res.overall_passed ? 100.0 : 50.0;
+  res.execution_mode = live_dataplane ? "LIVE_DATAPLANE" : "REQUIRES_LIVE_TARGET";
+
+  const bool run_all = (res.suite == "all");
+  const bool run_2544 = run_all || res.suite == "rfc2544" || res.suite == "2544";
+  const bool run_3511 = run_all || res.suite == "rfc3511" || res.suite == "3511";
+  const bool run_8219 = run_all || res.suite == "rfc8219" || res.suite == "8219";
+
+  int total_cnt = 0;
+  int passed_cnt = 0;
+  if (run_2544) {
+    res.rfc2544 = Run2544BinarySearchMeasured(c2544, trial_runner);
+    ++total_cnt;
+    if (res.rfc2544.passed) ++passed_cnt;
+  }
+  if (run_3511) {
+    res.rfc3511 = Run3511BenchmarkMeasured(c3511, cps_runner);
+    ++total_cnt;
+    if (res.rfc3511.passed) ++passed_cnt;
+  }
+  if (run_8219) {
+    res.rfc8219 = Run8219BenchmarkMeasured(c8219, inspection_runner);
+    ++total_cnt;
+    if (res.rfc8219.passed) ++passed_cnt;
+  }
+  res.overall_passed = (total_cnt > 0 && passed_cnt == total_cnt);
+  res.score = total_cnt > 0 ? (static_cast<double>(passed_cnt) * 100.0) / static_cast<double>(total_cnt) : 0.0;
   return res;
 }
 

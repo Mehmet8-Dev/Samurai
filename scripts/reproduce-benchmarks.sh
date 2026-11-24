@@ -39,6 +39,7 @@ mkdir -p "$(dirname "$OUT_MD")"
 NEED_BUILD=0
 for bin in \
   "${BUILD_DIR}/cli/samurai" \
+  "${BUILD_DIR}/zmq/samurai_l7_worker" \
   "${BUILD_DIR}/l4/test_100k_tcp_flows" \
   "${BUILD_DIR}/l4/test_1m_tcp_flows" \
   "${BUILD_DIR}/zmq/bench_l7_stateful_userspace"; do
@@ -51,7 +52,7 @@ if [[ "$NEED_BUILD" -eq 1 ]]; then
   echo "[samurai] Building native C++17 benchmark targets..."
   cmake -B "$BUILD_DIR" -S "${ROOT_DIR}/samurai" -DCMAKE_BUILD_TYPE=Release
   cmake --build "$BUILD_DIR" -j"$(nproc)" --target \
-    samurai samurai_cpu_worker test_100k_tcp_flows test_1m_tcp_flows bench_l7_stateful_userspace
+    samurai samurai_cpu_worker samurai_l7_worker test_100k_tcp_flows test_1m_tcp_flows bench_l7_stateful_userspace
 fi
 
 CPU_MODEL="$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | xargs || uname -m)"
@@ -87,8 +88,51 @@ echo "$L7_H1_OUT" | tail -n 10
 echo "$L7_H2_OUT" | tail -n 10
 
 echo ""
-echo "[3/3] Running RFC 2544 / 3511 / 8219 Compliance Suite..."
-RFC_OUT="$("${BUILD_DIR}/cli/samurai" --run-rfc-suite all 2>&1)"
+echo "[3/3] Running RFC 2544 / 3511 / 8219 Compliance Suite (Live Loopback L7)..."
+if command -v python3 >/dev/null 2>&1; then
+  RFC_OUT="$(python3 - "${BUILD_DIR}/cli/samurai" <<'PY' 2>&1
+import http.server, socketserver, subprocess, sys, threading
+
+cli_bin = sys.argv[1]
+
+class OkHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
+    def do_GET(self):
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+
+class ReusableServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+srv = ReusableServer(("127.0.0.1", 0), OkHandler)
+port = srv.server_address[1]
+t = threading.Thread(target=srv.serve_forever, daemon=True)
+t.start()
+try:
+    p = subprocess.run([
+        cli_bin, "--run-rfc-suite", "all",
+        "--worker", "l7", "--protocol", "http1", "--keepalive", "--concurrency", "4",
+        "--target", "127.0.0.1", "--port", str(port),
+        "--rps", "200", "--count", "40", "--confirm",
+    ], capture_output=True, text=True)
+    sys.stdout.write(p.stdout + p.stderr)
+    sys.exit(p.returncode)
+finally:
+    srv.shutdown()
+    srv.server_close()
+PY
+)"
+else
+  RFC_OUT="SKIPPED: python3 not available to host local loopback HTTP target"
+fi
 echo "$RFC_OUT" | head -n 25
 
 cat > "$OUT_MD" <<EOF

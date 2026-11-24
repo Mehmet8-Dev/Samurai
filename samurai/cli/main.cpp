@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
     std::printf(
         "usage: %s mcp <doctor|setup> [options]\n"
         "  samurai mcp doctor [--client <id>] [--json]\n"
-        "  samurai mcp setup  --client <id> [--dry-run] [--yes] [--docker | --npx] [--scope user|project] [--json]\n",
+        "  samurai mcp setup  --client <id> [--yes] [--docker | --npx] [--ghcr] [--scope user|project] [--json]\n",
         argv[0]);
     return (argc == 2 || (argc >= 3 && (std::string(argv[2]) == "-h" || std::string(argv[2]) == "--help")))
                ? 0
@@ -190,6 +190,9 @@ int main(int argc, char** argv) {
     if (opt.worker_name.empty()) {
       opt.worker_name = "cpu";
     }
+    if (opt.worker_name == "l7" && opt.job.protocol == "udp") {
+      opt.job.protocol = "http1";
+    }
     if (!opt.vector_explicit && opt.job.attack_vector == "flood") {
       opt.job.attack_vector = "basic";
     }
@@ -201,115 +204,140 @@ int main(int argc, char** argv) {
   }
 
   if (is_rfc_run) {
+    const std::string& rfc_suite = opt.run_rfc_suite;
+    if (rfc_suite != "all" && rfc_suite != "rfc2544" && rfc_suite != "2544" &&
+        rfc_suite != "rfc3511" && rfc_suite != "3511" && rfc_suite != "rfc8219" && rfc_suite != "8219") {
+      std::fprintf(stderr,
+                   "samurai: invalid --run-rfc-suite '%s' (expected rfc2544|rfc3511|rfc8219|all)\n",
+                   rfc_suite.c_str());
+      return 2;
+    }
+    if (!opt.confirm || opt.job.target_ip.empty()) {
+      std::fprintf(stderr,
+                   "samurai: --run-rfc-suite requires --confirm and a live target (--target <ip> --port <p> --worker <name>)\n");
+      return 2;
+    }
+
     cli::Rfc2544Config c2544;
     cli::Rfc3511Config c3511;
     cli::Rfc8219Config c8219;
     if (opt.job.packet_size > 0) {
       c2544.packet_size_bytes = opt.job.packet_size;
     }
-
-    bool live_dataplane = opt.confirm && !opt.job.target_ip.empty();
-    std::function<cli::Rfc2544Trial(double trial_rps)> trial_runner;
-    std::function<cli::Rfc3511Sample(double cps)> cps_runner;
-    std::function<cli::Rfc8219Sample(double gbps)> inspection_runner;
-    orchestrator::WarmWorkerPool rfc_pool;
-
-    if (live_dataplane) {
-      const auto rfc_entry = orchestrator::LookupWorker(opt.worker_name);
-      if (rfc_entry.has_value()) {
-        const std::string suffix = std::to_string(static_cast<long>(getpid()));
-        orchestrator::SupervisorConfig sup_cfg;
-        sup_cfg.worker = *rfc_entry;
-        sup_cfg.worker_dir = opt.worker_dir;
-        sup_cfg.jobs_endpoint = "ipc:///tmp/samurai_jobs_rfc_" + suffix;
-        sup_cfg.events_endpoint = "ipc:///tmp/samurai_events_rfc_" + suffix;
-        sup_cfg.recv_timeout_ms = opt.timeout_ms;
-        sup_cfg.iface = opt.iface;
-        sup_cfg.transport = opt.transport;
-        sup_cfg.dpdk_port = opt.dpdk_port;
-        sup_cfg.dpdk_queue = opt.dpdk_queue;
-
-        trial_runner = [sup_cfg, opt, c2544, &rfc_pool](double trial_rps) -> cli::Rfc2544Trial {
-          orchestrator::JobOptions job = opt.job;
-          job.target_rps = trial_rps;
-          job.pacing_mode = trial_rps > 0.0 ? 1u : 0u;
-          const double duration = std::max(0.5, c2544.trial_duration_s);
-          job.packet_count = static_cast<uint32_t>(std::max(1.0, trial_rps * duration));
-          if (job.telco_duration_ms == 0) {
-            job.telco_duration_ms = static_cast<std::uint32_t>(duration * 1000.0);
-          }
-          orchestrator::RunStats stats;
-          const int rc = orchestrator::RunJob(sup_cfg, job, stats, &rfc_pool, nullptr, "rfc-suite");
-          cli::Rfc2544Trial trial;
-          trial.rate_rps = (stats.actual_rps > 0.0) ? stats.actual_rps : trial_rps;
-          trial.sent_packets = stats.attempted;
-          trial.received_packets = (stats.sent >= stats.errors) ? (stats.sent - stats.errors) : 0;
-          trial.loss_pct = (rc != 0 || stats.attempted == 0)
-                               ? 100.0
-                               : std::clamp(stats.wire_loss_est_pct, 0.0, 100.0);
-          return trial;
-        };
-
-        cps_runner = [sup_cfg, opt, &rfc_pool](double target_cps) -> cli::Rfc3511Sample {
-          orchestrator::JobOptions job = opt.job;
-          job.target_rps = target_cps;
-          job.pacing_mode = target_cps > 0.0 ? 1u : 0u;
-          job.packet_count = static_cast<uint32_t>(std::max(1.0, target_cps * 2.0));
-          job.telco_rate_cps = static_cast<std::uint32_t>(std::max(1.0, target_cps));
-          orchestrator::RunStats stats;
-          const auto t0 = std::chrono::steady_clock::now();
-          const int rc = orchestrator::RunJob(sup_cfg, job, stats, &rfc_pool, nullptr, "rfc-suite");
-          const double elapsed_ms =
-              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-          cli::Rfc3511Sample sample;
-          sample.ok = (rc == 0 && stats.attempted > 0);
-          sample.achieved_cps =
-              (stats.telco_current_cps > 0) ? static_cast<double>(stats.telco_current_cps) : stats.actual_rps;
-          if (stats.l7_request_latency_p99_ms > 0.0) {
-            sample.p99_latency_ms = stats.l7_request_latency_p99_ms;
-          } else if (stats.telco_p99_setup_latency_us > 0) {
-            sample.p99_latency_ms = static_cast<double>(stats.telco_p99_setup_latency_us) / 1000.0;
-          } else if (stats.telco_avg_setup_latency_us > 0) {
-            sample.p99_latency_ms = static_cast<double>(stats.telco_avg_setup_latency_us) / 1000.0;
-          } else {
-            sample.p99_latency_ms = elapsed_ms / static_cast<double>(std::max<std::uint64_t>(1, stats.sent));
-          }
-          if (opt.job.concurrency > 1) {
-            sample.max_concurrency = opt.job.concurrency;
-          } else if (opt.worker_name == "telco" && opt.job.telco_subscribers > 0) {
-            sample.max_concurrency = opt.job.telco_subscribers;
-          } else {
-            sample.max_concurrency = static_cast<uint32_t>(std::min<std::uint64_t>(
-                stats.sent, static_cast<std::uint64_t>(UINT32_MAX)));
-          }
-          return sample;
-        };
-
-        inspection_runner = [sup_cfg, opt, &rfc_pool](double) -> cli::Rfc8219Sample {
-          orchestrator::JobOptions job = opt.job;
-          orchestrator::RunStats stats;
-          const auto t0 = std::chrono::steady_clock::now();
-          const int rc = orchestrator::RunJob(sup_cfg, job, stats, &rfc_pool, nullptr, "rfc-suite");
-          const double elapsed_s = std::max(
-              1e-6, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-          cli::Rfc8219Sample sample;
-          sample.ok = (rc == 0 && stats.attempted > 0);
-          sample.inspection_pass_rate_pct =
-              sample.ok ? std::clamp(100.0 - stats.wire_loss_est_pct, 0.0, 100.0) : 0.0;
-          if (stats.bytes_sent > 0) {
-            sample.measured_gbps = (static_cast<double>(stats.bytes_sent) * 8.0) / (elapsed_s * 1e9);
-          } else {
-            sample.measured_gbps = (stats.actual_rps * static_cast<double>(opt.job.packet_size) * 8.0) / 1e9;
-          }
-          return sample;
-        };
-      } else {
-        live_dataplane = false;
-      }
+    if (opt.job.target_rps > 0.0) {
+      c2544.max_rate_rps = opt.job.target_rps;
+      c2544.min_rate_rps = std::max(1.0, std::min(1000.0, opt.job.target_rps * 0.05));
+      c2544.resolution_rps = std::max(5.0, c2544.max_rate_rps * 0.15);
+      c2544.trial_duration_s = std::clamp(
+          static_cast<double>(std::max<uint32_t>(1, opt.job.packet_count)) /
+              std::max(1.0, c2544.max_rate_rps),
+          0.1,
+          5.0);
+      c3511.target_cps = (opt.worker_name == "telco" && opt.job.telco_rate_cps > 0)
+                             ? static_cast<double>(opt.job.telco_rate_cps)
+                             : opt.job.target_rps;
+    } else if (opt.worker_name == "telco" && opt.job.telco_rate_cps > 0) {
+      c3511.target_cps = static_cast<double>(opt.job.telco_rate_cps);
     }
 
+    const auto rfc_entry = orchestrator::LookupWorker(opt.worker_name);
+    if (!rfc_entry.has_value()) {
+      std::fprintf(stderr, "samurai: worker '%s' not available for --run-rfc-suite\n", opt.worker_name.c_str());
+      return 2;
+    }
+
+    orchestrator::WarmWorkerPool rfc_pool;
+    const std::string suffix = std::to_string(static_cast<long>(getpid()));
+    orchestrator::SupervisorConfig sup_cfg;
+    sup_cfg.worker = *rfc_entry;
+    sup_cfg.worker_dir = opt.worker_dir;
+    sup_cfg.jobs_endpoint = "ipc:///tmp/samurai_jobs_rfc_" + suffix;
+    sup_cfg.events_endpoint = "ipc:///tmp/samurai_events_rfc_" + suffix;
+    sup_cfg.recv_timeout_ms = opt.timeout_ms;
+    sup_cfg.iface = opt.iface;
+    sup_cfg.transport = opt.transport;
+    sup_cfg.dpdk_port = opt.dpdk_port;
+    sup_cfg.dpdk_queue = opt.dpdk_queue;
+
+    auto trial_runner = [sup_cfg, opt, c2544, &rfc_pool](double trial_rps) -> cli::Rfc2544Trial {
+      orchestrator::JobOptions job = opt.job;
+      job.target_rps = trial_rps;
+      job.pacing_mode = trial_rps > 0.0 ? 1u : 0u;
+      const double duration = std::max(0.1, c2544.trial_duration_s);
+      job.packet_count = static_cast<uint32_t>(std::max(1.0, trial_rps * duration));
+      if (job.telco_duration_ms == 0) {
+        job.telco_duration_ms = static_cast<std::uint32_t>(duration * 1000.0);
+      }
+      orchestrator::RunStats stats;
+      const int rc = orchestrator::RunJob(sup_cfg, job, stats, &rfc_pool, nullptr, "rfc-suite");
+      cli::Rfc2544Trial trial;
+      trial.rate_rps = (stats.actual_rps > 0.0) ? stats.actual_rps : trial_rps;
+      trial.sent_packets = stats.attempted;
+      trial.received_packets = (stats.sent >= stats.errors) ? (stats.sent - stats.errors) : 0;
+      trial.loss_pct = (rc != 0 || stats.attempted == 0)
+                           ? 100.0
+                           : std::clamp(stats.wire_loss_est_pct, 0.0, 100.0);
+      return trial;
+    };
+
+    auto cps_runner = [sup_cfg, opt, &rfc_pool](double target_cps) -> cli::Rfc3511Sample {
+      orchestrator::JobOptions job = opt.job;
+      job.target_rps = target_cps;
+      job.pacing_mode = target_cps > 0.0 ? 1u : 0u;
+      job.packet_count = (opt.job.target_rps > 0.0)
+                             ? std::max<uint32_t>(1, opt.job.packet_count)
+                             : static_cast<uint32_t>(std::max(1.0, target_cps * 2.0));
+      job.telco_rate_cps = static_cast<std::uint32_t>(std::max(1.0, target_cps));
+      orchestrator::RunStats stats;
+      const auto t0 = std::chrono::steady_clock::now();
+      const int rc = orchestrator::RunJob(sup_cfg, job, stats, &rfc_pool, nullptr, "rfc-suite");
+      const double elapsed_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      cli::Rfc3511Sample sample;
+      sample.ok = (rc == 0 && stats.attempted > 0);
+      sample.achieved_cps =
+          (stats.telco_current_cps > 0) ? static_cast<double>(stats.telco_current_cps) : stats.actual_rps;
+      if (stats.l7_request_latency_p99_ms > 0.0) {
+        sample.p99_latency_ms = stats.l7_request_latency_p99_ms;
+      } else if (stats.telco_p99_setup_latency_us > 0) {
+        sample.p99_latency_ms = static_cast<double>(stats.telco_p99_setup_latency_us) / 1000.0;
+      } else if (stats.telco_avg_setup_latency_us > 0) {
+        sample.p99_latency_ms = static_cast<double>(stats.telco_avg_setup_latency_us) / 1000.0;
+      } else {
+        sample.p99_latency_ms = elapsed_ms / static_cast<double>(std::max<std::uint64_t>(1, stats.sent));
+      }
+      if (opt.job.concurrency > 1) {
+        sample.max_concurrency = opt.job.concurrency;
+      } else if (opt.worker_name == "telco" && opt.job.telco_subscribers > 0) {
+        sample.max_concurrency = opt.job.telco_subscribers;
+      } else {
+        sample.max_concurrency = static_cast<uint32_t>(std::min<std::uint64_t>(
+            stats.sent, static_cast<std::uint64_t>(UINT32_MAX)));
+      }
+      return sample;
+    };
+
+    auto inspection_runner = [sup_cfg, opt, &rfc_pool](double) -> cli::Rfc8219Sample {
+      orchestrator::JobOptions job = opt.job;
+      orchestrator::RunStats stats;
+      const auto t0 = std::chrono::steady_clock::now();
+      const int rc = orchestrator::RunJob(sup_cfg, job, stats, &rfc_pool, nullptr, "rfc-suite");
+      const double elapsed_s = std::max(
+          1e-6, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+      cli::Rfc8219Sample sample;
+      sample.ok = (rc == 0 && stats.attempted > 0);
+      sample.inspection_pass_rate_pct =
+          sample.ok ? std::clamp(100.0 - stats.wire_loss_est_pct, 0.0, 100.0) : 0.0;
+      if (stats.bytes_sent > 0) {
+        sample.measured_gbps = (static_cast<double>(stats.bytes_sent) * 8.0) / (elapsed_s * 1e9);
+      } else {
+        sample.measured_gbps = (stats.actual_rps * static_cast<double>(opt.job.packet_size) * 8.0) / 1e9;
+      }
+      return sample;
+    };
+
     const cli::RfcSuiteResult res = cli::RfcSuiteEngine::RunAllMeasured(
-        c2544, c3511, c8219, trial_runner, cps_runner, inspection_runner, live_dataplane);
+        c2544, c3511, c8219, trial_runner, cps_runner, inspection_runner, true, rfc_suite);
     const std::string md_report = cli::RfcReportGenerator::GenerateMarkdownReport(res);
     const std::string html_report = cli::RfcReportGenerator::GenerateHtmlReport(res);
     std::printf("%s\n", md_report.c_str());

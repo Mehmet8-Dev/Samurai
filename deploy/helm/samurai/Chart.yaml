@@ -3,4 +3,4 @@ name: samurai
 description: Samurai distributed control plane (master/slave)
 type: application
 version: 0.5.0
-appVersion: "3.3.3"
+appVersion: "3.4.0"

@@ -481,25 +481,24 @@ int main() {
     fs::remove_all(tmp_root, ec);
     fs::create_directories(tmp_root / ".codex", ec);
 
-    // Seed an existing ~/.claude.json with another MCP server and verify dry-run + --yes preserve it + backup
+    // Seed an existing ~/.claude.json with another MCP server and verify default check vs --yes + backup
     {
       std::ofstream out(tmp_root / ".claude.json");
       out << "{\"mcpServers\":{\"other\":{\"command\":\"/bin/true\"}}}\n";
     }
-    samurai::mcp::SetupOptions dry_opts;
-    dry_opts.client = "claude-code";
-    dry_opts.dry_run = true;
-    dry_opts.yes = false;
-    dry_opts.binary_override = "/usr/local/bin/samurai_mcp";
-    dry_opts.home_override = tmp_root.string();
-    dry_opts.project_override = tmp_root.string();
-    const auto dry_res = samurai::mcp::ExecuteSetup(dry_opts);
-    Check(dry_res.ok && dry_res.report.find("dry_run")->as_bool(false),
-          "setup without --yes runs in non-mutating dry-run mode");
-    Check(!fs::exists(tmp_root / ".claude.json.bak"), "dry-run does not create backup file");
+    samurai::mcp::SetupOptions check_opts;
+    check_opts.client = "claude-code";
+    check_opts.yes = false;
+    check_opts.binary_override = "/usr/local/bin/samurai_mcp";
+    check_opts.home_override = tmp_root.string();
+    check_opts.project_override = tmp_root.string();
+    const auto check_res = samurai::mcp::ExecuteSetup(check_opts);
+    const Value* applied_flag = check_res.report.find("applied");
+    Check(check_res.ok && applied_flag && !applied_flag->as_bool(true),
+          "setup without --yes does not mutate config");
+    Check(!fs::exists(tmp_root / ".claude.json.bak"), "setup without --yes does not create backup file");
 
-    samurai::mcp::SetupOptions apply_opts = dry_opts;
-    apply_opts.dry_run = false;
+    samurai::mcp::SetupOptions apply_opts = check_opts;
     apply_opts.yes = true;
     const auto apply_res = samurai::mcp::ExecuteSetup(apply_opts);
     Check(apply_res.ok && apply_res.report.find("applied")->as_bool(false) &&
@@ -556,7 +555,7 @@ int main() {
     samurai::mcp::SetupOptions npx_opts;
     npx_opts.client = "antigravity";
     npx_opts.npx = true;
-    npx_opts.dry_run = true;
+    npx_opts.yes = false;
     npx_opts.home_override = tmp_root.string();
     npx_opts.project_override = tmp_root.string();
     const auto npx_res = samurai::mcp::ExecuteSetup(npx_opts);
@@ -569,7 +568,7 @@ int main() {
     win_opts.client = "vscode";
     win_opts.host_os = "windows";
     win_opts.yes = true;
-    win_opts.image = "samurai:local-v3.3.3";
+    win_opts.image = "samurai:local-v3.4.0";
     win_opts.home_override = tmp_root.string();
     win_opts.project_override = tmp_root.string();
     win_opts.appdata_override = (tmp_root / "AppData" / "Roaming").string();
@@ -593,7 +592,7 @@ int main() {
       if (args_val && args_val->is_array()) {
         for (const auto& el : args_val->elements()) {
           if (el.as_string() == "host.docker.internal:host-gateway") has_gateway = true;
-          if (el.as_string() == "samurai:local-v3.3.3") has_local_img = true;
+          if (el.as_string() == "samurai:local-v3.4.0") has_local_img = true;
           if (el.as_string() == "samurai-build-cache:/var/cache/samurai") has_cache_vol = true;
         }
       }
@@ -616,7 +615,6 @@ int main() {
 
     samurai::mcp::SetupOptions win_npx_opts = win_opts;
     win_npx_opts.npx = true;
-    win_npx_opts.dry_run = true;
     win_npx_opts.yes = false;
     win_npx_opts.client = "windsurf";
     const auto win_npx_res = samurai::mcp::ExecuteSetup(win_npx_opts);

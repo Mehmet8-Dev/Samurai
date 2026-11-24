@@ -305,7 +305,6 @@ def test_cpp_mcp_doctor_and_setup_cli(tmp_path: Path) -> None:
             "cursor",
             "--scope",
             "project",
-            "--dry-run",
             "--json",
         ],
         cwd=str(tmp_path),
@@ -316,7 +315,6 @@ def test_cpp_mcp_doctor_and_setup_cli(tmp_path: Path) -> None:
     )
     setup_json = json.loads(setup.stdout)
     assert setup_json["ok"] is True
-    assert setup_json["dry_run"] is True
     assert setup_json["applied"] is False
     assert setup_json["config_path"] == str(tmp_path / ".cursor" / "mcp.json")
     assert not (tmp_path / ".cursor" / "mcp.json").exists()

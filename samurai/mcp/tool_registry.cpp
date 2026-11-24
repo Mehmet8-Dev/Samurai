@@ -220,12 +220,18 @@ void RegisterAllTools(McpServer& server,
   {
     Value props = Value::Object();
     props.set("suite", PropStr("RFC suite to run.", {"all", "rfc2544", "rfc3511", "rfc8219"}));
-    props.set("target", PropStr("Optional private/loopback IPv4 target."));
-    props.set("live_dataplane", PropBool("When true with a private target, run live dataplane trials."));
+    props.set("target", PropStr("Authorized private/loopback IPv4 target (required)."));
+    props.set("port", PropInt("Target port (default: 80)."));
+    props.set("worker", PropStr("Worker backend (e.g. l7, cpu, dpdk, telco)."));
+    props.set("protocol", PropStr("Protocol override (e.g. http1, http2, udp, tcp)."));
+    props.set("rps", PropNum("Target peak RPS ceiling for RFC 2544/3511 trials."));
+    props.set("count", PropInt("Requests/packets per RFC trial (default: 1000)."));
+    props.set("keepalive", PropBool("Reuse L7 connections across requests."));
+    props.set("live_dataplane", PropBool("Must be true to confirm live dataplane RFC trials."));
     server.RegisterTool({
         "samurai_run_rfc_suite",
-        "Execute Samurai's native RFC 2544 (throughput), RFC 3511 (firewall CPS), and RFC 8219 (IPv6) compliance benchmark suite.",
-        SchemaWithProps(std::move(props)),
+        "Execute Samurai's native RFC 2544 (throughput), RFC 3511 (firewall CPS), and RFC 8219 (IPv6) compliance benchmark suite against a live target.",
+        SchemaWithProps(std::move(props), {"target", "live_dataplane"}),
         [safety](const Value& a) { return HandleRunRfcSuite(a, safety); },
     });
   }
