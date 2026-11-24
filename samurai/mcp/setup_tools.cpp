@@ -171,49 +171,52 @@ std::string AppDataDir(const std::string& override_appdata, const std::string& h
   return home + "/AppData/Roaming";
 }
 
-std::string ResolveClientConfigPath(const ClientSpec& spec,
-                                    const std::string& scope,
-                                    const std::string& home,
-                                    const std::string& project,
-                                    const std::string& host_os = "",
-                                    const std::string& appdata_override = "") {
+std::vector<std::string> ResolveClientConfigCandidates(const ClientSpec& spec,
+                                                    const std::string& scope,
+                                                    const std::string& home,
+                                                    const std::string& project,
+                                                    const std::string& host_os = "",
+                                                    const std::string& appdata_override = "") {
   const std::string os_kind = NormalizeHostOs(host_os);
   const std::string id = spec.id;
   if (scope == "project" && spec.supports_project_scope) {
-    if (id == "claude_code") return project + "/.mcp.json";
-    if (id == "cursor") return project + "/.cursor/mcp.json";
-    if (id == "gemini_cli") return project + "/.gemini/settings.json";
-    if (id == "vscode") return project + "/.vscode/mcp.json";
-    if (id == "opencode") return project + "/opencode.json";
+    if (id == "claude_code") return {project + "/.mcp.json"};
+    if (id == "cursor") return {project + "/.cursor/mcp.json"};
+    if (id == "gemini_cli") return {project + "/.gemini/settings.json"};
+    if (id == "vscode") return {project + "/.vscode/mcp.json"};
+    if (id == "opencode") return {project + "/opencode.json"};
   }
 
-  if (id == "claude_code") return home + "/.claude.json";
+  if (id == "claude_code") return {home + "/.claude.json"};
   if (id == "claude_desktop") {
     if (os_kind == "windows") {
-      return AppDataDir(appdata_override, home) + "/Claude/claude_desktop_config.json";
+      return {AppDataDir(appdata_override, home) + "/Claude/claude_desktop_config.json"};
     }
     if (os_kind == "macos") {
-      return home + "/Library/Application Support/Claude/claude_desktop_config.json";
+      return {home + "/Library/Application Support/Claude/claude_desktop_config.json"};
     }
-    return home + "/.config/Claude/claude_desktop_config.json";
+    return {home + "/.config/Claude/claude_desktop_config.json"};
   }
-  if (id == "cursor") return home + "/.cursor/mcp.json";
-  if (id == "codex") return home + "/.codex/config.toml";
-  if (id == "gemini_cli") return home + "/.gemini/settings.json";
-  if (id == "antigravity") return home + "/.gemini/antigravity/mcp_config.json";
-  if (id == "windsurf") return home + "/.codeium/windsurf/mcp_config.json";
+  if (id == "cursor") return {home + "/.cursor/mcp.json"};
+  if (id == "codex") return {home + "/.codex/config.toml"};
+  if (id == "gemini_cli") return {home + "/.gemini/settings.json"};
+  if (id == "antigravity") {
+    // Prefer Antigravity 2.0 / agy CLI global path; fall back to legacy Antigravity IDE path.
+    return {home + "/.gemini/config/mcp_config.json", home + "/.gemini/antigravity/mcp_config.json"};
+  }
+  if (id == "windsurf") return {home + "/.codeium/windsurf/mcp_config.json"};
   if (id == "vscode") {
     if (os_kind == "windows") {
-      return AppDataDir(appdata_override, home) + "/Code/User/mcp.json";
+      return {AppDataDir(appdata_override, home) + "/Code/User/mcp.json"};
     }
     if (os_kind == "macos") {
-      return home + "/Library/Application Support/Code/User/mcp.json";
+      return {home + "/Library/Application Support/Code/User/mcp.json"};
     }
-    return home + "/.config/Code/User/mcp.json";
+    return {home + "/.config/Code/User/mcp.json"};
   }
-  if (id == "opencode") return home + "/.config/opencode/opencode.json";
-  if (id == "copilot_cli") return home + "/.copilot/mcp-config.json";
-  return "";
+  if (id == "opencode") return {home + "/.config/opencode/opencode.json"};
+  if (id == "copilot_cli") return {home + "/.copilot/mcp-config.json"};
+  return {};
 }
 
 bool ReadFileText(const std::string& path, std::string& out) {
@@ -407,62 +410,121 @@ bool HasCodexSamuraiSection(const std::string& content) {
   return false;
 }
 
+struct ConfigInspection {
+  std::string path;
+  bool exists{false};
+  bool non_empty{false};
+  bool parent_exists{false};
+  bool parse_ok{true};
+  bool registered{false};
+  std::string configured_command;
+};
+
+ConfigInspection InspectConfigCandidate(const ClientSpec& spec, const std::string& path) {
+  ConfigInspection info;
+  info.path = path;
+  std::error_code ec;
+  info.exists = fs::exists(path, ec);
+  const fs::path parent = fs::path(path).parent_path();
+  info.parent_exists = !parent.empty() && fs::is_directory(parent, ec);
+
+  if (!info.exists) return info;
+
+  std::string text;
+  if (!ReadFileText(path, text)) return info;
+  info.non_empty = text.find_first_not_of(" \t\r\n") != std::string::npos;
+  if (!info.non_empty) return info;
+
+  if (spec.format == ConfigFormat::kTomlCodex) {
+    info.registered = HasCodexSamuraiSection(text);
+    return info;
+  }
+
+  const auto parsed = Parse(text);
+  if (!parsed.ok || !parsed.value.is_object()) {
+    info.parse_ok = false;
+    return info;
+  }
+  const Value* container = parsed.value.find(JsonContainerKey(spec.format));
+  if (container && container->is_object()) {
+    const Value* entry = container->find("samurai");
+    if (entry && entry->is_object()) {
+      info.registered = true;
+      const Value* cmd = entry->find("command");
+      if (cmd && cmd->is_string()) {
+        info.configured_command = cmd->as_string();
+      } else if (cmd && cmd->is_array() && !cmd->elements().empty()) {
+        info.configured_command = cmd->elements()[0].as_string();
+      }
+    }
+  }
+  return info;
+}
+
+ConfigInspection SelectClientConfigInspection(const ClientSpec& spec,
+                                              const std::string& scope,
+                                              const std::string& home,
+                                              const std::string& project,
+                                              const std::string& host_os = "",
+                                              const std::string& appdata_override = "") {
+  const std::vector<std::string> candidates =
+      ResolveClientConfigCandidates(spec, scope, home, project, host_os, appdata_override);
+  if (candidates.empty()) return {};
+  if (candidates.size() == 1) return InspectConfigCandidate(spec, candidates[0]);
+
+  std::vector<ConfigInspection> inspected;
+  inspected.reserve(candidates.size());
+  for (const auto& cand : candidates) {
+    inspected.push_back(InspectConfigCandidate(spec, cand));
+  }
+  for (const auto& item : inspected) {
+    if (item.registered) return item;
+  }
+  for (const auto& item : inspected) {
+    if (item.exists && item.non_empty) return item;
+  }
+  for (const auto& item : inspected) {
+    if (item.parent_exists) return item;
+  }
+  for (const auto& item : inspected) {
+    if (item.exists) return item;
+  }
+  return inspected.front();
+}
+
+std::string ResolveClientConfigPath(const ClientSpec& spec,
+                                    const std::string& scope,
+                                    const std::string& home,
+                                    const std::string& project,
+                                    const std::string& host_os = "",
+                                    const std::string& appdata_override = "") {
+  const std::vector<std::string> candidates =
+      ResolveClientConfigCandidates(spec, scope, home, project, host_os, appdata_override);
+  if (candidates.empty()) return "";
+  if (candidates.size() == 1) return candidates[0];
+  return SelectClientConfigInspection(spec, scope, home, project, host_os, appdata_override).path;
+}
+
 Value InspectClientRegistration(const ClientSpec& spec,
                                 const std::string& home,
                                 const std::string& project,
                                 const std::string& host_os = "",
                                 const std::string& appdata_override = "") {
+  const ConfigInspection info =
+      SelectClientConfigInspection(spec, "user", home, project, host_os, appdata_override);
+
   Value obj = Value::Object();
   obj.set("client", Value::Str(spec.id));
   obj.set("display_name", Value::Str(spec.display_name));
-
-  const std::string path =
-      ResolveClientConfigPath(spec, "user", home, project, host_os, appdata_override);
-  obj.set("config_path", Value::Str(path));
-
-  std::error_code ec;
-  const bool exists = fs::exists(path, ec);
-  obj.set("config_exists", Value::Bool(exists));
-
-  bool registered = false;
-  std::string configured_cmd;
-  bool parse_ok = true;
-
-  if (exists) {
-    std::string text;
-    if (ReadFileText(path, text)) {
-      if (spec.format == ConfigFormat::kTomlCodex) {
-        registered = HasCodexSamuraiSection(text);
-      } else if (!text.empty()) {
-        const auto parsed = Parse(text);
-        if (!parsed.ok || !parsed.value.is_object()) {
-          parse_ok = false;
-        } else {
-          const Value* container = parsed.value.find(JsonContainerKey(spec.format));
-          if (container && container->is_object()) {
-            const Value* entry = container->find("samurai");
-            if (entry && entry->is_object()) {
-              registered = true;
-              const Value* cmd = entry->find("command");
-              if (cmd && cmd->is_string()) {
-                configured_cmd = cmd->as_string();
-              } else if (cmd && cmd->is_array() && !cmd->elements().empty()) {
-                configured_cmd = cmd->elements()[0].as_string();
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  obj.set("config_valid", Value::Bool(parse_ok));
-  obj.set("registered", Value::Bool(registered));
-  if (!configured_cmd.empty()) {
-    obj.set("configured_command", Value::Str(configured_cmd));
-    const bool cmd_ok = (configured_cmd == "docker" && !FindInPath("docker").empty()) ||
-                        IsExecutable(configured_cmd) ||
-                        !FindInPath(configured_cmd).empty();
+  obj.set("config_path", Value::Str(info.path));
+  obj.set("config_exists", Value::Bool(info.exists));
+  obj.set("config_valid", Value::Bool(info.parse_ok));
+  obj.set("registered", Value::Bool(info.registered));
+  if (!info.configured_command.empty()) {
+    obj.set("configured_command", Value::Str(info.configured_command));
+    const bool cmd_ok = (info.configured_command == "docker" && !FindInPath("docker").empty()) ||
+                        IsExecutable(info.configured_command) ||
+                        !FindInPath(info.configured_command).empty();
     obj.set("command_executable", Value::Bool(cmd_ok));
   }
   return obj;
@@ -501,6 +563,7 @@ std::string NormalizeClientId(const std::string& raw) {
   }
   if (s == "claude") return "claude_code";
   if (s == "gemini") return "gemini_cli";
+  if (s == "agy" || s == "antigravity_cli") return "antigravity";
   if (s == "copilot") return "copilot_cli";
   if (s == "vs_code") return "vscode";
   return s;

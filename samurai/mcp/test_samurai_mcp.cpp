@@ -562,6 +562,52 @@ int main() {
     Check(npx_res.ok && npx_res.report.find("transport_mode")->as_string() == "npx" &&
               npx_res.report.find("proposed_entry")->find("command")->as_string() == "npx",
           "setup --npx generates npx samurai-net transport entry");
+    Check(npx_res.report.find("config_path")->as_string() ==
+              (tmp_root / ".gemini" / "config" / "mcp_config.json").string(),
+          "antigravity setup defaults to ~/.gemini/config/mcp_config.json");
+    Check(samurai::mcp::NormalizeClientId("agy") == "antigravity" &&
+              samurai::mcp::NormalizeClientId("antigravity-cli") == "antigravity",
+          "NormalizeClientId supports agy and antigravity-cli aliases");
+
+    // Verify agy CLI global config (~/.gemini/config/mcp_config.json) overrides empty legacy IDE file
+    fs::create_directories(tmp_root / ".gemini" / "antigravity", ec);
+    fs::create_directories(tmp_root / ".gemini" / "config", ec);
+    {
+      std::ofstream legacy_empty(tmp_root / ".gemini" / "antigravity" / "mcp_config.json");
+      (void)legacy_empty;
+      std::ofstream agy_cfg(tmp_root / ".gemini" / "config" / "mcp_config.json");
+      agy_cfg << "{\"mcpServers\":{\"samurai\":{\"command\":\"/usr/local/bin/samurai_mcp\"}}}\n";
+    }
+    samurai::mcp::DoctorOptions agy_doc_opts;
+    agy_doc_opts.client = "agy";
+    agy_doc_opts.home_override = tmp_root.string();
+    agy_doc_opts.project_override = tmp_root.string();
+    const Value agy_doc = samurai::mcp::BuildDoctorReport(agy_doc_opts);
+    const Value* agy_clients = agy_doc.find("clients");
+    Check(agy_clients && agy_clients->is_array() && agy_clients->elements().size() == 1 &&
+              agy_clients->elements()[0].find("registered")->as_bool(false) &&
+              agy_clients->elements()[0].find("config_path")->as_string() ==
+                  (tmp_root / ".gemini" / "config" / "mcp_config.json").string(),
+          "doctor detects registered samurai entry in ~/.gemini/config/mcp_config.json despite empty legacy file");
+
+    // Verify legacy ~/.gemini/antigravity/mcp_config.json fallback when ~/.gemini/config/mcp_config.json has no samurai
+    fs::remove_all(tmp_root / ".gemini", ec);
+    fs::create_directories(tmp_root / ".gemini" / "antigravity", ec);
+    {
+      std::ofstream legacy_cfg(tmp_root / ".gemini" / "antigravity" / "mcp_config.json");
+      legacy_cfg << "{\"mcpServers\":{\"other\":{\"command\":\"/bin/true\"}}}\n";
+    }
+    samurai::mcp::SetupOptions legacy_antigravity_opts;
+    legacy_antigravity_opts.client = "antigravity";
+    legacy_antigravity_opts.binary_override = "/usr/local/bin/samurai_mcp";
+    legacy_antigravity_opts.yes = true;
+    legacy_antigravity_opts.home_override = tmp_root.string();
+    legacy_antigravity_opts.project_override = tmp_root.string();
+    const auto legacy_antigravity_res = samurai::mcp::ExecuteSetup(legacy_antigravity_opts);
+    Check(legacy_antigravity_res.ok &&
+              legacy_antigravity_res.report.find("config_path")->as_string() ==
+                  (tmp_root / ".gemini" / "antigravity" / "mcp_config.json").string(),
+          "setup falls back to populated legacy ~/.gemini/antigravity/mcp_config.json when ~/.gemini/config/mcp_config.json is absent");
 
     // Verify Windows host setup resolves APPDATA paths, npx.cmd, and host-gateway Docker args
     samurai::mcp::SetupOptions win_opts;

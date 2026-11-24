@@ -20,7 +20,9 @@ const {
   resolveTargetCommand,
 } = require("../lib/launcher");
 const {
+  buildDoctorReport,
   executeSetup,
+  normalizeClientId,
   resolveClientConfigPath,
 } = require("../lib/mcp_setup");
 
@@ -193,6 +195,50 @@ test("mcp_setup configures Windows IDE & CLI paths with local Docker host-gatewa
     assert.equal(npxRes.ok, true);
     assert.equal(npxRes.report.applied, false);
     assert.equal(npxRes.report.proposed_entry.command, "npx.cmd");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("antigravity MCP doctor & setup resolve ~/.gemini/config/mcp_config.json and legacy fallback", () => {
+  assert.equal(normalizeClientId("agy"), "antigravity");
+  assert.equal(normalizeClientId("antigravity-cli"), "antigravity");
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "samurai-agy-mcp-"));
+  try {
+    const legacyPath = path.join(tmpDir, ".gemini", "antigravity", "mcp_config.json");
+    const agyPath = path.join(tmpDir, ".gemini", "config", "mcp_config.json");
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    fs.mkdirSync(path.dirname(agyPath), { recursive: true });
+    fs.writeFileSync(legacyPath, "");
+    fs.writeFileSync(
+      agyPath,
+      JSON.stringify({ mcpServers: { samurai: { command: "/usr/local/bin/samurai_mcp", args: [] } } })
+    );
+
+    const doc = buildDoctorReport(
+      { client: "agy", homeOverride: tmpDir, projectOverride: tmpDir },
+      { findLocalBinary: () => "/usr/local/bin/samurai_mcp" }
+    );
+    assert.equal(doc.clients.length, 1);
+    assert.equal(doc.clients[0].registered, true);
+    assert.equal(doc.clients[0].config_path, agyPath);
+
+    // Without agy global file, non-empty legacy Antigravity IDE file is selected.
+    fs.rmSync(agyPath);
+    fs.writeFileSync(legacyPath, JSON.stringify({ mcpServers: { other: { command: "echo" } } }));
+    const setupRes = executeSetup({
+      client: "antigravity",
+      yes: true,
+      binaryOverride: "/usr/local/bin/samurai_mcp",
+      homeOverride: tmpDir,
+      projectOverride: tmpDir,
+    });
+    assert.equal(setupRes.ok, true);
+    assert.equal(setupRes.report.config_path, legacyPath);
+    const updatedLegacy = JSON.parse(fs.readFileSync(legacyPath, "utf8"));
+    assert.ok(updatedLegacy.mcpServers.other);
+    assert.ok(updatedLegacy.mcpServers.samurai);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

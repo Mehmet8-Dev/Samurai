@@ -30,6 +30,9 @@ const CLIENT_ALIASES = {
   "gemini-cli": "gemini_cli",
   gemini_cli: "gemini_cli",
   antigravity: "antigravity",
+  "antigravity-cli": "antigravity",
+  antigravity_cli: "antigravity",
+  agy: "antigravity",
   windsurf: "windsurf",
   vscode: "vscode",
   "vs-code": "vscode",
@@ -55,7 +58,7 @@ function normalizeHostOs(raw, platform = process.platform) {
   return "linux";
 }
 
-function resolveClientConfigPath(spec, opts = {}) {
+function resolveClientConfigCandidates(spec, opts = {}) {
   const hostOs = normalizeHostOs(opts.hostOs, opts.platform || process.platform);
   const home = opts.home || os.homedir();
   const project = opts.project || process.cwd();
@@ -78,32 +81,77 @@ function resolveClientConfigPath(spec, opts = {}) {
   const id = spec.id;
 
   if (scope === "project" && spec.supportsProjectScope) {
-    if (id === "claude_code") return pathImpl.join(project, ".mcp.json");
-    if (id === "cursor") return pathImpl.join(project, ".cursor", "mcp.json");
-    if (id === "gemini_cli") return pathImpl.join(project, ".gemini", "settings.json");
-    if (id === "vscode") return pathImpl.join(project, ".vscode", "mcp.json");
-    if (id === "opencode") return pathImpl.join(project, "opencode.json");
+    if (id === "claude_code") return [pathImpl.join(project, ".mcp.json")];
+    if (id === "cursor") return [pathImpl.join(project, ".cursor", "mcp.json")];
+    if (id === "gemini_cli") return [pathImpl.join(project, ".gemini", "settings.json")];
+    if (id === "vscode") return [pathImpl.join(project, ".vscode", "mcp.json")];
+    if (id === "opencode") return [pathImpl.join(project, "opencode.json")];
   }
 
-  if (id === "claude_code") return pathImpl.join(home, ".claude.json");
+  if (id === "claude_code") return [pathImpl.join(home, ".claude.json")];
   if (id === "claude_desktop") {
-    if (hostOs === "windows") return pathImpl.join(appData, "Claude", "claude_desktop_config.json");
-    if (hostOs === "macos") return pathImpl.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json");
-    return pathImpl.join(home, ".config", "Claude", "claude_desktop_config.json");
+    if (hostOs === "windows") return [pathImpl.join(appData, "Claude", "claude_desktop_config.json")];
+    if (hostOs === "macos") return [pathImpl.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")];
+    return [pathImpl.join(home, ".config", "Claude", "claude_desktop_config.json")];
   }
-  if (id === "cursor") return pathImpl.join(home, ".cursor", "mcp.json");
-  if (id === "codex") return pathImpl.join(home, ".codex", "config.toml");
-  if (id === "gemini_cli") return pathImpl.join(home, ".gemini", "settings.json");
-  if (id === "antigravity") return pathImpl.join(home, ".gemini", "antigravity", "mcp_config.json");
-  if (id === "windsurf") return pathImpl.join(home, ".codeium", "windsurf", "mcp_config.json");
+  if (id === "cursor") return [pathImpl.join(home, ".cursor", "mcp.json")];
+  if (id === "codex") return [pathImpl.join(home, ".codex", "config.toml")];
+  if (id === "gemini_cli") return [pathImpl.join(home, ".gemini", "settings.json")];
+  if (id === "antigravity") {
+    // Prefer Antigravity 2.0 / agy CLI global path; fall back to legacy Antigravity IDE path.
+    return [
+      pathImpl.join(home, ".gemini", "config", "mcp_config.json"),
+      pathImpl.join(home, ".gemini", "antigravity", "mcp_config.json"),
+    ];
+  }
+  if (id === "windsurf") return [pathImpl.join(home, ".codeium", "windsurf", "mcp_config.json")];
   if (id === "vscode") {
-    if (hostOs === "windows") return pathImpl.join(appData, "Code", "User", "mcp.json");
-    if (hostOs === "macos") return pathImpl.join(home, "Library", "Application Support", "Code", "User", "mcp.json");
-    return pathImpl.join(home, ".config", "Code", "User", "mcp.json");
+    if (hostOs === "windows") return [pathImpl.join(appData, "Code", "User", "mcp.json")];
+    if (hostOs === "macos") return [pathImpl.join(home, "Library", "Application Support", "Code", "User", "mcp.json")];
+    return [pathImpl.join(home, ".config", "Code", "User", "mcp.json")];
   }
-  if (id === "opencode") return pathImpl.join(home, ".config", "opencode", "opencode.json");
-  if (id === "copilot_cli") return pathImpl.join(home, ".copilot", "mcp-config.json");
-  return "";
+  if (id === "opencode") return [pathImpl.join(home, ".config", "opencode", "opencode.json")];
+  if (id === "copilot_cli") return [pathImpl.join(home, ".copilot", "mcp-config.json")];
+  return [];
+}
+
+function inspectConfigCandidate(spec, cfgPath) {
+  const exists = fs.existsSync(cfgPath);
+  const parentExists = fs.existsSync(path.dirname(cfgPath));
+  if (!exists) {
+    return { path: cfgPath, exists: false, nonEmpty: false, parentExists, registered: false };
+  }
+  const content = fs.readFileSync(cfgPath, "utf8");
+  const nonEmpty = content.trim().length > 0;
+  return {
+    path: cfgPath,
+    exists: true,
+    nonEmpty,
+    parentExists,
+    registered: isRegisteredInContent(spec.format, content),
+  };
+}
+
+function selectConfigCandidate(spec, opts = {}) {
+  const candidates = resolveClientConfigCandidates(spec, opts);
+  if (candidates.length === 0) return { path: "", exists: false, nonEmpty: false, parentExists: false, registered: false };
+  if (candidates.length === 1) return inspectConfigCandidate(spec, candidates[0]);
+
+  const inspected = candidates.map((c) => inspectConfigCandidate(spec, c));
+  return (
+    inspected.find((c) => c.registered) ||
+    inspected.find((c) => c.exists && c.nonEmpty) ||
+    inspected.find((c) => c.parentExists) ||
+    inspected.find((c) => c.exists) ||
+    inspected[0]
+  );
+}
+
+function resolveClientConfigPath(spec, opts = {}) {
+  const candidates = resolveClientConfigCandidates(spec, opts);
+  if (candidates.length === 0) return "";
+  if (candidates.length === 1) return candidates[0];
+  return selectConfigCandidate(spec, opts).path;
 }
 
 function buildServerSpec({ transportMode, imageTag, hostOs, mcpBin }) {
@@ -342,22 +390,19 @@ function buildDoctorReport(opts = {}, helpers = {}) {
   const clients = [];
   for (const spec of CLIENT_SPECS) {
     if (filterClient && spec.id !== filterClient) continue;
-    const cfgPath = resolveClientConfigPath(spec, {
+    const inspected = selectConfigCandidate(spec, {
       hostOs,
       scope: "user",
       home: opts.homeOverride,
       project: opts.projectOverride,
       appData: opts.appDataOverride,
     });
-    const exists = fs.existsSync(cfgPath);
-    const content = exists ? fs.readFileSync(cfgPath, "utf8") : "";
-    const registered = isRegisteredInContent(spec.format, content);
     clients.push({
       client: spec.id,
       display_name: spec.displayName,
-      config_path: cfgPath,
-      config_exists: exists,
-      registered,
+      config_path: inspected.path,
+      config_exists: inspected.exists,
+      registered: inspected.registered,
     });
   }
 
@@ -494,9 +539,8 @@ async function runHostMcpConfigCmd(sub, args, ctx) {
     // Register every client whose parent config directory already exists (or whose config already exists).
     targetClients = [];
     for (const spec of CLIENT_SPECS) {
-      const cfgPath = resolveClientConfigPath(spec, { hostOs, scope: opts.scope });
-      const parentDir = path.dirname(cfgPath);
-      if (fs.existsSync(cfgPath) || fs.existsSync(parentDir)) {
+      const candidates = resolveClientConfigCandidates(spec, { hostOs, scope: opts.scope });
+      if (candidates.some((cfgPath) => fs.existsSync(cfgPath) || fs.existsSync(path.dirname(cfgPath)))) {
         targetClients.push(spec.id);
       }
     }
@@ -568,6 +612,7 @@ module.exports = {
   executeSetup,
   normalizeClientId,
   normalizeHostOs,
+  resolveClientConfigCandidates,
   resolveClientConfigPath,
   runHostMcpConfigCmd,
 };
