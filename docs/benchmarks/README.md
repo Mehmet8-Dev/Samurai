@@ -36,11 +36,16 @@ All measurements below were captured on a commodity laptop (AMD Ryzen 5 5600H â€
 ## Reproduce Locally
 
 ```bash
-# Pre-built GHCR container (zero build)
-docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp
-docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_l7 --proto h2 --flows 10000
+# GHCR source-runtime container (contains uncompiled source+toolchain; compiles locally with SAMURAI_NATIVE_ARCH=ON on first run)
+docker run --rm -v samurai-build-cache:/var/cache/samurai ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp
+docker run --rm -v samurai-build-cache:/var/cache/samurai ghcr.io/mehmet8-dev/samurai:latest samurai_bench_l7 --proto h2 --flows 10000
 
-# Local build & automated hardware report (writes reports/reproduced_benchmark_summary.md)
+# Or local host-native build inside Docker (`SAMURAI_NATIVE_ARCH=ON`)
+docker build -t samurai:local .
+docker run --rm samurai:local samurai_bench_1m_tcp
+
+# Or via 1-command npx launcher & automated hardware report (writes reports/reproduced_benchmark_summary.md)
+npx -y samurai-net bench 1m-tcp
 ./scripts/reproduce-benchmarks.sh          # Quick (~5s): 100k TCP + 10k L7 H1/H2 + RFC suite
 ./scripts/reproduce-benchmarks.sh --full   # Full (~45s): includes 1,000,000 active TCP flows
 ```

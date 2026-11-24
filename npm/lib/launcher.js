@@ -7,9 +7,11 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const PKG = require("../package.json");
+const { runHostMcpConfigCmd } = require("./mcp_setup");
 
 const DEFAULT_REPO = "Mehmet8-Dev/Samurai";
-const DEFAULT_PREBUILT_IMAGE = "ghcr.io/mehmet8-dev/samurai:latest";
+const DEFAULT_GHCR_SOURCE_IMAGE = "ghcr.io/mehmet8-dev/samurai:latest";
+const DEFAULT_BUILD_CACHE_VOLUME = "samurai-build-cache:/var/cache/samurai";
 
 const LOCAL_SUBDIRS = [
   "build/cli",
@@ -442,10 +444,35 @@ async function ensureCachedLinuxRelease(version, env = process.env) {
   }
 }
 
-async function ensureLocalDockerImage(dockerBin, version, env = process.env) {
-  const imageTag = getLocalImageTag(version, env);
+function isRegistryImageRef(imageTag) {
+  return typeof imageTag === "string" && imageTag.includes("/");
+}
+
+async function ensureLocalDockerImage(dockerBin, version, env = process.env, customTag = "") {
+  const imageTag = customTag || getLocalImageTag(version, env);
   const inspect = spawnSync(dockerBin, ["image", "inspect", imageTag], { stdio: "ignore" });
   if (inspect.status === 0) return imageTag;
+
+  if (isRegistryImageRef(imageTag)) {
+    process.stderr.write(
+      `[samurai-net] Pulling uncompiled source image '${imageTag}' and compiling locally for this host (SAMURAI_NATIVE_ARCH=ON)...\n`
+    );
+    const pullRes = spawnSync(dockerBin, ["pull", imageTag], {
+      stdio: ["ignore", process.stderr, process.stderr],
+    });
+    if (pullRes.status !== 0) {
+      throw new Error(`docker pull exited with status ${pullRes.status}`);
+    }
+    const warmRes = spawnSync(
+      dockerBin,
+      ["run", "--rm", "-v", DEFAULT_BUILD_CACHE_VOLUME, imageTag, "samurai_mcp", "--help"],
+      { stdio: ["ignore", process.stderr, process.stderr] }
+    );
+    if (warmRes.status !== 0) {
+      throw new Error(`host-native container compile warm-up exited with status ${warmRes.status}`);
+    }
+    return imageTag;
+  }
 
   const srcRoot = await ensureSourceTree(version, false, env);
   process.stderr.write(
@@ -471,7 +498,7 @@ function buildDockerArgs(binary, args, opts = {}) {
     (binary === "samurai_mcp" && (args[0] === "setup" || args[0] === "doctor")) ||
     (binary === "samurai" && args[0] === "mcp" && (args[1] === "setup" || args[1] === "doctor"));
 
-  const dockerArgs = ["run", "--rm", "-i"];
+  const dockerArgs = ["run", "--rm", "-i", "-v", DEFAULT_BUILD_CACHE_VOLUME];
   if (isMcpConfigCmd) {
     if (typeof process.getuid === "function" && typeof process.getgid === "function") {
       dockerArgs.push("-u", `${process.getuid()}:${process.getgid()}`);
@@ -530,6 +557,24 @@ async function runCli(defaultBinary, rawArgv) {
     return buildNativeForHost(PKG.version, args);
   }
 
+  // Handle `mcp setup|doctor` directly on the host OS (Windows/macOS/Linux) so
+  // native IDE paths (%APPDATA%, ~/.cursor, ~/.claude.json, etc.) and local
+  // Docker image building work identically across platforms without a container mismatch.
+  const isMcpSetupOrDoctor =
+    (binary === "samurai" && args[0] === "mcp" && (args[1] === "setup" || args[1] === "doctor")) ||
+    (binary === "samurai_mcp" && (args[0] === "setup" || args[0] === "doctor"));
+  if (isMcpSetupOrDoctor) {
+    const sub = binary === "samurai" ? args[1] : args[0];
+    const subArgs = binary === "samurai" ? args.slice(2) : args.slice(1);
+    return runHostMcpConfigCmd(sub, subArgs, {
+      defaultImageTag: getLocalImageTag(PKG.version),
+      findInPath,
+      findLocalBinary,
+      ensureLocalDockerImage: (dockerBin, tag) =>
+        ensureLocalDockerImage(dockerBin, PKG.version, process.env, tag),
+    });
+  }
+
   const forceDocker = process.env.SAMURAI_DOCKER === "1";
   const allowPrebuilt = process.env.SAMURAI_PREBUILT === "1";
 
@@ -572,15 +617,15 @@ async function runCli(defaultBinary, rawArgv) {
     return 1;
   }
 
-  let imageTag = process.env.SAMURAI_IMAGE || DEFAULT_PREBUILT_IMAGE;
-  if (!allowPrebuilt) {
-    imageTag = await ensureLocalDockerImage(dockerBin, PKG.version);
-  }
+  const requestedImage = process.env.SAMURAI_IMAGE || getLocalImageTag(PKG.version);
+  const imageTag = await ensureLocalDockerImage(dockerBin, PKG.version, process.env, requestedImage);
   const dockerArgs = buildDockerArgs(binary, args, { image: imageTag });
   return execBinary(dockerBin, dockerArgs, null);
 }
 
 module.exports = {
+  DEFAULT_BUILD_CACHE_VOLUME,
+  DEFAULT_GHCR_SOURCE_IMAGE,
   OPTIONAL_NATIVE_BUILD_TARGETS,
   buildDockerArgs,
   buildExecEnv,

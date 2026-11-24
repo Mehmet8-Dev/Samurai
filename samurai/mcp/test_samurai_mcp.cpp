@@ -564,6 +564,67 @@ int main() {
               npx_res.report.find("proposed_entry")->find("command")->as_string() == "npx",
           "setup --npx generates npx samurai-net transport entry");
 
+    // Verify Windows host setup resolves APPDATA paths, npx.cmd, and host-gateway Docker args
+    samurai::mcp::SetupOptions win_opts;
+    win_opts.client = "vscode";
+    win_opts.host_os = "windows";
+    win_opts.yes = true;
+    win_opts.image = "samurai:local-v3.3.3";
+    win_opts.home_override = tmp_root.string();
+    win_opts.project_override = tmp_root.string();
+    win_opts.appdata_override = (tmp_root / "AppData" / "Roaming").string();
+    const auto win_res = samurai::mcp::ExecuteSetup(win_opts);
+    const Value* win_mode = win_res.report.find("transport_mode");
+    const Value* win_os = win_res.report.find("host_os");
+    const Value* win_cfg_path = win_res.report.find("config_path");
+    const Value* win_entry = win_res.report.find("proposed_entry");
+    Check(win_res.ok && win_mode && win_mode->as_string() == "docker" &&
+              win_os && win_os->as_string() == "windows",
+          "setup --host-os windows defaults to docker transport");
+    Check(win_cfg_path &&
+              win_cfg_path->as_string() ==
+                  (tmp_root / "AppData" / "Roaming" / "Code" / "User" / "mcp.json").string(),
+          "setup --host-os windows resolves APPDATA VS Code config path");
+    {
+      const Value* args_val = win_entry ? win_entry->find("args") : nullptr;
+      bool has_gateway = false;
+      bool has_local_img = false;
+      bool has_cache_vol = false;
+      if (args_val && args_val->is_array()) {
+        for (const auto& el : args_val->elements()) {
+          if (el.as_string() == "host.docker.internal:host-gateway") has_gateway = true;
+          if (el.as_string() == "samurai:local-v3.3.3") has_local_img = true;
+          if (el.as_string() == "samurai-build-cache:/var/cache/samurai") has_cache_vol = true;
+        }
+      }
+      Check(has_gateway && has_local_img && has_cache_vol,
+            "setup --host-os windows injects cache volume, host-gateway, and image tag");
+    }
+
+    samurai::mcp::DoctorOptions win_doc_opts;
+    win_doc_opts.client = "vscode";
+    win_doc_opts.host_os = "windows";
+    win_doc_opts.home_override = tmp_root.string();
+    win_doc_opts.project_override = tmp_root.string();
+    win_doc_opts.appdata_override = (tmp_root / "AppData" / "Roaming").string();
+    const Value win_doc = samurai::mcp::BuildDoctorReport(win_doc_opts);
+    const Value* win_clients = win_doc.find("clients");
+    Check(win_clients && win_clients->is_array() && win_clients->elements().size() == 1 &&
+              win_clients->elements()[0].find("registered") &&
+              win_clients->elements()[0].find("registered")->as_bool(false),
+          "doctor --host-os windows detects APPDATA-registered vscode entry");
+
+    samurai::mcp::SetupOptions win_npx_opts = win_opts;
+    win_npx_opts.npx = true;
+    win_npx_opts.dry_run = true;
+    win_npx_opts.yes = false;
+    win_npx_opts.client = "windsurf";
+    const auto win_npx_res = samurai::mcp::ExecuteSetup(win_npx_opts);
+    const Value* win_npx_entry = win_npx_res.report.find("proposed_entry");
+    const Value* win_npx_cmd = win_npx_entry ? win_npx_entry->find("command") : nullptr;
+    Check(win_npx_res.ok && win_npx_cmd && win_npx_cmd->as_string() == "npx.cmd",
+          "setup --host-os windows --npx uses npx.cmd");
+
     fs::remove_all(tmp_root, ec);
   }
 

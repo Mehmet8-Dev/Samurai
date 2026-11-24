@@ -240,3 +240,9 @@ jobs:
         run: |
           docker run --rm samurai:ci samurai_master --help
           docker run --rm samurai:ci samurai_slave --help
+
+      - name: Build Source-Runtime Docker image (uncompiled GHCR target)
+        run: |
+          docker build -f Dockerfile --target source-runtime -t samurai:source-ci .
+          docker run --rm -e SAMURAI_SKIP_BUILD=1 samurai:source-ci test -f /opt/samurai/src/samurai/CMakeLists.txt
+          docker run --rm -e SAMURAI_SKIP_BUILD=1 samurai:source-ci bash -n /usr/local/bin/samurai-entrypoint.sh

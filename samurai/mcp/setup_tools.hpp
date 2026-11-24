@@ -15,14 +15,17 @@ namespace samurai::mcp {
 struct DoctorOptions {
   std::string client;  // optional filter (e.g. "claude_code", "cursor", "codex", ...)
   bool json = false;
+  std::string host_os;           // optional override: linux | macos | windows
   std::string home_override;     // optional HOME override (for testing)
   std::string project_override;  // optional project root override (for testing)
+  std::string appdata_override;  // optional APPDATA override (for Windows testing)
 };
 
 struct SetupOptions {
   std::string client;            // required: client ID
   std::string scope = "user";    // "user" or "project"
   std::string image = "samurai:local";
+  std::string host_os;           // optional override: linux | macos | windows
   bool docker = false;
   bool npx = false;
   bool dry_run = false;
@@ -31,6 +34,7 @@ struct SetupOptions {
   std::string binary_override;   // optional samurai_mcp path override
   std::string home_override;     // optional HOME override (for testing)
   std::string project_override;  // optional project root override (for testing)
+  std::string appdata_override;  // optional APPDATA override (for Windows testing)
 };
 
 const std::vector<std::string>& SupportedClients();

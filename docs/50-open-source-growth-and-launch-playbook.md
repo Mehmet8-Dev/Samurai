@@ -16,14 +16,14 @@ Before publishing any external post, configure these in **GitHub → Settings**:
 - **Social Preview Image (1280×640):**
   Export a 1280×640 PNG banner (for example from [`docs/assets/diagrams/samurai_system_architecture.svg`](assets/diagrams/samurai_system_architecture.svg) or your video stills) and upload it under **Settings → Social preview**.
 - **GitHub Discussions Categories to Enable:**
-  - `Benchmarks & Hardware Results` (Pin a thread: *"Community 1M TCP Flow Leaderboard — run `docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp` and post your CPU!"*)
+  - `Benchmarks & Hardware Results` (Pin a thread: *"Community 1M TCP Flow Leaderboard — run `docker run --rm -v samurai-build-cache:/var/cache/samurai ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp` (compiles natively on your CPU on first run) and post your CPU!"*)
   - `Architecture & RFCs`
   - `Show & Tell` (Lab topologies, WAF/BNG/5G UPF test setups)
 - **Publish a `v3.3.3` Tag After Pushing:**
-  Pushing a `v3.3.3` tag triggers `.github/workflows/release.yml`, automatically rebuilding `ghcr.io/mehmet8-dev/samurai:latest` so it includes:
+  Pushing a `v3.3.3` tag triggers `.github/workflows/release.yml`, publishing `ghcr.io/mehmet8-dev/samurai:latest` as an **uncompiled source + toolchain container** (`--target source-runtime`) so each user compiles locally (`SAMURAI_NATIVE_ARCH=ON`) on first run and gets:
   - Auto-discovered worker binaries (no `--worker-dir` required)
-  - Native C++17 `samurai_mcp` (22 tools, 5 skill resources, 5 workflow prompts) + `/usr/local/share/samurai/skills`
-  - Built-in `samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, and `samurai_bench_l7` commands inside the GHCR image!
+  - Native C++17 `samurai_mcp` (22 tools, 5 skill resources, 5 workflow prompts) + `/usr/local/share/samurai/skills` + bundled `artifacts/rl/*.srlp` Mahoraga weights
+  - Built-in `samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, and `samurai_bench_l7` commands inside the host-compiled container!
 
 ---
 
@@ -46,8 +46,8 @@ Before publishing any external post, configure these in **GitHub → Settings**:
   > - **Real Linux kernel wire (`netns + veth + AF_PACKET` vs kernel `accept4()`):** `133.5k CPS` across 100k handshakes with 0 retransmits.
   > - **L7 Shared-Nothing (`nghttp2`):** `189.9k RPS` across 1M HTTP/2 flows (`P99 4ms`).
   >
-  > You can reproduce the 1M TCP flow benchmark locally in ~10 seconds without compiling:
-  > `docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp`
+  > You can build and reproduce the 1M TCP flow benchmark locally on your own CPU via the uncompiled GHCR source image (`-DSAMURAI_NATIVE_ARCH=ON` compiles on first run):
+  > `docker run --rm -v samurai-build-cache:/var/cache/samurai ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp`
   >
   > It also ships a zero-dependency MCP server so Claude Code / Cursor can run safety-gated (loopback/RFC1918-only) benchmarks, plus optional `AF_XDP`, `DPDK`, consumer GeForce BAR1 P2P CUDA, and 4G/5G telecom workers. Happy to answer deep-dive questions on the TCP state machine, `io_uring`/kTLS, or CUDA P2P!
 
@@ -82,8 +82,8 @@ Before publishing any external post, configure these in **GitHub → Settings**:
   > *(Attach 20-second terminal GIF of `samurai_bench_1m_tcp`)*
 - **Post 2 (The C++ Memory Story):** `std::deque` 512B slab retention → `-63.3% RAM` (`1,648 B` → `605 B/flow`).
 - **Post 3 (Consumer GPU BAR1 P2P):** Why datacenter-only GPU networking doesn't have to stay locked behind paywalls + persistent VRAM kernel diagram (`docs/assets/diagrams/samurai_gpu_p2p_dataplane.svg`).
-- **Post 4 (Native C++17 MCP + RL Autopilot):** One-liner `claude mcp add samurai -- ./build/mcp/samurai_mcp` (or via GHCR Docker) — zero Python, native C++17 MCP `2024-11-05` server driving 1M TCP benchmarks AND Closed-Loop Mahoraga RL Autopilot with fail-closed loopback/RFC1918 safety.
-- **Post 5 (CTA — Independent Verification):** "Don't trust my screenshots — run `docker run --rm ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp` on your CPU and reply with your CPS & B/flow! Repo (AGPL-3.0): https://github.com/Mehmet8-Dev/Samurai"
+- **Post 4 (Native C++17 MCP + RL Autopilot):** One-liner `npx -y samurai-net mcp setup --client all --yes` (or `--docker --ghcr --yes`) — zero Python, native C++17 MCP `2024-11-05` server driving 1M TCP benchmarks AND Closed-Loop Mahoraga RL Autopilot with fail-closed loopback/RFC1918 safety.
+- **Post 5 (CTA — Independent Verification):** "Don't trust my screenshots — run `docker run --rm -v samurai-build-cache:/var/cache/samurai ghcr.io/mehmet8-dev/samurai:latest samurai_bench_1m_tcp` (compiles natively on your CPU on first run) and reply with your CPS & B/flow! Repo (AGPL-3.0): https://github.com/Mehmet8-Dev/Samurai"
 
 ---
 

@@ -13,8 +13,12 @@ ven311/
 .venv/
 samurai/venv/
 
-# Local-only heavy trees (not needed to build the native image)
-artifacts/
+# Local-only heavy trees (keep canonical artifacts/rl/*.srlp weights for Mahoraga RL)
+artifacts/*
+!artifacts/rl/
+artifacts/rl/*.bak.srlp
+artifacts/rl/*.prev.srlp
+artifacts/rl/banaware-sweep-report.json
 research/
 data/
 reports/

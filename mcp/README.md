@@ -36,15 +36,22 @@ npx -y samurai-net mcp doctor
 # 2. Preview proposed config changes (safe non-mutating dry-run)
 npx -y samurai-net mcp setup --client cursor --dry-run
 
-# 3. Apply registration (automatically creates a .bak backup of existing configs)
-npx -y samurai-net mcp setup --client cursor --yes
+# 3. Apply registration to a single client or every detected IDE/CLI on Windows / macOS / Linux (creates .bak backup)
+npx -y samurai-net mcp setup --client all --yes
+npx -y samurai-net mcp setup --client antigravity --yes
+npx -y samurai-net mcp setup --client vscode --yes
+npx -y samurai-net mcp setup --client claude_desktop --yes
 
-# Or register npx (auto-compiles from source for host hardware) or local Docker directly:
+# Or register npx (`npx.cmd` on Windows), local Docker build, or GHCR source-runtime (`--ghcr`):
 npx -y samurai-net mcp setup --client claude_code --npx --yes
 npx -y samurai-net mcp setup --client claude_code --docker --yes
+npx -y samurai-net mcp setup --client claude_code --docker --ghcr --yes
 ```
 
-> **macOS & Windows (Docker Desktop):** Docker Desktop runs containers inside a Linux VM, so `--network host` does not bind directly to host `127.0.0.1`. Target services running on your Mac/Windows host via `host.docker.internal` (the Docker setup mode automatically passes `--add-host host.docker.internal:host-gateway` on non-Linux hosts), or run Samurai against sibling containers on a shared Docker network.
+> **Windows & macOS (Docker Desktop) — Host-Local Compile Inside Docker & Path Resolution:**
+> - **Host-local build (`--docker` or `--ghcr`):** Running `npx -y samurai-net mcp setup ... --yes` compiles C++ **for your local host CPU/GPU (`SAMURAI_NATIVE_ARCH=ON`)** — either via local `docker build` (`samurai:local-v3.3.3`) or with `--ghcr` by pulling the uncompiled `ghcr.io/mehmet8-dev/samurai:latest` source+toolchain image and compiling once into `-v samurai-build-cache:/var/cache/samurai` (pass `--no-build` to skip pre-warming). GitHub CI never pre-compiles binaries inside the GHCR image.
+> - **Native Windows IDE/CLI paths:** `samurai-net mcp setup` runs directly on your Windows Node.js host so `%APPDATA%\Code\User\mcp.json`, `%APPDATA%\Claude\claude_desktop_config.json`, `%USERPROFILE%\.cursor\mcp.json`, `%USERPROFILE%\.claude.json`, `%USERPROFILE%\.codex\config.toml`, `%USERPROFILE%\.gemini\antigravity\mcp_config.json`, and `%USERPROFILE%\.codeium\windsurf\mcp_config.json` resolve without container path mismatches.
+> - **Docker Desktop networking:** On non-Linux hosts, containers run inside a Linux VM so `--network host` cannot reach host `127.0.0.1`. `mcp setup` automatically emits `--add-host host.docker.internal:host-gateway` so MCP tools can target host services via `host.docker.internal` (or sibling containers on a shared Docker network).
 
 ### Manual Setup (Claude Code / Local Container)
 

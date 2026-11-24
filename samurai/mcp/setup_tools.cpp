@@ -149,10 +149,35 @@ std::string LocateSkillsDir() {
   return "";
 }
 
+std::string NormalizeHostOs(const std::string& raw) {
+  std::string s;
+  s.reserve(raw.size());
+  for (char c : raw) s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+  if (s == "win" || s == "win32" || s == "windows") return "windows";
+  if (s == "mac" || s == "macos" || s == "darwin") return "macos";
+  if (s == "linux") return "linux";
+#if defined(_WIN32)
+  return "windows";
+#elif defined(__APPLE__)
+  return "macos";
+#else
+  return "linux";
+#endif
+}
+
+std::string AppDataDir(const std::string& override_appdata, const std::string& home) {
+  if (!override_appdata.empty()) return override_appdata;
+  if (const char* a = std::getenv("APPDATA"); a && a[0] != '\0') return std::string(a);
+  return home + "/AppData/Roaming";
+}
+
 std::string ResolveClientConfigPath(const ClientSpec& spec,
                                     const std::string& scope,
                                     const std::string& home,
-                                    const std::string& project) {
+                                    const std::string& project,
+                                    const std::string& host_os = "",
+                                    const std::string& appdata_override = "") {
+  const std::string os_kind = NormalizeHostOs(host_os);
   const std::string id = spec.id;
   if (scope == "project" && spec.supports_project_scope) {
     if (id == "claude_code") return project + "/.mcp.json";
@@ -164,11 +189,13 @@ std::string ResolveClientConfigPath(const ClientSpec& spec,
 
   if (id == "claude_code") return home + "/.claude.json";
   if (id == "claude_desktop") {
-#if defined(__APPLE__)
-    return home + "/Library/Application Support/Claude/claude_desktop_config.json";
-#else
+    if (os_kind == "windows") {
+      return AppDataDir(appdata_override, home) + "/Claude/claude_desktop_config.json";
+    }
+    if (os_kind == "macos") {
+      return home + "/Library/Application Support/Claude/claude_desktop_config.json";
+    }
     return home + "/.config/Claude/claude_desktop_config.json";
-#endif
   }
   if (id == "cursor") return home + "/.cursor/mcp.json";
   if (id == "codex") return home + "/.codex/config.toml";
@@ -176,11 +203,13 @@ std::string ResolveClientConfigPath(const ClientSpec& spec,
   if (id == "antigravity") return home + "/.gemini/antigravity/mcp_config.json";
   if (id == "windsurf") return home + "/.codeium/windsurf/mcp_config.json";
   if (id == "vscode") {
-#if defined(__APPLE__)
-    return home + "/Library/Application Support/Code/User/mcp.json";
-#else
+    if (os_kind == "windows") {
+      return AppDataDir(appdata_override, home) + "/Code/User/mcp.json";
+    }
+    if (os_kind == "macos") {
+      return home + "/Library/Application Support/Code/User/mcp.json";
+    }
     return home + "/.config/Code/User/mcp.json";
-#endif
   }
   if (id == "opencode") return home + "/.config/opencode/opencode.json";
   if (id == "copilot_cli") return home + "/.copilot/mcp-config.json";
@@ -380,12 +409,15 @@ bool HasCodexSamuraiSection(const std::string& content) {
 
 Value InspectClientRegistration(const ClientSpec& spec,
                                 const std::string& home,
-                                const std::string& project) {
+                                const std::string& project,
+                                const std::string& host_os = "",
+                                const std::string& appdata_override = "") {
   Value obj = Value::Object();
   obj.set("client", Value::Str(spec.id));
   obj.set("display_name", Value::Str(spec.display_name));
 
-  const std::string path = ResolveClientConfigPath(spec, "user", home, project);
+  const std::string path =
+      ResolveClientConfigPath(spec, "user", home, project, host_os, appdata_override);
   obj.set("config_path", Value::Str(path));
 
   std::error_code ec;
@@ -439,8 +471,8 @@ Value InspectClientRegistration(const ClientSpec& spec,
 void PrintSetupUsage() {
   std::printf(
       "Usage:\n"
-      "  samurai_mcp doctor [--client <id>] [--json]\n"
-      "  samurai_mcp setup --client <id> [--dry-run] [--yes] [--docker | --npx] [--image <ref>] [--scope user|project] [--json]\n"
+      "  samurai_mcp doctor [--client <id>] [--host-os <linux|macos|windows>] [--json]\n"
+      "  samurai_mcp setup --client <id> [--dry-run] [--yes] [--docker | --npx] [--ghcr] [--image <ref>] [--host-os <linux|macos|windows>] [--scope user|project] [--json]\n"
       "\n"
       "Supported --client IDs:\n"
       "  claude_code, claude_desktop, cursor, codex, gemini_cli,\n"
@@ -479,6 +511,7 @@ Value BuildDoctorReport(const DoctorOptions& opts) {
   const std::string project = ProjectDir(opts.project_override);
 
   Value root = Value::Object();
+  root.set("host_os", Value::Str(NormalizeHostOs(opts.host_os)));
   root.set("platform", Value::Str(
 #if defined(__APPLE__)
                            "darwin"
@@ -604,7 +637,7 @@ Value BuildDoctorReport(const DoctorOptions& opts) {
   for (const auto& c : kClients) {
     if (!norm_filter.empty() && norm_filter != c.id) continue;
     filter_matched = true;
-    clients.push_back(InspectClientRegistration(c, home, project));
+    clients.push_back(InspectClientRegistration(c, home, project, opts.host_os, opts.appdata_override));
   }
   if (!filter_matched) {
     root.set("client_filter_error", Value::Str("Unknown client ID: " + opts.client));
@@ -664,30 +697,32 @@ SetupResult ExecuteSetup(const SetupOptions& opts) {
     return res;
   }
 
+  const std::string host_os = NormalizeHostOs(opts.host_os);
   const std::string home = HomeDir(opts.home_override);
   const std::string project = ProjectDir(opts.project_override);
-  const std::string config_path = ResolveClientConfigPath(*spec, opts.scope, home, project);
+  const std::string config_path =
+      ResolveClientConfigPath(*spec, opts.scope, home, project, host_os, opts.appdata_override);
   const std::string backup_path = config_path + ".bak";
 
   std::string mcp_bin = opts.binary_override.empty() ? LocateBinary({"samurai_mcp"}) : opts.binary_override;
   const bool use_npx = opts.npx;
-  const bool use_docker = !use_npx && (opts.docker || mcp_bin.empty());
+  const bool use_docker = !use_npx && (opts.docker || host_os != "linux" || mcp_bin.empty());
 
   std::string command;
   std::vector<std::string> args;
   if (use_npx) {
-    command = "npx";
+    command = (host_os == "windows") ? "npx.cmd" : "npx";
     args = {"-y", "-p", "samurai-net", "samurai-mcp"};
   } else if (use_docker) {
     command = "docker";
-    args = {"run", "-i", "--rm"};
-#if defined(__linux__)
-    args.emplace_back("--network");
-    args.emplace_back("host");
-#else
-    args.emplace_back("--add-host");
-    args.emplace_back("host.docker.internal:host-gateway");
-#endif
+    args = {"run", "-i", "--rm", "-v", "samurai-build-cache:/var/cache/samurai"};
+    if (host_os == "linux") {
+      args.emplace_back("--network");
+      args.emplace_back("host");
+    } else {
+      args.emplace_back("--add-host");
+      args.emplace_back("host.docker.internal:host-gateway");
+    }
     args.push_back(opts.image);
     args.emplace_back("samurai_mcp");
   } else {
@@ -767,6 +802,7 @@ SetupResult ExecuteSetup(const SetupOptions& opts) {
   out.set("ok", Value::Bool(true));
   out.set("applied", Value::Bool(apply));
   out.set("dry_run", Value::Bool(!apply));
+  out.set("host_os", Value::Str(host_os));
   out.set("client", Value::Str(spec->id));
   out.set("display_name", Value::Str(spec->display_name));
   out.set("scope", Value::Str(opts.scope));
@@ -803,6 +839,12 @@ int RunDoctorCli(int argc, char** argv) {
         return 2;
       }
       opts.client = argv[++i];
+    } else if (a == "--host-os") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "samurai: missing value for --host-os\n");
+        return 2;
+      }
+      opts.host_os = argv[++i];
     } else {
       std::fprintf(stderr, "samurai doctor: unknown option '%s'\n", a.c_str());
       return 2;
@@ -901,8 +943,17 @@ int RunSetupCli(int argc, char** argv) {
         return 2;
       }
       opts.image = argv[++i];
+    } else if (a == "--host-os") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "samurai setup: missing value for --host-os\n");
+        return 2;
+      }
+      opts.host_os = argv[++i];
     } else if (a == "--docker") {
       opts.docker = true;
+    } else if (a == "--ghcr") {
+      opts.docker = true;
+      opts.image = "ghcr.io/mehmet8-dev/samurai:latest";
     } else if (a == "--npx") {
       opts.npx = true;
     } else if (a == "--dry-run") {

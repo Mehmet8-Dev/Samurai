@@ -8,19 +8,18 @@ Samurai (v3.3.3) bridges the gap between scripting load tools (`k6`, `Locust`) a
 
 ## Quick Start
 
-### 1. Run & Compile Natively for Your Hardware (`npx` or `docker`)
+### 1. Build Natively for Your Hardware (`npx`, `docker`, or `cmake`)
 `samurai-net` downloads the Samurai source code and **automatically compiles all binaries and workers on your target machine** (`-march=native`, CUDA, DPDK, AF_XDP, `io_uring`, DOCA) into `~/.cache/samurai/` on first run:
 
 ```bash
-# Option A: Compile natively on this machine & run the 1M stateful TCP flow benchmark (605 B/flow)
-npx -y samurai-net bench 1m-tcp
-
-# Or install globally and trigger/refresh the host-native build explicitly:
+# Option A: Install globally or compile natively on this machine via npm
+npx -y samurai-net build
 npm install -g samurai-net && samurai-net build
 
-# Option B: Build the Docker runtime locally from source for your host hardware
+# Option B: Docker (`ghcr.io` source-runtime compiles natively on first run, OR local `docker build`)
+docker run --rm -v samurai-build-cache:/var/cache/samurai ghcr.io/mehmet8-dev/samurai:latest samurai --help
+# Or bake a standalone container image directly on your host:
 docker build -t samurai:local .
-docker run --rm samurai:local samurai_bench_1m_tcp
 
 # Option C: Build directly from a cloned repo (Linux C++17)
 cmake -B build -S samurai -DCMAKE_BUILD_TYPE=Release -DSAMURAI_NATIVE_ARCH=ON && cmake --build build -j"$(nproc)"
@@ -33,13 +32,22 @@ Automatically diagnose binaries and register Samurai MCP across **Claude Code, C
 # Check binaries, workers, and MCP client registration status
 npx -y samurai-net mcp doctor
 
-# Preview (dry-run) and apply MCP registration (creates a .bak backup automatically)
-npx -y samurai-net mcp setup --client claude_code --dry-run
+# Preview (dry-run) or register every detected IDE / coding CLI in one command (.bak backup created automatically):
+# Supported clients: claude_code, claude_desktop, cursor, codex, gemini_cli, antigravity, windsurf, vscode, opencode, copilot_cli
+npx -y samurai-net mcp setup --client all --yes
+npx -y samurai-net mcp setup --client cursor --dry-run
 npx -y samurai-net mcp setup --client claude_code --yes
 
-# Register via npx or Docker transport (zero local compile; works on macOS / Windows / Linux):
+# Windows PowerShell (Docker Desktop + native %APPDATA% / %USERPROFILE% paths + local host-built image):
+# Automatically builds `samurai:local-v3.3.3` on your machine (`SAMURAI_NATIVE_ARCH=ON`) and injects `--add-host host.docker.internal:host-gateway`.
+npx -y samurai-net mcp setup --client antigravity --yes
+npx -y samurai-net mcp setup --client vscode --yes
+npx -y samurai-net mcp setup --client claude_desktop --yes
+
+# Or force npx launcher (`npx.cmd` on Windows), local Docker build, or GHCR source-runtime (`--ghcr`):
 npx -y samurai-net mcp setup --client cursor --npx --yes
 npx -y samurai-net mcp setup --client cursor --docker --yes
+npx -y samurai-net mcp setup --client cursor --docker --ghcr --yes
 ```
 
 ### 3. Run Your First Stress Test
@@ -70,7 +78,8 @@ samurai_mcp doctor --json
 # Preview (dry-run) or apply MCP registration (creates a .bak backup automatically)
 samurai_mcp setup --client cursor --dry-run
 samurai_mcp setup --client cursor --yes          # native binary
-samurai_mcp setup --client claude_code --docker --yes  # or zero-build GHCR container
+samurai_mcp setup --client claude_code --docker --yes         # local Docker image
+samurai_mcp setup --client claude_code --docker --ghcr --yes  # GHCR source-runtime (compiles natively on first run)
 
 # Or register directly via Claude Code CLI:
 claude mcp add samurai -- /path/to/Samurai/build/mcp/samurai_mcp
@@ -264,7 +273,10 @@ Run on each agent/generator machine:
 Build the multi-stage container runtime directly on your target host (`SAMURAI_NATIVE_ARCH=ON` by default) so binaries match your local CPU/GPU/DPDK environment:
 
 ```bash
-# Build locally from source for your host hardware (or via: npx -y samurai-net build --docker)
+# Option 1: Pull the uncompiled GHCR source+toolchain image (compiles natively on YOUR host on first run, cached in samurai-build-cache)
+docker run --rm -v samurai-build-cache:/var/cache/samurai ghcr.io/mehmet8-dev/samurai:latest samurai --help
+
+# Option 2: Or bake a standalone image directly from local repo (`SAMURAI_NATIVE_ARCH=ON`)
 docker build -t samurai:local .
 
 # Inspect CLI and distributed daemon options
@@ -281,7 +293,7 @@ docker run --rm --add-host host.docker.internal:host-gateway samurai:local \
   samurai --worker l7 --target "$(python3 -c 'import socket; print(socket.gethostbyname("host.docker.internal"))')" --port 8080 --l7-protocol http2 --count 1000 --confirm
 ```
 
-> **Note:** The local container build packages `samurai`, `samurai_mcp`, `samurai_master`, `samurai_slave`, reproducible benchmark harnesses (`samurai_bench_1m_tcp`, `samurai_bench_100k_tcp`, `samurai_bench_l7`), and every worker whose host toolchain (`CUDA`, `DPDK`, `AF_XDP`, `DOCA`, `l7`, `scenario`, `telco`, `defense`) is present during the build under `/usr/local/bin`. *(Optional portable CI images are also published at `ghcr.io/mehmet8-dev/samurai:v3.3.3` when `SAMURAI_PREBUILT=1` is desired.)* See [`docs/11-docker.md`](docs/11-docker.md) for Docker Desktop networking details.
+> **Note:** GitHub Releases publish `ghcr.io/mehmet8-dev/samurai:latest` as an **uncompiled source + toolchain container** (`--target source-runtime`): no C++ binaries are pre-compiled on GitHub Actions runners. On first container launch (or directly via `docker build -t samurai:local .`), CMake compiles `-DSAMURAI_NATIVE_ARCH=ON` specifically for your host hardware (`samurai`, `samurai_mcp`, `samurai_master`, `samurai_slave`, benchmark harnesses, and every worker whose host toolchain is detected), caching binaries in `/var/cache/samurai` (`-v samurai-build-cache:/var/cache/samurai`). On **Windows / macOS (Docker Desktop)**, use `npx -y samurai-net mcp setup --client <id|all> --yes` (or add `--ghcr`) so `%APPDATA%`/`%USERPROFILE%` configs, `host.docker.internal`, the cache volume, and host-local build warm-up are wired automatically. See [`docs/11-docker.md`](docs/11-docker.md) for Docker Desktop networking details.
 
 ### 4) Docker Compose Deployment
 

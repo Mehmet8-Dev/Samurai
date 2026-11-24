@@ -92,13 +92,15 @@ jobs:
           tar -czvf "${DIST_DIR}.tar.gz" "${DIST_DIR}"
           sha256sum "${DIST_DIR}.tar.gz" > "${DIST_DIR}.tar.gz.sha256"
 
-      - name: Build and Push Docker Image to GHCR
+      - name: Build and Push Uncompiled Source Docker Image to GHCR
         run: |
           TAG="${{ needs.validate-tag.outputs.resolved_tag }}"
           IMAGE="ghcr.io/${{ github.repository_owner }}/samurai"
           IMAGE_LOWER=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker build -f Dockerfile --build-arg SAMURAI_NATIVE_ARCH=OFF -t "${IMAGE_LOWER}:${TAG}" -t "${IMAGE_LOWER}:latest" .
+          # Package toolchain + source only (target=source-runtime): zero C++ binaries compiled on GitHub Actions.
+          # On first user run, samurai-entrypoint.sh compiles natively for the host machine (SAMURAI_NATIVE_ARCH=ON).
+          docker build -f Dockerfile --target source-runtime -t "${IMAGE_LOWER}:${TAG}" -t "${IMAGE_LOWER}:latest" .
           docker push "${IMAGE_LOWER}:${TAG}"
           docker push "${IMAGE_LOWER}:latest"
 

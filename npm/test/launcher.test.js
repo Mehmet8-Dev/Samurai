@@ -8,6 +8,8 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const {
+  DEFAULT_BUILD_CACHE_VOLUME,
+  DEFAULT_GHCR_SOURCE_IMAGE,
   buildDockerArgs,
   buildExecEnv,
   detectConfiguredOptionalTargets,
@@ -17,6 +19,10 @@ const {
   getNativeCacheDir,
   resolveTargetCommand,
 } = require("../lib/launcher");
+const {
+  executeSetup,
+  resolveClientConfigPath,
+} = require("../lib/mcp_setup");
 
 test("resolveTargetCommand routes bench, build, and mcp subcommands cleanly", () => {
   assert.deepEqual(resolveTargetCommand("samurai", ["build", "--jobs", "4"]), {
@@ -41,20 +47,22 @@ test("resolveTargetCommand routes bench, build, and mcp subcommands cleanly", ()
   });
 });
 
-test("buildDockerArgs uses host network on Linux and host-gateway on macOS", () => {
+test("buildDockerArgs uses host network on Linux and host-gateway on macOS/Windows", () => {
   const linuxArgs = buildDockerArgs("samurai", ["--worker", "l7"], {
     platform: "linux",
-    image: "ghcr.io/mehmet8-dev/samurai:latest",
+    image: "samurai:local-v3.3.3",
   });
   assert.ok(linuxArgs.includes("--network"));
   assert.ok(linuxArgs.includes("host"));
 
-  const macArgs = buildDockerArgs("samurai", ["--worker", "l7"], {
-    platform: "darwin",
-    image: "ghcr.io/mehmet8-dev/samurai:latest",
+  const winArgs = buildDockerArgs("samurai", ["--worker", "l7"], {
+    platform: "win32",
+    image: DEFAULT_GHCR_SOURCE_IMAGE,
   });
-  assert.ok(macArgs.includes("--add-host"));
-  assert.ok(macArgs.includes("host.docker.internal:host-gateway"));
+  assert.ok(winArgs.includes(DEFAULT_BUILD_CACHE_VOLUME));
+  assert.ok(winArgs.includes("--add-host"));
+  assert.ok(winArgs.includes("host.docker.internal:host-gateway"));
+  assert.ok(winArgs.includes(DEFAULT_GHCR_SOURCE_IMAGE));
 });
 
 test("buildDockerArgs mounts HOME for MCP setup/doctor commands", () => {
@@ -124,6 +132,67 @@ test("buildExecEnv wires native GPU, defense CUDA, and AF_XDP shared libraries w
 
     const preserved = buildExecEnv(tmpDir, { PATH: "/usr/bin", SAMURAI_GPU_NATIVE_LIB: "/custom/gpu.so" });
     assert.equal(preserved.SAMURAI_GPU_NATIVE_LIB, "/custom/gpu.so");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp_setup configures Windows IDE & CLI paths with local Docker host-gateway", () => {
+  assert.equal(
+    resolveClientConfigPath(
+      { id: "vscode", supportsProjectScope: true },
+      { hostOs: "windows", scope: "user", home: "C:\\Users\\mehmet", appData: "C:\\Users\\mehmet\\AppData\\Roaming" }
+    ),
+    "C:\\Users\\mehmet\\AppData\\Roaming\\Code\\User\\mcp.json"
+  );
+  assert.equal(
+    resolveClientConfigPath(
+      { id: "claude_desktop", supportsProjectScope: false },
+      { hostOs: "windows", scope: "user", home: "C:\\Users\\mehmet", appData: "C:\\Users\\mehmet\\AppData\\Roaming" }
+    ),
+    "C:\\Users\\mehmet\\AppData\\Roaming\\Claude\\claude_desktop_config.json"
+  );
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "samurai-win-mcp-"));
+  try {
+    const appDataDir = path.join(tmpDir, "AppData", "Roaming");
+    fs.mkdirSync(path.join(appDataDir, "Code", "User"), { recursive: true });
+    fs.writeFileSync(
+      path.join(appDataDir, "Code", "User", "mcp.json"),
+      JSON.stringify({ servers: { existing: { type: "stdio", command: "echo" } } })
+    );
+
+    const res = executeSetup({
+      client: "vscode",
+      hostOs: "windows",
+      imageTag: "samurai:local-v3.3.3",
+      yes: true,
+      homeOverride: tmpDir,
+      projectOverride: tmpDir,
+      appDataOverride: appDataDir,
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.report.transport_mode, "docker");
+    assert.equal(res.report.backup_created, true);
+    assert.ok(res.report.proposed_entry.args.includes(DEFAULT_BUILD_CACHE_VOLUME));
+    assert.ok(res.report.proposed_entry.args.includes("--add-host"));
+    assert.ok(res.report.proposed_entry.args.includes("host.docker.internal:host-gateway"));
+    assert.ok(res.report.proposed_entry.args.includes("samurai:local-v3.3.3"));
+
+    const written = JSON.parse(fs.readFileSync(res.report.config_path, "utf8"));
+    assert.ok(written.servers.existing);
+    assert.equal(written.servers.samurai.command, "docker");
+
+    const npxRes = executeSetup({
+      client: "cursor",
+      hostOs: "windows",
+      npx: true,
+      dryRun: true,
+      homeOverride: tmpDir,
+      projectOverride: tmpDir,
+    });
+    assert.equal(npxRes.ok, true);
+    assert.equal(npxRes.report.proposed_entry.command, "npx.cmd");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
