@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "discovery_tools.hpp"
 #include "runtime_tools.hpp"
 #include "scenario_tools.hpp"
 
@@ -56,6 +57,16 @@ Value PropBool(const char* desc) {
   return p;
 }
 
+Value PropArray(const char* desc, const char* item_type) {
+  Value p = Value::Object();
+  p.set("type", Value::Str("array"));
+  if (desc && desc[0]) p.set("description", Value::Str(desc));
+  Value items = Value::Object();
+  items.set("type", Value::Str(item_type));
+  p.set("items", std::move(items));
+  return p;
+}
+
 Value SchemaWithProps(Value props, const std::vector<std::string>& required = {}) {
   Value s = Value::Object();
   s.set("type", Value::Str("object"));
@@ -69,7 +80,17 @@ Value SchemaWithProps(Value props, const std::vector<std::string>& required = {}
 }
 
 std::string ReadSkillMarkdown(const std::string& rel_path, const std::string& fallback_text) {
-  std::vector<std::string> prefixes = {"."};
+  std::vector<std::string> prefixes;
+  if (const char* env_skills = std::getenv("SAMURAI_SKILLS_DIR")) {
+    if (env_skills[0] != '\0') {
+      const std::string root(env_skills);
+      if (rel_path.rfind("skills/", 0) == 0) {
+        prefixes.push_back(root + "/" + rel_path.substr(7));
+      }
+      prefixes.push_back(root);
+    }
+  }
+  prefixes.push_back(".");
   char buf[4096] = {0};
   const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
   if (n > 0) {
@@ -77,13 +98,15 @@ std::string ReadSkillMarkdown(const std::string& rel_path, const std::string& fa
     const auto slash = p.find_last_of('/');
     if (slash != std::string::npos) {
       const std::string dir = p.substr(0, slash);
+      prefixes.push_back(dir + "/../../..");
       prefixes.push_back(dir + "/../..");
       prefixes.push_back(dir + "/..");
       prefixes.push_back("/usr/local/share/samurai");
     }
   }
   for (const auto& pre : prefixes) {
-    std::ifstream in(pre + "/" + rel_path);
+    // Allow SAMURAI_SKILLS_DIR pointing directly to the skills folder as well as project root.
+    std::ifstream in(pre.find("SKILL.md") != std::string::npos ? pre : (pre + "/" + rel_path));
     if (in.is_open()) {
       std::ostringstream oss;
       oss << in.rdbuf();
@@ -114,6 +137,13 @@ void AddCustomTcpSchemaProps(Value& props) {
       "Automatically detect route interface, source IP, and MAC env vars when custom_tcp or af_xdp is active (default: true)."));
 }
 
+void AddAllowTargetProps(Value& props) {
+  props.set("allow_target", PropStr(
+      "Explicit per-call authorization for an external/enterprise target (IPv4, CIDR like 203.0.113.0/24, or hostname/wildcard domain like api.example.com). Public targets stay fail-closed unless explicitly authorized via allow_target/allow_targets or SAMURAI_MCP_ALLOW_TARGETS (SAMURAI_MCP_DENY_TARGETS always wins)."));
+  props.set("allow_targets", PropArray(
+      "Array of explicitly authorized external/enterprise targets (IPv4, CIDR, or domain/hostname) for this call.", "string"));
+}
+
 }  // namespace
 
 void RegisterAllTools(McpServer& server,
@@ -140,11 +170,14 @@ void RegisterAllTools(McpServer& server,
   {
     Value props = Value::Object();
     props.set("worker", PropStr("Dataplane worker backend (default: cpu).", AllowedWorkers()));
-    props.set("target", PropStr("Authorized private/loopback (or SAMURAI_MCP_ALLOW_TARGETS) IPv4 target."));
+    props.set("target", PropStr("Private/loopback IPv4, or explicitly authorized public IPv4/CIDR/hostname (pass allow_target/allow_targets to authorize external targets)."));
+    AddAllowTargetProps(props);
     props.set("port", PropInt("Target TCP/UDP port (1-65535)."));
     props.set("protocol", PropStr("L4/L7/Telco protocol (default: udp).", AllowedProtocols()));
     props.set("vector", PropStr("Workload/attack vector label (e.g. flood, basic, http, http2, dns, slowloris, sctp-flood)."));
-    props.set("count", PropInt("Bounded packet/request count."));
+    props.set("count", PropInt("Packet/request budget (default limit 100000000 or SAMURAI_MCP_MAX_COUNT; 0=unlimited up to uint32 wire limit)."));
+    props.set("duration_s", PropNum("Optional enterprise soak test duration in seconds (runs timed rounds / continuous execution until elapsed)."));
+    props.set("async", PropBool("When true, start as a background soak job and return job_id immediately (monitor via samurai_job_status / samurai_job_stop)."));
     props.set("size", PropInt("Packet size in bytes (1-65535)."));
     props.set("rps", PropNum("Target rate in packets/requests per second (0 = max speed)."));
     props.set("pin_cpu", PropInt("Pin dataplane worker to a specific CPU core index."));
@@ -207,10 +240,10 @@ void RegisterAllTools(McpServer& server,
     props.set("kpi_max_tcp_overflows", PropInt("Fail KPI gate if TCP overflows > threshold."));
     // Custom TCP / AF_XDP wire configuration & auto-discovery
     AddCustomTcpSchemaProps(props);
-    props.set("timeout_s", PropInt("Subprocess wall-clock timeout in seconds (5-120)."));
+    props.set("timeout_s", PropInt("Subprocess/soak wall-clock timeout in seconds (5-86400, default: auto-sized above duration_s or 30s)."));
     server.RegisterTool({
         "samurai_run_benchmark",
-        "Execute a real, live, fail-closed Samurai dataplane test against an authorized target server using any of the 10 native workers (L4, L7/TLS/H2/QUIC, AF_XDP, DPDK, GPU BAR1 P2P, DOCA, 4G/5G Telco CUPS, IPFIX, VAE Defense) and return structured JSON telemetry + KPI gate results.",
+        "Execute a real, live, fail-closed Samurai dataplane test (or long-running enterprise soak) against private or per-call authorized public targets using any of the 10 native workers.",
         SchemaWithProps(std::move(props)),
         [safety](const Value& a) { return HandleRunBenchmark(a, safety); },
     });
@@ -220,13 +253,15 @@ void RegisterAllTools(McpServer& server,
   {
     Value props = Value::Object();
     props.set("suite", PropStr("RFC suite to run.", {"all", "rfc2544", "rfc3511", "rfc8219"}));
-    props.set("target", PropStr("Authorized private/loopback IPv4 target (required)."));
+    props.set("target", PropStr("Authorized private/loopback or allow_target-permitted IPv4/domain target (required)."));
+    AddAllowTargetProps(props);
     props.set("port", PropInt("Target port (default: 80)."));
     props.set("worker", PropStr("Worker backend (e.g. l7, cpu, dpdk, telco)."));
     props.set("protocol", PropStr("Protocol override (e.g. http1, http2, udp, tcp)."));
     props.set("rps", PropNum("Target peak RPS ceiling for RFC 2544/3511 trials."));
     props.set("count", PropInt("Requests/packets per RFC trial (default: 1000)."));
     props.set("keepalive", PropBool("Reuse L7 connections across requests."));
+    props.set("timeout_s", PropInt("RFC suite timeout in seconds (5-86400, default: 120)."));
     props.set("live_dataplane", PropBool("Must be true to confirm live dataplane RFC trials."));
     server.RegisterTool({
         "samurai_run_rfc_suite",
@@ -264,7 +299,8 @@ void RegisterAllTools(McpServer& server,
   // 7. Cluster service/node/worker/shard discovery (real samurai_master endpoints)
   {
     Value props = Value::Object();
-    props.set("host", PropStr("Private/loopback IPv4 address of samurai_master (default: 127.0.0.1)."));
+    props.set("host", PropStr("Private/loopback IPv4 (or allow_target-authorized) address of samurai_master (default: 127.0.0.1)."));
+    AddAllowTargetProps(props);
     props.set("port", PropInt("Management API HTTP port (default: 8089)."));
     props.set("auth_token", PropStr("Optional Bearer token (falls back to SAMURAI_MANAGEMENT_API_*_TOKEN)."));
     props.set("include_events", PropBool("Include /v1/cluster/events log (default: false)."));
@@ -287,7 +323,8 @@ void RegisterAllTools(McpServer& server,
   // 8. Provision new worker nodes into the cluster
   {
     Value props = Value::Object();
-    props.set("host", PropStr("samurai_master private/loopback IPv4 (default: 127.0.0.1)."));
+    props.set("host", PropStr("samurai_master private/loopback (or allow_target-authorized) IPv4 (default: 127.0.0.1)."));
+    AddAllowTargetProps(props);
     props.set("port", PropInt("Management API HTTP port (default: 8089)."));
     props.set("node_hosts", PropStr("Comma-separated private/RFC1918 IPv4 addresses of new nodes to provision."));
     props.set("ssh_user", PropStr("SSH username on target lab nodes (default: root)."));
@@ -307,7 +344,8 @@ void RegisterAllTools(McpServer& server,
   // 9. Live multi-worker shard reconfiguration
   {
     Value props = Value::Object();
-    props.set("host", PropStr("samurai_master private/loopback IPv4 (default: 127.0.0.1)."));
+    props.set("host", PropStr("samurai_master private/loopback (or allow_target-authorized) IPv4 (default: 127.0.0.1)."));
+    AddAllowTargetProps(props);
     props.set("port", PropInt("Management API HTTP port (default: 8089)."));
     props.set("shard_id", PropStr("Optional active shard ID to reconfigure (omit for cluster-wide update)."));
     props.set("worker_id", PropStr("Optional worker ID filter."));
@@ -332,7 +370,8 @@ void RegisterAllTools(McpServer& server,
   // 10. Emergency cluster-wide abort
   {
     Value props = Value::Object();
-    props.set("host", PropStr("samurai_master private/loopback IPv4 (default: 127.0.0.1)."));
+    props.set("host", PropStr("samurai_master private/loopback (or allow_target-authorized) IPv4 (default: 127.0.0.1)."));
+    AddAllowTargetProps(props);
     props.set("port", PropInt("Management API HTTP port (default: 8089)."));
     props.set("auth_token", PropStr("Optional Operator/Admin Bearer token."));
     server.RegisterTool({
@@ -390,7 +429,8 @@ void RegisterAllTools(McpServer& server,
   {
     Value props = Value::Object();
     props.set("worker", PropStr("Worker flavor required across cluster slaves (default: cpu).", AllowedWorkers()));
-    props.set("target", PropStr("Authorized private/loopback (or SAMURAI_MCP_ALLOW_TARGETS) IPv4 target."));
+    props.set("target", PropStr("Private/loopback IPv4, or allow_target-authorized IPv4/CIDR/domain."));
+    AddAllowTargetProps(props);
     props.set("port", PropInt("Target port (1-65535)."));
     props.set("protocol", PropStr("L4/L7/Telco protocol (default: udp).", AllowedProtocols()));
     props.set("count", PropInt("Total distributed packet/request count split across workers (0 allowed for timed telco)."));
@@ -456,7 +496,7 @@ void RegisterAllTools(McpServer& server,
     props.set("cl_lever_shield", PropBool("Enable Mahoraga LeverShield on distributed RL runs."));
     props.set("cl_online_adapt", PropBool("Enable serving-time continual online adaptation."));
     props.set("cl_novelty", PropBool("Enable open-vocabulary novelty defense detection."));
-    props.set("timeout_s", PropInt("Subprocess wall-clock timeout in seconds (5-120)."));
+    props.set("timeout_s", PropInt("Subprocess wall-clock timeout in seconds (5-86400, default: 45)."));
     server.RegisterTool({
         "samurai_cluster_run_job",
         "Dispatch and execute a real distributed multi-worker test job via samurai_master across connected samurai_slave nodes (supports all 10 workers, shard strategies, 4G/5G telco pools, IPFIX, and distributed Closed-Loop AIMD/BinSearch/Mahoraga RL).",
@@ -533,7 +573,8 @@ void RegisterAllTools(McpServer& server,
     Value props = Value::Object();
     props.set("session_id", PropStr("Autopilot session ID."));
     props.set("worker", PropStr("Dataplane worker backend (default: l7).", AllowedWorkers()));
-    props.set("target", PropStr("Private/loopback IPv4 target (fail-closed)."));
+    props.set("target", PropStr("Private/loopback IPv4 or allow_target-authorized external IPv4/domain."));
+    AddAllowTargetProps(props);
     props.set("port", PropInt("Target port (default: 8080)."));
     props.set("protocol", PropStr("Protocol (default: http1).", AllowedProtocols()));
     props.set("l7_protocol", PropStr("Optional L7 protocol override.", {"http1", "http2", "quic", "dns"}));
@@ -547,7 +588,7 @@ void RegisterAllTools(McpServer& server,
     props.set("l7_profile_file", PropStr("Alias for scenario_file."));
     props.set("iface", PropStr("Optional network interface override (--iface)."));
     props.set("transport", PropStr("Optional dataplane transport override (--transport)."));
-    props.set("window_s", PropNum("Window duration in seconds used to compute packet count from setpoint_rps (0.2-15s, default: 1.0)."));
+    props.set("window_s", PropNum("Window duration in seconds used to compute packet count from setpoint_rps (0.2-3600s, default: 1.0)."));
     props.set("count", PropInt("Optional explicit packet/request count override."));
     props.set("concurrency", PropInt("L7 concurrency."));
     props.set("keepalive", PropBool("L7 keepalive."));
@@ -611,19 +652,22 @@ void RegisterAllTools(McpServer& server,
     sc_obj.set("description", Value::Str("Inline Scenario Engine JSON spec to validate and run live."));
     props.set("scenario", std::move(sc_obj));
     props.set("scenario_file", PropStr("Path to a Scenario Engine JSON file."));
-    props.set("target", PropStr("Private/loopback IPv4 target (fail-closed; public IPs blocked)."));
+    props.set("target", PropStr("Private/loopback IPv4, or explicitly authorized public IPv4/CIDR/domain (requires allow_target/allow_targets or SAMURAI_MCP_ALLOW_TARGETS)."));
+    AddAllowTargetProps(props);
     props.set("port", PropInt("Target port (default: 8080)."));
-    props.set("count", PropInt("Bounded request/session budget (default: 100)."));
+    props.set("count", PropInt("Bounded request/session budget (default: 100; limit 100000000 or SAMURAI_MCP_MAX_COUNT)."));
+    props.set("duration_s", PropNum("Optional enterprise soak test duration in seconds (loops scenario flows continuously across rounds until elapsed)."));
+    props.set("async", PropBool("When true, start as a background soak job and return job_id immediately (poll/stop via samurai_job_status / samurai_job_stop)."));
     props.set("rps", PropNum("Optional target RPS pacing cap."));
     props.set("concurrency", PropInt("Optional concurrency override."));
     props.set("iface", PropStr("Optional network interface override (--iface)."));
     props.set("transport", PropStr("Optional dataplane transport override (--transport)."));
     props.set("config", PropStr("Optional tuning config file path (--config)."));
     AddCustomTcpSchemaProps(props);
-    props.set("timeout_s", PropInt("Subprocess wall-clock timeout in seconds (5-120)."));
+    props.set("timeout_s", PropInt("Subprocess/soak wall-clock timeout in seconds (5-86400, default: auto-sized above duration_s or 30s)."));
     server.RegisterTool({
         "samurai_scenario_run",
-        "Validate in-process and execute a live multi-step persona Scenario (HTTP/1.1, HTTP/2, QUIC/H3, cookie/JWT token binding, SLA checks) via samurai_scenario_worker against a loopback/RFC1918 lab target.",
+        "Validate in-process and execute a live multi-step persona Scenario or long-running enterprise soak (HTTP/1.1, HTTP/2, QUIC/H3, L4 TCP, cookie/JWT token binding, SLA checks) against loopback/RFC1918 or explicitly authorized external targets.",
         SchemaWithProps(std::move(props)),
         [safety](const Value& a) { return HandleScenarioRun(a, safety); },
     });
@@ -649,6 +693,58 @@ void RegisterAllTools(McpServer& server,
         "Evaluate a Scenario Engine SLA contract against observed session/step/latency/TCP counters in-process via native evaluate_sla_native().",
         SchemaWithProps(std::move(props), {"sla"}),
         [](const Value& a) { return HandleScenarioEvaluateSla(a); },
+    });
+  }
+
+  // 21. Fail-closed API & Docker service discovery
+  {
+    Value props = Value::Object();
+    props.set("target", PropStr("Single private/loopback IPv4, host.docker.internal, or allow_target-authorized public IPv4/domain."));
+    props.set("targets", PropArray("Array of private/loopback IPv4, host.docker.internal, or allow_target-authorized public targets.", "string"));
+    AddAllowTargetProps(props);
+    props.set("ports", PropArray("TCP ports to check on explicit target/targets (default: common HTTP/API ports).", "integer"));
+    props.set("discover_docker", PropBool("Inspect running Docker containers and their network IPs/ports via /var/run/docker.sock (default: true when no explicit target/targets provided)."));
+    props.set("docker_socket", PropStr("Unix socket path for Docker Engine API (default: /var/run/docker.sock)."));
+    props.set("name_filter", PropStr("Case-insensitive substring filter on Docker container name or image."));
+    props.set("network_filter", PropStr("Case-insensitive substring filter on Docker network name."));
+    props.set("probe_http", PropBool("Perform HTTP/1.1 probing on open TCP ports (default: true)."));
+    props.set("probe_openapi", PropBool("Probe OpenAPI/Swagger endpoints (/openapi.json, /swagger.json, /v3/api-docs, etc.) and extract routes (default: true)."));
+    props.set("probe_non_http_ports", PropBool("Also send HTTP probes to well-known database/SSH ports like 5432/6379 (default: false)."));
+    props.set("probe_paths", PropArray("Additional HTTP paths to probe on open services.", "string"));
+    props.set("replace_default_paths", PropBool("When true, probe only 'probe_paths' instead of merging with built-in health/API paths (default: false)."));
+    props.set("host_header", PropStr("Optional HTTP Host header override for probed services."));
+    props.set("auth_token", PropStr("Optional Bearer token sent as Authorization header during HTTP discovery probes."));
+    props.set("connect_timeout_ms", PropInt("Non-blocking TCP connect timeout in ms (50-5000, default: 400)."));
+    props.set("request_timeout_ms", PropInt("HTTP read timeout per probe in ms (100-10000, default: 1500)."));
+    props.set("include_body_preview", PropBool("Include truncated sanitized response body previews (default: true)."));
+    props.set("generate_scenario", PropBool("Synthesize a ready-to-run samurai_scenario_worker JSON skeleton from discovered live GET routes (default: true)."));
+    server.RegisterTool({
+        "samurai_discover_apis",
+        "Discover local Docker network containers/ports and inspect HTTP APIs (private/loopback by default; external targets permitted when explicitly passed via allow_target/allow_targets; TCP reachability, service fingerprinting, OpenAPI/Swagger route extraction, health probes, and Scenario JSON synthesis).",
+        SchemaWithProps(std::move(props)),
+        [safety](const Value& a) { return HandleDiscoverApis(a, safety); },
+    });
+  }
+
+  // 22-23. Background async soak job inspection & graceful cancellation
+  {
+    Value props = Value::Object();
+    props.set("job_id", PropStr("Optional async job ID (omit to list all active and completed soak jobs)."));
+    server.RegisterTool({
+        "samurai_job_status",
+        "Inspect status, elapsed time, and final telemetry/report of an async enterprise soak job started with async=true.",
+        SchemaWithProps(std::move(props)),
+        [](const Value& a) { return HandleJobStatus(a); },
+    });
+  }
+  {
+    Value props = Value::Object();
+    props.set("job_id", PropStr("Async job ID to stop gracefully."));
+    server.RegisterTool({
+        "samurai_job_stop",
+        "Stop a running async enterprise soak job cleanly (sends SIGTERM/SIGKILL to worker subprocess and returns collected job state).",
+        SchemaWithProps(std::move(props), {"job_id"}),
+        [](const Value& a) { return HandleJobStop(a); },
     });
   }
 }
