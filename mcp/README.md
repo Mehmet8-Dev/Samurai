@@ -4,7 +4,7 @@ A **100% native C++17, zero-Python, modular Model Context Protocol (MCP) server*
 
 Links directly against `samurai_core` (native JSON + `ValidateTargetSafety`), `samurai_control` (`ClosedLoopController`, **Mahoraga `RlPolicy`** SRLP MLP & RL² GRU, `LeverShield`, `RlExploreConfig`, `SplitJobToShards`, `SplitTelcoSubscribers`, `AutoscaleController`), and `samurai_scenario` (`parse_spec`, `build_worker_session_plans_native`, `evaluate_sla_native`).
 
-Exposes **22 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 MCP Workflow Prompts** over stdio JSON-RPC 2.0 — enabling Claude Code, Cursor, Codex, Antigravity, and autonomous RL agents to execute live tests against authorized target servers across all 10 workers (L4, L7/TLS/H2/QUIC, GPU BAR1 P2P, 4G/5G Telco CUPS, IPFIX), discover/provision/scale cluster nodes, dispatch distributed multi-worker jobs, run Scenario Engine journeys, and drive Closed-Loop Autopilot runs.
+Exposes **25 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 MCP Workflow Prompts** over stdio JSON-RPC 2.0 — enabling Claude Code, Cursor, Codex, Antigravity, and autonomous RL agents to execute live tests against authorized target servers across all 10 workers (L4, L7/TLS/H2/QUIC, GPU BAR1 P2P, 4G/5G Telco CUPS, IPFIX), discover/provision/scale cluster nodes, dispatch distributed multi-worker jobs, run Scenario Engine journeys, discover Docker/OpenAPI services, manage async soak jobs, and drive Closed-Loop Autopilot runs.
 
 ---
 
@@ -18,7 +18,7 @@ Exposes **22 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**,
 | [`samurai/mcp/cluster_tools.hpp`](../samurai/mcp/cluster_tools.hpp) / `.cpp` | Distributed cluster discovery, SSH node provisioning, live shard reconfiguration, abort, in-process sharding/autoscale planning, and loopback local multi-worker mesh manager |
 | [`samurai/mcp/autopilot_tools.hpp`](../samurai/mcp/autopilot_tools.hpp) / `.cpp` | Closed-Loop Autopilot & Mahoraga RL session manager (`AIMD` / `BinSearch` / `kRl` + `RlPolicy` + `LeverShield` + `RlExploreConfig`) |
 | [`samurai/mcp/scenario_tools.hpp`](../samurai/mcp/scenario_tools.hpp) / `.cpp` | Scenario Engine in-process compiler, weighted worker scheduler, SLA evaluator, and fail-closed live runner |
-| [`samurai/mcp/tool_registry.hpp`](../samurai/mcp/tool_registry.hpp) / `.cpp` | Registration of all 22 tools, 5 skill resources, and 5 workflow prompts |
+| [`samurai/mcp/tool_registry.hpp`](../samurai/mcp/tool_registry.hpp) / `.cpp` | Registration of all 25 tools, 5 skill resources, and 5 workflow prompts |
 | [`samurai/mcp/setup_tools.hpp`](../samurai/mcp/setup_tools.hpp) / `.cpp` | Automated MCP client diagnostics (`doctor`) & registration (`setup`) across 10+ AI clients |
 | [`samurai/mcp/test_samurai_mcp.cpp`](../samurai/mcp/test_samurai_mcp.cpp) | Native C++17 verification suite (`test_samurai_mcp`) |
 
@@ -83,7 +83,7 @@ claude mcp add samurai -- docker run -i --rm --network host samurai:local samura
 
 ---
 
-## All 22 Native MCP Tools
+## All 25 Native MCP Tools
 
 ### Dataplane, Live Target Testing, Benchmarks & RFC Compliance (6 Tools)
 | Tool | Purpose |
@@ -120,8 +120,15 @@ claude mcp add samurai -- docker run -i --rm --network host samurai:local samura
 | Tool | Purpose |
 | :--- | :--- |
 | `samurai_scenario_compile` | Parses, validates, and compiles Scenario JSON specs in-process via `samurai_scenario` |
-| `samurai_scenario_run` | Validates in-process and runs a live multi-step persona scenario via `samurai_scenario_worker` |
+| `samurai_scenario_run` | Validates in-process and runs a live multi-step persona scenario via `samurai_scenario_worker` (supports `duration_s` & `async: true`) |
 | `samurai_scenario_evaluate_sla` | Evaluates Scenario SLA contracts in-process via `evaluate_sla_native()` |
+
+### Service Discovery & Async Soak Job Management (3 Tools)
+| Tool | Purpose |
+| :--- | :--- |
+| `samurai_discover_apis` | Fail-closed Docker container/port discovery, HTTP/OpenAPI probing, and Scenario JSON skeleton synthesis |
+| `samurai_job_status` | Inspects status, elapsed time, and final telemetry/report of async soak jobs (`async: true`) |
+| `samurai_job_stop` | Gracefully stops a running async soak job (`SIGTERM`/`SIGKILL`) and returns final captured state |
 
 ---
 

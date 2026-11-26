@@ -45,6 +45,13 @@ Always separate:
 - **In-memory dataplane self-benchmarks:** `samurai_bench_tcp_flows` (`100k`/`1m`), `samurai_bench_l7_userspace` (`h1`/`h2`).
 - Report exact tool name, target, worker/protocol, HTTP status breakdown (`status_2xx..5xx`), `expectation_failures`, RPS/PPS, P95/P99 latency, elapsed soak duration, and any failures honestly.
 
+## API & Docker Discovery (`samurai_discover_apis`)
+
+Before writing scenarios for an unfamiliar local/staging service:
+- **Docker + local port scan:** Call `samurai_discover_apis` with `discover_docker: true` (optional `name_filter`, `network_filter`) to inspect running containers, published ports, and container IPs via `/var/run/docker.sock`.
+- **Direct target + OpenAPI probe:** Pass `target` (or `targets`) + `ports` (e.g. `[3000, 8080, 8443]`), `probe_openapi: true`, optional `auth_token` (Bearer) and `allow_target` for authorized external hosts.
+- **Output:** Returns open TCP ports, HTTP status/headers, extracted OpenAPI/Swagger routes, and a ready-to-compile `generated_scenario` JSON skeleton when `generate_scenario: true` — feed it directly into `samurai_scenario_compile` -> `samurai_scenario_run`.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

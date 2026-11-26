@@ -34,6 +34,13 @@ When running `worker: "afxdp"` or an L7/Scenario profile with `transport: "custo
 - **Target Authorization:** Internal loopback / RFC 1918 / link-local / CGNAT targets work fail-closed out of the box; external enterprise IPv4s, CIDRs, or domains require explicit `allow_target` / `allow_targets` (or `SAMURAI_MCP_ALLOW_TARGETS`), with `SAMURAI_MCP_DENY_TARGETS` always enforced first.
 - **Enterprise Soak:** `samurai_run_benchmark` accepts `duration_s` (up to `86400s`) and `async: true` across workers (`telco` maps to `--telco-duration-ms`, `scenario` uses `SAMURAI_SCENARIO_DURATION_S`, and other dataplane workers iterate bounded rounds and aggregate `soak_summary`).
 
+## Telco 4G/5G CUPS Protocol Examples (`worker: "telco"`)
+
+When using `samurai_run_benchmark` with `worker: "telco"`:
+- **5G GTP-U User Plane (`protocol: "gtpu"`):** Pass `port: 2152`, `telco_qfi` (`1–63`), `telco_teid_base`, `telco_pool_profile` (`"linear"` | `"regional-bng"` | `"national-cgnat"`), and `duration_s` (maps to `telco_duration_ms`).
+- **5G Control / Signalling (`pfcp`, `sctp`, `diameter`):** Use `protocol: "pfcp"` (`port: 8805`), `protocol: "sctp"` (`profile: "telco-sctp-flood"`), or `protocol: "diameter"` (`port: 3868`, `profile: "telco-diameter-billing"`).
+- **IMS / VoIP Media (`sip-rtp`):** Use `protocol: "sip-rtp"` (`port: 5060`, `profile: "telco-sip-storm"`) with `enable_srtp: true` for encrypted RTP media testing.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "discovery_tools.hpp"
+#include "embedded_skills.hpp"
 #include "runtime_tools.hpp"
 #include "scenario_tools.hpp"
 
@@ -754,35 +755,78 @@ void RegisterSkillsAndPrompts(McpServer& server) {
     const char* slug;
     const char* rel_path;
     const char* desc;
+    std::vector<PromptArgument> args;
   };
-  static const SkillDef kSkills[] = {
+  const std::vector<SkillDef> kSkills = {
       {"samurai-netbench", "skills/samurai-netbench/SKILL.md",
-       "Core Samurai L4/L7/RFC benchmarking, host discovery, and evidence-boundary workflow."},
+       "Core Samurai L4/L7/RFC benchmarking, host discovery, and evidence-boundary workflow.",
+       {{"target", "Target IPv4, CIDR, or hostname to test or discover.", false},
+        {"port", "Target TCP/UDP port (e.g. 8080).", false},
+        {"goal", "Benchmark, soak, or discovery objective.", false}}},
       {"samurai-cluster-orchestrator", "skills/samurai-cluster-orchestrator/SKILL.md",
-       "Distributed cluster discovery, node provisioning, multi-worker sharding, autoscaling, and live shard coordination."},
+       "Distributed cluster discovery, node provisioning, multi-worker sharding, autoscaling, and live shard coordination.",
+       {{"host", "samurai_master Management API host (default: 127.0.0.1).", false},
+        {"port", "samurai_master Management API port (default: 8089).", false},
+        {"slaves", "Desired number of samurai_slave workers.", false},
+        {"target", "Target SUT IPv4 or hostname for distributed jobs.", false}}},
       {"samurai-autopilot-rl", "skills/samurai-autopilot-rl/SKILL.md",
-       "Closed-Loop Autopilot (AIMD/BinSearch/Mahoraga RL), SRLP MLP/RL^2 GRU inference, and LeverShield WAF reflex."},
+       "Closed-Loop Autopilot (AIMD/BinSearch/Mahoraga RL), SRLP MLP/RL^2 GRU inference, and LeverShield WAF reflex.",
+       {{"target", "Target SUT IPv4 or hostname.", false},
+        {"port", "Target SUT port.", false},
+        {"strategy", "Autopilot strategy: aimd, binsearch, or rl.", false},
+        {"slo_max_latency_ms", "Maximum P99 latency SLO threshold in ms.", false}}},
       {"samurai-scenario-author", "skills/samurai-scenario-author/SKILL.md",
-       "Multi-step Web/Mobile persona scenario authoring, JWT/cookie binding, in-process compilation, and SLA verification."},
+       "Multi-step Web/Mobile persona scenario authoring, JWT/cookie binding, in-process compilation, and SLA verification.",
+       {{"target", "Target service IPv4 or hostname.", false},
+        {"port", "Target service port.", false},
+        {"protocol", "Scenario protocol: http1, http2, http3, quic, or tcp.", false},
+        {"flow_goal", "User journey or L4 TCP flow to model.", false}}},
       {"samurai-hardware-dataplane", "skills/samurai-hardware-dataplane/SKILL.md",
-       "Complete catalog & orchestration playbook for all 10 native dataplane workers (cpu, afpacket, afxdp, dpdk, gpu CUDA/BAR1 P2P, doca, l7, scenario, telco 4G/5G CUPS, defense VAE)."},
+       "Complete catalog & orchestration playbook for all 10 native dataplane workers (cpu, afpacket, afxdp, dpdk, gpu CUDA/BAR1 P2P, doca, l7, scenario, telco 4G/5G CUPS, defense VAE).",
+       {{"worker", "Dataplane worker (cpu, afpacket, afxdp, dpdk, gpu, doca, l7, scenario, telco, defense).", false},
+        {"target", "Target IPv4 or hostname.", false},
+        {"protocol", "Protocol (udp, tcp, http1, http2, quic, gtpu, pfcp, sctp, diameter, sip-rtp).", false},
+        {"duration_s", "Optional soak duration in seconds.", false}}},
   };
 
   for (const auto& s : kSkills) {
+    const std::string slug = s.slug;
     const std::string uri = std::string("samurai://skills/") + s.slug;
     const std::string rel = s.rel_path;
     const std::string desc = s.desc;
+    const auto load_skill = [slug, rel, desc]() {
+      std::string embedded = EmbeddedSkillMarkdown(slug);
+      if (embedded.empty()) embedded = "# " + rel + "\n\n" + desc + "\n";
+      return ReadSkillMarkdown(rel, embedded);
+    };
     server.RegisterResource({
         uri,
         s.slug,
         desc,
         "text/markdown",
-        [rel, desc]() { return ReadSkillMarkdown(rel, "# " + rel + "\n\n" + desc + "\n"); },
+        load_skill,
     });
     server.RegisterPrompt({
         s.slug,
         desc,
-        [rel, desc](const Value&) { return ReadSkillMarkdown(rel, "# " + rel + "\n\n" + desc + "\n"); },
+        s.args,
+        [load_skill, slug](const Value& args) {
+          std::string base = load_skill();
+          if (!args.is_object() || args.members().empty()) return base;
+          std::ostringstream ctx;
+          ctx << "## Active Task Context (`" << slug << "`)\n\n";
+          bool has_any = false;
+          for (const auto& kv : args.members()) {
+            const std::string val = kv.second.is_string() ? kv.second.as_string() : kv.second.dump();
+            if (!val.empty()) {
+              ctx << "- **" << kv.first << ":** `" << val << "`\n";
+              has_any = true;
+            }
+          }
+          if (!has_any) return base;
+          ctx << "\n---\n\n";
+          return ctx.str() + base;
+        },
     });
   }
 }

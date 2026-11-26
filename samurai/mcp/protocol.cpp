@@ -198,7 +198,15 @@ std::optional<Value> McpServer::HandleRequest(const Value& req) const {
       Value entry = Value::Object();
       entry.set("name", Value::Str(p.name));
       entry.set("description", Value::Str(p.description));
-      entry.set("arguments", Value::Array());
+      Value args_arr = Value::Array();
+      for (const auto& arg : p.arguments) {
+        Value aobj = Value::Object();
+        aobj.set("name", Value::Str(arg.name));
+        aobj.set("description", Value::Str(arg.description));
+        aobj.set("required", Value::Bool(arg.required));
+        args_arr.push_back(std::move(aobj));
+      }
+      entry.set("arguments", std::move(args_arr));
       arr.push_back(std::move(entry));
     }
     Value result = Value::Object();

@@ -19,6 +19,7 @@
 
 #include "autopilot_tools.hpp"
 #include "cluster_tools.hpp"
+#include "embedded_skills.hpp"
 #include "json.hpp"
 #include "protocol.hpp"
 #include "runtime_tools.hpp"
@@ -159,6 +160,40 @@ int main() {
     const Value* prompts = pp.value.find("result")->find("prompts");
     Check(prompts && prompts->is_array() && prompts->elements().size() == 5,
           "prompts/list returns 5 skill prompts");
+    bool all_prompts_have_args = (prompts && prompts->is_array() && !prompts->elements().empty());
+    if (prompts && prompts->is_array()) {
+      for (const auto& pr : prompts->elements()) {
+        const Value* pargs = pr.find("arguments");
+        if (!pargs || !pargs->is_array() || pargs->elements().empty()) {
+          all_prompts_have_args = false;
+          break;
+        }
+      }
+    }
+    Check(all_prompts_have_args, "prompts/list exposes structured arguments for every skill prompt");
+
+    // Verify embedded skill markdown fallback and parameterized prompts/get rendering
+    for (const auto& sc : kSkillChecks) {
+      const std::string emb = samurai::mcp::EmbeddedSkillMarkdown(sc.slug);
+      const std::string msg = std::string("EmbeddedSkillMarkdown contains full content for ") + sc.slug;
+      Check(emb.size() > 500 && emb.find(sc.marker) != std::string::npos, msg.c_str());
+    }
+    Check(samurai::mcp::EmbeddedSkillMarkdown("samurai-netbench").find("samurai_discover_apis") != std::string::npos,
+          "samurai-netbench skill includes samurai_discover_apis section");
+    Check(samurai::mcp::EmbeddedSkillMarkdown("samurai-hardware-dataplane").find("telco_qfi") != std::string::npos,
+          "samurai-hardware-dataplane skill includes telco protocol parameters");
+
+    const auto pgline = server.HandleLine(
+        R"({"jsonrpc":"2.0","id":204,"method":"prompts/get","params":{"name":"samurai-netbench","arguments":{"target":"10.0.0.5","port":"8080"}}})");
+    const auto pgp = Parse(*pgline);
+    const Value* msgs = pgp.value.find("result") ? pgp.value.find("result")->find("messages") : nullptr;
+    const std::string ptext = (msgs && msgs->is_array() && !msgs->elements().empty())
+                                  ? msgs->elements()[0].find("content")->find("text")->as_string()
+                                  : "";
+    Check(ptext.find("Active Task Context") != std::string::npos &&
+              ptext.find("10.0.0.5") != std::string::npos &&
+              ptext.find("25 native C++17 tools") != std::string::npos,
+          "prompts/get renders Active Task Context with arguments alongside skill markdown");
   }
 
   // 4. Fail-closed safety blocks public targets

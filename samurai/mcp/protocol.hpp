@@ -42,9 +42,16 @@ struct ResourceSpec {
   std::function<std::string()> reader;
 };
 
+struct PromptArgument {
+  std::string name;
+  std::string description;
+  bool required = false;
+};
+
 struct PromptSpec {
   std::string name;
   std::string description;
+  std::vector<PromptArgument> arguments;
   std::function<std::string(const samurai::core::json::Value& args)> renderer;
 };
 
