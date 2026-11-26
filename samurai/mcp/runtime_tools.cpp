@@ -18,15 +18,21 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 
 namespace samurai::mcp {
 
@@ -526,6 +532,14 @@ std::string FindNativeBinary(const std::vector<std::string>& candidates) {
 SubprocessResult RunSubprocess(const std::vector<std::string>& argv,
                                int timeout_s,
                                const EnvVarList& env_overrides) {
+  return RunSubprocessCancellable(argv, timeout_s, env_overrides, nullptr, nullptr);
+}
+
+SubprocessResult RunSubprocessCancellable(const std::vector<std::string>& argv,
+                                          int timeout_s,
+                                          const EnvVarList& env_overrides,
+                                          const std::atomic<bool>* cancel_flag,
+                                          std::atomic<pid_t>* active_pid_out) {
   SubprocessResult res;
   if (argv.empty()) {
     res.error = "Empty command";
@@ -570,6 +584,8 @@ SubprocessResult RunSubprocess(const std::vector<std::string>& argv,
     _exit(127);
   }
 
+  if (active_pid_out) active_pid_out->store(pid);
+
   ::close(out_pipe[1]);
   ::close(err_pipe[1]);
   ::fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
@@ -582,6 +598,14 @@ SubprocessResult RunSubprocess(const std::vector<std::string>& argv,
 
   char buf[4096];
   while (out_open || err_open) {
+    if (cancel_flag && cancel_flag->load()) {
+      res.error = "Stopped by caller";
+      ::kill(pid, SIGTERM);
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      ::kill(pid, SIGKILL);
+      break;
+    }
+
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
       res.timed_out = true;
@@ -608,7 +632,7 @@ SubprocessResult RunSubprocess(const std::vector<std::string>& argv,
       fds[nfds++] = pollfd{err_pipe[0], POLLIN, 0};
     }
 
-    const int prc = ::poll(fds, nfds, std::min(rem_ms, 200));
+    const int prc = ::poll(fds, nfds, std::min(rem_ms, 100));
     if (prc < 0) {
       if (errno == EINTR) continue;
       break;
@@ -648,12 +672,200 @@ SubprocessResult RunSubprocess(const std::vector<std::string>& argv,
 
   int wstatus = 0;
   ::waitpid(pid, &wstatus, 0);
+  if (active_pid_out) active_pid_out->store(-1);
   if (WIFEXITED(wstatus)) {
     res.exit_code = WEXITSTATUS(wstatus);
   } else if (WIFSIGNALED(wstatus)) {
     res.exit_code = 128 + WTERMSIG(wstatus);
   }
   return res;
+}
+
+namespace {
+
+struct AsyncJobRecord {
+  std::string job_id;
+  std::string tool;
+  std::string target;
+  int port = 0;
+  int timeout_s = 0;
+  std::chrono::steady_clock::time_point started_at;
+  std::string status = "running";
+  double elapsed_s = 0.0;
+  Value result = Value::Null();
+  std::atomic<bool> cancel{false};
+  std::atomic<pid_t> active_pid{-1};
+  std::mutex join_mu;
+  std::thread worker;
+};
+
+struct AsyncJobRegistry {
+  std::mutex mu;
+  std::uint64_t next_id = 1;
+  std::deque<std::string> order;
+  std::unordered_map<std::string, std::shared_ptr<AsyncJobRecord>> jobs;
+
+  ~AsyncJobRegistry() {
+    std::vector<std::shared_ptr<AsyncJobRecord>> all;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      for (auto& kv : jobs) {
+        kv.second->cancel.store(true);
+        const pid_t p = kv.second->active_pid.load();
+        if (p > 0) ::kill(p, SIGTERM);
+        all.push_back(kv.second);
+      }
+    }
+    for (auto& job : all) {
+      std::lock_guard<std::mutex> jlock(job->join_mu);
+      if (job->worker.joinable()) job->worker.join();
+    }
+  }
+};
+
+AsyncJobRegistry& GetJobRegistry() {
+  static AsyncJobRegistry reg;
+  return reg;
+}
+
+Value JobSnapshotJson(const AsyncJobRecord& job, bool include_result) {
+  const double cur_elapsed = (job.status == "running")
+      ? std::chrono::duration<double>(std::chrono::steady_clock::now() - job.started_at).count()
+      : job.elapsed_s;
+  Value o = Value::Object();
+  o.set("job_id", Value::Str(job.job_id));
+  o.set("tool", Value::Str(job.tool));
+  o.set("target", Value::Str(job.target));
+  o.set("port", Value::Int(job.port));
+  o.set("timeout_s", Value::Int(job.timeout_s));
+  o.set("status", Value::Str(job.status));
+  o.set("elapsed_s", Value::Double(cur_elapsed));
+  if (include_result && !job.result.is_null()) {
+    o.set("result", job.result);
+  }
+  return o;
+}
+
+}  // namespace
+
+ToolResult StartAsyncMcpJob(
+    const std::string& tool_name,
+    const std::string& target,
+    int port,
+    int timeout_s,
+    std::function<Value(const std::atomic<bool>&, std::atomic<pid_t>&, std::string&)> runner) {
+  auto& reg = GetJobRegistry();
+  auto job = std::make_shared<AsyncJobRecord>();
+  {
+    std::lock_guard<std::mutex> lock(reg.mu);
+    job->job_id = "job-" + std::to_string(reg.next_id++);
+    job->tool = tool_name;
+    job->target = target;
+    job->port = port;
+    job->timeout_s = timeout_s;
+    job->started_at = std::chrono::steady_clock::now();
+    reg.jobs.emplace(job->job_id, job);
+    reg.order.push_back(job->job_id);
+    while (reg.order.size() > 64) {
+      const std::string old_id = reg.order.front();
+      auto it = reg.jobs.find(old_id);
+      if (it != reg.jobs.end() && it->second->status == "running") break;
+      reg.order.pop_front();
+      if (it != reg.jobs.end()) reg.jobs.erase(it);
+    }
+  }
+
+  job->worker = std::thread([job, fn = std::move(runner)]() {
+    std::string final_status = "completed";
+    Value payload = Value::Null();
+    try {
+      payload = fn(job->cancel, job->active_pid, final_status);
+    } catch (const std::exception& ex) {
+      final_status = "failed";
+      payload = Value::Object();
+      payload.set("error", Value::Str(ex.what()));
+    }
+    if (job->cancel.load() && final_status == "completed") {
+      final_status = "stopped";
+    }
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - job->started_at).count();
+    auto& r = GetJobRegistry();
+    std::lock_guard<std::mutex> lock(r.mu);
+    job->status = final_status;
+    job->elapsed_s = elapsed;
+    job->result = std::move(payload);
+  });
+
+  Value out = Value::Object();
+  out.set("async", Value::Bool(true));
+  out.set("job_id", Value::Str(job->job_id));
+  out.set("tool", Value::Str(tool_name));
+  out.set("target", Value::Str(target));
+  out.set("port", Value::Int(port));
+  out.set("timeout_s", Value::Int(timeout_s));
+  out.set("status", Value::Str("running"));
+  out.set("hint", Value::Str("Poll progress with samurai_job_status or stop early with samurai_job_stop."));
+  return MakeToolSuccess(std::move(out));
+}
+
+ToolResult HandleJobStatus(const Value& args) {
+  auto& reg = GetJobRegistry();
+  const std::string jid = args.find("job_id") && args.find("job_id")->is_string()
+                              ? args.find("job_id")->as_string()
+                              : "";
+  std::lock_guard<std::mutex> lock(reg.mu);
+  if (!jid.empty()) {
+    auto it = reg.jobs.find(jid);
+    if (it == reg.jobs.end()) {
+      return MakeToolError("Unknown job_id: " + jid);
+    }
+    return MakeToolSuccess(JobSnapshotJson(*it->second, true));
+  }
+
+  Value arr = Value::Array();
+  int running_count = 0;
+  for (const auto& id : reg.order) {
+    auto it = reg.jobs.find(id);
+    if (it == reg.jobs.end()) continue;
+    if (it->second->status == "running") ++running_count;
+    arr.push_back(JobSnapshotJson(*it->second, false));
+  }
+  Value out = Value::Object();
+  out.set("running_count", Value::Int(running_count));
+  out.set("total_jobs", Value::Int(static_cast<std::int64_t>(reg.jobs.size())));
+  out.set("jobs", std::move(arr));
+  return MakeToolSuccess(std::move(out));
+}
+
+ToolResult HandleJobStop(const Value& args) {
+  const std::string jid = args.find("job_id") && args.find("job_id")->is_string()
+                              ? args.find("job_id")->as_string()
+                              : "";
+  if (jid.empty()) return MakeToolError("job_id is required");
+
+  auto& reg = GetJobRegistry();
+  std::shared_ptr<AsyncJobRecord> job;
+  {
+    std::lock_guard<std::mutex> lock(reg.mu);
+    auto it = reg.jobs.find(jid);
+    if (it == reg.jobs.end()) {
+      return MakeToolError("Unknown job_id: " + jid);
+    }
+    job = it->second;
+    job->cancel.store(true);
+    const pid_t p = job->active_pid.load();
+    if (p > 0) ::kill(p, SIGTERM);
+  }
+
+  {
+    std::lock_guard<std::mutex> jlock(job->join_mu);
+    if (job->worker.joinable()) job->worker.join();
+  }
+
+  std::lock_guard<std::mutex> lock(reg.mu);
+  if (job->status == "running") job->status = "stopped";
+  return MakeToolSuccess(JobSnapshotJson(*job, true));
 }
 
 Value HostMetadataJson() {
@@ -715,6 +927,12 @@ ToolResult HandleListProfiles(const Value&) {
 }
 
 ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) {
+    return MakeToolError("Invalid target authorization parameter: " + safety_err);
+  }
+
   const std::string bin = FindNativeBinary({"samurai"});
   if (bin.empty()) {
     return MakeToolError("samurai CLI binary not found. Build via CMake first.");
@@ -727,7 +945,7 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
 
   const std::string raw_target = args.find("target") ? args.find("target")->as_string("127.0.0.1") : "127.0.0.1";
   std::string target;
-  const auto target_check = ResolveMcpTarget(raw_target, safety, target);
+  const auto target_check = ResolveMcpTarget(raw_target, eff_safety, target);
   if (!target_check.ok) {
     return MakeToolError("Target blocked by fail-closed MCP safety gate: " + target_check.reason);
   }
@@ -737,9 +955,25 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
     return MakeToolError("port must be between 1 and 65535");
   }
 
-  const std::int64_t count = args.find("count") ? args.find("count")->as_int(1000) : 1000;
-  if (count < 1 || static_cast<std::uint64_t>(count) > safety.max_packet_count) {
-    return MakeToolError("count must be between 1 and " + std::to_string(safety.max_packet_count));
+  const double duration_s = (args.find("duration_s") && args.find("duration_s")->is_number())
+      ? std::max(0.0, args.find("duration_s")->as_double(0.0))
+      : 0.0;
+  const double rps = args.find("rps") ? args.find("rps")->as_double(0.0) : 0.0;
+  if (rps < 0.0) {
+    return MakeToolError("rps must be >= 0");
+  }
+
+  std::int64_t count = (args.find("count") && args.find("count")->is_number())
+      ? args.find("count")->as_int(1000)
+      : ((duration_s > 0.0 && rps > 0.0)
+             ? std::max<std::int64_t>(1, static_cast<std::int64_t>(std::llround(rps * duration_s)))
+             : 1000);
+  if (worker == "telco" && duration_s > 0.0 && !args.find("count")) {
+    count = 1000;
+  }
+  std::string count_err;
+  if (!ValidateMcpPacketCount(count, eff_safety, &count_err)) {
+    return MakeToolError(count_err);
   }
 
   const std::int64_t size = args.find("size") ? args.find("size")->as_int(64) : 64;
@@ -752,77 +986,62 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
     return MakeToolError("Unsupported protocol: " + protocol);
   }
 
-  const double rps = args.find("rps") ? args.find("rps")->as_double(0.0) : 0.0;
-  if (rps < 0.0) {
-    return MakeToolError("rps must be >= 0");
-  }
-
+  const int default_timeout_s = duration_s > 0.0
+      ? std::max(30, static_cast<int>(std::ceil(duration_s)) + 30)
+      : 30;
   const int timeout_s = std::clamp(
-      static_cast<int>(args.find("timeout_s") ? args.find("timeout_s")->as_int(30) : 30),
-      5, safety.max_timeout_s);
+      static_cast<int>((args.find("timeout_s") && args.find("timeout_s")->is_number())
+                           ? args.find("timeout_s")->as_int(default_timeout_s)
+                           : default_timeout_s),
+      5, eff_safety.max_timeout_s);
+  const bool run_async = args.find("async") && args.find("async")->as_bool(false);
 
-  char tmpl[] = "/tmp/samurai_mcp_report_XXXXXX";
-  const int tmp_fd = ::mkstemp(tmpl);
-  if (tmp_fd < 0) {
-    return MakeToolError("Failed to create temporary report file");
-  }
-  ::close(tmp_fd);
-  const std::string report_path(tmpl);
-
-  std::vector<std::string> cmd = {bin, "--worker", worker};
-  for (const auto& allow_ip : safety.allow_targets) {
-    cmd.push_back("--allow-target");
-    cmd.push_back(allow_ip);
-  }
-  for (const auto& deny_ip : safety.deny_targets) {
-    cmd.push_back("--deny-target");
-    cmd.push_back(deny_ip);
-  }
+  std::vector<std::string> base_cmd = {bin, "--worker", worker};
+  AppendSafetyCliArgs(eff_safety, base_cmd, target);
   if (const Value* prof = args.find("profile"); prof && prof->is_string() && !prof->as_string().empty()) {
-    cmd.push_back("--profile");
-    cmd.push_back(prof->as_string());
+    base_cmd.push_back("--profile");
+    base_cmd.push_back(prof->as_string());
   }
-  cmd.push_back("--target");      cmd.push_back(target);
-  cmd.push_back("--port");        cmd.push_back(std::to_string(port));
-  cmd.push_back("--count");       cmd.push_back(std::to_string(count));
-  cmd.push_back("--size");        cmd.push_back(std::to_string(size));
-  cmd.push_back("--protocol");    cmd.push_back(protocol);
-  cmd.push_back("--report-json"); cmd.push_back(report_path);
-  cmd.push_back("--confirm");
+  base_cmd.push_back("--target");      base_cmd.push_back(target);
+  base_cmd.push_back("--port");        base_cmd.push_back(std::to_string(port));
+  base_cmd.push_back("--count");       base_cmd.push_back(std::to_string(count));
+  base_cmd.push_back("--size");        base_cmd.push_back(std::to_string(size));
+  base_cmd.push_back("--protocol");    base_cmd.push_back(protocol);
+  base_cmd.push_back("--confirm");
 
   auto push_str = [&](const char* key, const char* flag) {
     if (const Value* v = args.find(key); v && v->is_string() && !v->as_string().empty()) {
-      cmd.push_back(flag);
-      cmd.push_back(v->as_string());
+      base_cmd.push_back(flag);
+      base_cmd.push_back(v->as_string());
     }
   };
   auto push_pos_int = [&](const char* key, const char* flag) {
     if (const Value* v = args.find(key); v && v->is_number() && v->as_int(0) > 0) {
-      cmd.push_back(flag);
-      cmd.push_back(std::to_string(v->as_int(0)));
+      base_cmd.push_back(flag);
+      base_cmd.push_back(std::to_string(v->as_int(0)));
     }
   };
   auto push_nonneg_int = [&](const char* key, const char* flag) {
     if (const Value* v = args.find(key); v && v->is_number() && v->as_int(-1) >= 0) {
-      cmd.push_back(flag);
-      cmd.push_back(std::to_string(v->as_int(0)));
+      base_cmd.push_back(flag);
+      base_cmd.push_back(std::to_string(v->as_int(0)));
     }
   };
   auto push_num = [&](const char* key, const char* flag) {
     if (const Value* v = args.find(key); v && v->is_number()) {
-      cmd.push_back(flag);
-      cmd.push_back(std::to_string(v->as_double(0.0)));
+      base_cmd.push_back(flag);
+      base_cmd.push_back(std::to_string(v->as_double(0.0)));
     }
   };
   auto push_bool_flag = [&](const char* key, const char* flag) {
     if (const Value* v = args.find(key); v && v->as_bool(false)) {
-      cmd.push_back(flag);
+      base_cmd.push_back(flag);
     }
   };
 
   if (rps > 0.0) {
-    cmd.push_back("--rps");
-    cmd.push_back(std::to_string(rps));
+    base_cmd.push_back("--rps");
+    base_cmd.push_back(std::to_string(rps));
   }
 
   // Core / vector / CPU pinning / dataplane transport & config
@@ -840,7 +1059,14 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
   push_str("l7_profile_file", "--l7-profile-file");
   push_str("l7_payload_file", "--l7-payload-file");
   push_str("scheme", "--scheme");
-  push_str("host_header", "--host-header");
+  if (args.find("host_header") && args.find("host_header")->is_string() &&
+      !args.find("host_header")->as_string().empty()) {
+    push_str("host_header", "--host-header");
+  } else if (raw_target != target && (worker == "l7" || worker == "scenario" ||
+             protocol == "http1" || protocol == "http2" || protocol == "quic")) {
+    base_cmd.push_back("--host-header");
+    base_cmd.push_back(raw_target);
+  }
   push_pos_int("concurrency", "--concurrency");
   push_pos_int("max_connections", "--max-connections");
   push_pos_int("max_streams", "--max-streams");
@@ -852,7 +1078,12 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
   push_pos_int("telco_subscribers", "--telco-subscribers");
   push_nonneg_int("telco_subscriber_start", "--telco-subscriber-start");
   push_pos_int("telco_cps", "--telco-cps");
-  push_pos_int("telco_duration_ms", "--telco-duration-ms");
+  if (args.find("telco_duration_ms") && args.find("telco_duration_ms")->as_int(0) > 0) {
+    push_pos_int("telco_duration_ms", "--telco-duration-ms");
+  } else if (worker == "telco" && duration_s > 0.0) {
+    base_cmd.push_back("--telco-duration-ms");
+    base_cmd.push_back(std::to_string(std::max<std::int64_t>(100, static_cast<std::int64_t>(std::llround(duration_s * 1000.0)))));
+  }
   push_pos_int("vlan_s", "--vlan-s");
   push_pos_int("vlan_c", "--vlan-c");
   push_pos_int("sctp_rate", "--sctp-rate");
@@ -877,14 +1108,13 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
     const std::string raw_collector =
         args.find("ipfix_collector") ? args.find("ipfix_collector")->as_string("127.0.0.1") : "127.0.0.1";
     std::string collector;
-    const auto cchk = ResolveMcpTarget(raw_collector, safety, collector);
+    const auto cchk = ResolveMcpTarget(raw_collector, eff_safety, collector);
     if (!cchk.ok) {
-      ::unlink(report_path.c_str());
       return MakeToolError("ipfix_collector blocked by fail-closed MCP safety gate: " + cchk.reason);
     }
-    cmd.push_back("--ipfix-enabled");
-    cmd.push_back("--ipfix-collector");
-    cmd.push_back(collector);
+    base_cmd.push_back("--ipfix-enabled");
+    base_cmd.push_back("--ipfix-collector");
+    base_cmd.push_back(collector);
     push_pos_int("ipfix_port", "--ipfix-port");
     push_pos_int("ipfix_sample_rate", "--ipfix-sample-rate");
     push_bool_flag("ipfix_netflow_v9", "--ipfix-netflow-v9");
@@ -901,39 +1131,157 @@ ToolResult HandleRunBenchmark(const Value& args, const SafetyConfig& safety) {
   push_pos_int("kpi_min_dhcp_leases", "--kpi-min-dhcp-leases");
   push_nonneg_int("kpi_max_tcp_overflows", "--kpi-max-tcp-overflows");
 
-  const std::string l7_profile_path = ArgStr(args, "l7_profile_file");
+  const std::string l7_profile_path = args.find("l7_profile_file") && args.find("l7_profile_file")->is_string()
+      ? args.find("l7_profile_file")->as_string()
+      : "";
   const bool wants_custom_tcp =
       (worker == "afxdp") || ProfileFileUsesCustomTcp(l7_profile_path);
   const CustomTcpEnvResolution tcp_env =
       ResolveCustomTcpEnv(args, target, static_cast<int>(port), wants_custom_tcp);
   if (!tcp_env.error.empty()) {
-    ::unlink(report_path.c_str());
     return MakeToolError(tcp_env.error);
   }
 
-  const auto res = RunSubprocess(cmd, timeout_s, tcp_env.env_overrides);
-  const std::string report_raw = ReadWholeFile(report_path);
-  ::unlink(report_path.c_str());
+  EnvVarList env_overrides = tcp_env.env_overrides;
+  if (worker == "scenario" && duration_s > 0.0) {
+    env_overrides.emplace_back("SAMURAI_SCENARIO_DURATION_S", std::to_string(duration_s));
+  }
+  const bool loop_rounds = (duration_s > 0.0 && worker != "telco" && worker != "scenario");
 
-  Value out = Value::Object();
-  out.set("host", HostMetadataJson());
-  if (tcp_env.active) {
-    out.set("custom_tcp_env", tcp_env.summary_json);
+  auto exec_bench = [base_cmd = std::move(base_cmd),
+                     env_overrides = std::move(env_overrides),
+                     tcp_summary = tcp_env.summary_json,
+                     tcp_active = tcp_env.active,
+                     duration_s, timeout_s, loop_rounds](
+                        const std::atomic<bool>* cancel_flag,
+                        std::atomic<pid_t>* active_pid,
+                        std::string* final_status_out) -> Value {
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto soak_deadline = (duration_s > 0.0)
+        ? t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                   std::chrono::duration<double>(duration_s))
+        : t0;
+    const auto wall_deadline = t0 + std::chrono::seconds(std::max(1, timeout_s));
+
+    SubprocessResult last_res;
+    Value last_report = Value::Null();
+    std::uint64_t soak_rounds = 0;
+    std::uint64_t total_sent = 0;
+    std::uint64_t total_errors = 0;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_attempted = 0;
+
+    do {
+      const auto now = std::chrono::steady_clock::now();
+      const int rem_wall_s = std::max(1, static_cast<int>(
+          std::chrono::duration_cast<std::chrono::seconds>(wall_deadline - now).count()));
+      if (now >= wall_deadline) {
+        last_res.timed_out = true;
+        break;
+      }
+
+      char tmpl[] = "/tmp/samurai_mcp_report_XXXXXX";
+      const int tmp_fd = ::mkstemp(tmpl);
+      std::string report_path;
+      std::vector<std::string> cmd = base_cmd;
+      if (tmp_fd >= 0) {
+        ::close(tmp_fd);
+        report_path = tmpl;
+        cmd.push_back("--report-json");
+        cmd.push_back(report_path);
+      }
+
+      last_res = RunSubprocessCancellable(cmd, rem_wall_s, env_overrides, cancel_flag, active_pid);
+      std::string report_raw;
+      if (!report_path.empty()) {
+        report_raw = ReadWholeFile(report_path);
+        ::unlink(report_path.c_str());
+      }
+      if (!report_raw.empty()) {
+        const auto parsed = samurai::core::json::Parse(report_raw);
+        last_report = parsed.ok ? parsed.value : Value::Str(report_raw);
+        if (last_report.is_object()) {
+          const Value* st = last_report.find("stats");
+          const Value& s = (st && st->is_object()) ? *st : last_report;
+          auto g = [&](const char* k) -> std::uint64_t {
+            const Value* v = s.find(k);
+            return (v && v->is_number()) ? static_cast<std::uint64_t>(std::max<std::int64_t>(0, v->as_int(0))) : 0ULL;
+          };
+          total_sent += g("packets_sent");
+          total_errors += g("packets_errors");
+          total_bytes += g("bytes_sent");
+          total_attempted += g("attempted");
+        }
+      }
+      ++soak_rounds;
+      if (!loop_rounds) break;
+      if (last_res.timed_out || last_res.exit_code != 0) break;
+      if (cancel_flag && cancel_flag->load()) break;
+    } while (std::chrono::steady_clock::now() < soak_deadline &&
+             std::chrono::steady_clock::now() < wall_deadline);
+
+    const double elapsed_s = std::max(1e-6, std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count());
+
+    if (final_status_out) {
+      if (cancel_flag && cancel_flag->load()) *final_status_out = "stopped";
+      else if (last_res.timed_out) *final_status_out = "timed_out";
+      else if (last_res.exit_code != 0) *final_status_out = "failed";
+      else *final_status_out = "completed";
+    }
+
+    Value out = Value::Object();
+    out.set("host", HostMetadataJson());
+    if (tcp_active) {
+      out.set("custom_tcp_env", tcp_summary);
+    }
+    out.set("exit_code", Value::Int(last_res.exit_code));
+    out.set("timed_out", Value::Bool(last_res.timed_out));
+    out.set("elapsed_s", Value::Double(elapsed_s));
+    if (duration_s > 0.0) {
+      Value soak = Value::Object();
+      soak.set("requested_duration_s", Value::Double(duration_s));
+      soak.set("elapsed_s", Value::Double(elapsed_s));
+      soak.set("rounds", Value::Int(static_cast<std::int64_t>(soak_rounds)));
+      if (loop_rounds) {
+        soak.set("packets_sent_total", Value::Int(static_cast<std::int64_t>(total_sent)));
+        soak.set("packets_errors_total", Value::Int(static_cast<std::int64_t>(total_errors)));
+        soak.set("bytes_sent_total", Value::Int(static_cast<std::int64_t>(total_bytes)));
+        soak.set("attempted_total", Value::Int(static_cast<std::int64_t>(total_attempted)));
+        soak.set("actual_rps", Value::Double(static_cast<double>(total_sent) / elapsed_s));
+      }
+      out.set("soak_summary", std::move(soak));
+    }
+    out.set("report", std::move(last_report));
+    out.set("stdout", Value::Str(last_res.stdout_text));
+    out.set("stderr", Value::Str(last_res.stderr_text));
+    return out;
+  };
+
+  if (run_async) {
+    return StartAsyncMcpJob(
+        "samurai_run_benchmark",
+        target,
+        static_cast<int>(port),
+        timeout_s,
+        [exec_bench = std::move(exec_bench)](
+            const std::atomic<bool>& cancel,
+            std::atomic<pid_t>& pid,
+            std::string& status_out) {
+          return exec_bench(&cancel, &pid, &status_out);
+        });
   }
-  out.set("exit_code", Value::Int(res.exit_code));
-  out.set("timed_out", Value::Bool(res.timed_out));
-  if (!report_raw.empty()) {
-    const auto parsed = samurai::core::json::Parse(report_raw);
-    out.set("report", parsed.ok ? parsed.value : Value::Str(report_raw));
-  } else {
-    out.set("report", Value::Null());
-  }
-  out.set("stdout", Value::Str(res.stdout_text));
-  out.set("stderr", Value::Str(res.stderr_text));
-  return MakeToolSuccess(std::move(out));
+
+  return MakeToolSuccess(exec_bench(nullptr, nullptr, nullptr));
 }
 
 ToolResult HandleRunRfcSuite(const Value& args, const SafetyConfig& safety) {
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) {
+    return MakeToolError("Invalid target authorization parameter: " + safety_err);
+  }
+
   const std::string bin = FindNativeBinary({"samurai"});
   if (bin.empty()) {
     return MakeToolError("samurai CLI binary not found.");
@@ -956,12 +1304,13 @@ ToolResult HandleRunRfcSuite(const Value& args, const SafetyConfig& safety) {
   }
 
   std::string resolved_tgt;
-  const auto chk = ResolveMcpTarget(tgt->as_string(), safety, resolved_tgt);
+  const auto chk = ResolveMcpTarget(tgt->as_string(), eff_safety, resolved_tgt);
   if (!chk.ok) {
     return MakeToolError("Target blocked by fail-closed MCP safety gate: " + chk.reason);
   }
 
   std::vector<std::string> cmd = {bin, "--run-rfc-suite", suite, "--target", resolved_tgt, "--confirm"};
+  AppendSafetyCliArgs(eff_safety, cmd, resolved_tgt);
   if (const Value* worker = args.find("worker"); worker && worker->is_string() && !worker->as_string().empty()) {
     cmd.push_back("--worker");
     cmd.push_back(worker->as_string());
@@ -978,7 +1327,11 @@ ToolResult HandleRunRfcSuite(const Value& args, const SafetyConfig& safety) {
     cmd.push_back("--rps");
     cmd.push_back(std::to_string(rps->as_double(0.0)));
   }
-  if (const Value* cnt = args.find("count"); cnt && cnt->as_int(0) > 0) {
+  if (const Value* cnt = args.find("count"); cnt && cnt->is_number()) {
+    std::string cerr;
+    if (!ValidateMcpPacketCount(cnt->as_int(0), eff_safety, &cerr)) {
+      return MakeToolError(cerr);
+    }
     cmd.push_back("--count");
     cmd.push_back(std::to_string(cnt->as_int(100)));
   }
@@ -986,7 +1339,10 @@ ToolResult HandleRunRfcSuite(const Value& args, const SafetyConfig& safety) {
     cmd.push_back("--keepalive");
   }
 
-  const auto res = RunSubprocess(cmd, 60);
+  const int timeout_s = std::clamp(
+      static_cast<int>(args.find("timeout_s") ? args.find("timeout_s")->as_int(120) : 120),
+      5, eff_safety.max_timeout_s);
+  const auto res = RunSubprocess(cmd, timeout_s);
   Value out = Value::Object();
   out.set("host", HostMetadataJson());
   out.set("suite", Value::Str(suite));
@@ -1055,9 +1411,14 @@ ToolResult HandleBenchL7Userspace(const Value& args) {
 }
 
 ToolResult HandleClusterStatus(const Value& args, const SafetyConfig& safety) {
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) {
+    return MakeToolError("Invalid target authorization parameter: " + safety_err);
+  }
   const std::string raw_host = args.find("host") ? args.find("host")->as_string("127.0.0.1") : "127.0.0.1";
   std::string host;
-  const auto chk = ResolveMcpTarget(raw_host, safety, host);
+  const auto chk = ResolveMcpTarget(raw_host, eff_safety, host);
   if (!chk.ok) {
     return MakeToolError("Cluster host blocked by fail-closed MCP safety gate: " + chk.reason);
   }
