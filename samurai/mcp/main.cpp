@@ -48,9 +48,10 @@ int main(int argc, char** argv) {
           "\n"
           "Environment variables:\n"
           "  SAMURAI_BIN_DIR                      Directory containing samurai binaries\n"
-          "  SAMURAI_MCP_ALLOW_TARGETS            Optional CSV allowlist of lab IPv4/CIDRs\n"
+          "  SAMURAI_MCP_ALLOW_TARGETS            Optional CSV allowlist of lab/enterprise IPv4, CIDR, or domains\n"
           "  SAMURAI_MCP_DENY_TARGETS             Optional CSV denylist (always wins)\n"
-          "  SAMURAI_MCP_MAX_COUNT                Max packet/request count per tool call (default: 500000)\n"
+          "  SAMURAI_MCP_MAX_COUNT                Max packet/request count per call (default: 100000000; 0=unlimited)\n"
+          "  SAMURAI_MCP_MAX_TIMEOUT_S            Max subprocess/soak timeout seconds (default: 86400)\n"
           "  SAMURAI_MANAGEMENT_API_VIEWER_TOKEN  Optional Viewer token for samurai_master :8089\n"
           "  SAMURAI_MANAGEMENT_API_OPERATOR_TOKEN Optional Operator token for provision/reconfigure/abort\n"
           "  SAMURAI_MANAGEMENT_API_ADMIN_TOKEN   Optional Admin token for samurai_master :8089\n",
