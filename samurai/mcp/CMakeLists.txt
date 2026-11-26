@@ -24,6 +24,7 @@ add_library(
   autopilot_tools.cpp
   scenario_tools.cpp
   cluster_tools.cpp
+  discovery_tools.cpp
   tool_registry.cpp
 )
 target_include_directories(samurai_mcp_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
