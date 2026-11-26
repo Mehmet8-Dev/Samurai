@@ -4,10 +4,13 @@
 // orchestrator's ZMQ supervisor.
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -17,6 +20,7 @@
 
 #include "args.hpp"
 #include "config_loader.hpp"
+#include "json.hpp"
 #include "kpi_gate.hpp"
 #include "options.hpp"
 #include "profiles.hpp"
@@ -185,13 +189,68 @@ int main(int argc, char** argv) {
     ::setenv("SAMURAI_LOG_LEVEL", opt.log_level.c_str(), 1);
   }
 
+  auto to_lower_copy = [](std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+  auto infer_scenario_protocol = [&](const std::string& path) -> std::string {
+    if (path.empty()) return "http1";
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return "http1";
+    std::ostringstream oss;
+    oss << in.rdbuf();
+    const auto parsed = core::json::Parse(oss.str());
+    if (!parsed.ok || !parsed.value.is_object()) return "http1";
+    const auto& doc = parsed.value;
+    bool has_http = false;
+    bool has_l4_tcp = false;
+    if (const auto* flows = doc.find("flows"); flows && flows->is_object()) {
+      for (const auto& fkv : flows->members()) {
+        const auto* steps = fkv.second.find("steps");
+        if (!steps || !steps->is_array()) continue;
+        for (const auto& st : steps->elements()) {
+          if (!st.is_object()) continue;
+          std::string t;
+          if (const auto* tv = st.find("type"); tv && tv->is_string()) t = tv->as_string();
+          if (t.empty()) {
+            if (const auto* kv = st.find("kind"); kv && kv->is_string()) t = kv->as_string();
+          }
+          t = to_lower_copy(t);
+          if (t.empty() || t == "request") has_http = true;
+          else if (t == "tcp_connect" || t == "tcp_send" || t == "tcp_expect" || t == "tcp_close") has_l4_tcp = true;
+        }
+      }
+    }
+    if (has_l4_tcp && !has_http) return "tcp";
+    std::string req;
+    if (const auto* lm = doc.find("load_model"); lm && lm->is_object()) {
+      if (const auto* b = lm->find("backend"); b && b->is_string()) req = to_lower_copy(b->as_string());
+    }
+    if (const auto* p = doc.find("protocol"); p && p->is_string()) req = to_lower_copy(p->as_string());
+    if (req == "http2" || req == "h2") return "http2";
+    if (req == "http3" || req == "h3" || req == "quic") return "quic";
+    if (req == "tcp") return "tcp";
+    return "http1";
+  };
+
   const bool is_rfc_run = !opt.run_rfc_suite.empty();
+  if (opt.worker_name == "l7") {
+    if (opt.job.protocol == "udp") opt.job.protocol = "http1";
+    if (!opt.vector_explicit && opt.job.attack_vector == "flood") {
+      opt.job.attack_vector = is_rfc_run ? "basic" : "http";
+    }
+  } else if (opt.worker_name == "scenario") {
+    if (opt.job.protocol == "udp") {
+      opt.job.protocol = infer_scenario_protocol(opt.job.l7_profile_file);
+    }
+    if (!opt.vector_explicit && opt.job.attack_vector == "flood") {
+      opt.job.attack_vector = "scenario";
+    }
+  }
+
   if (is_rfc_run) {
     if (opt.worker_name.empty()) {
       opt.worker_name = "cpu";
-    }
-    if (opt.worker_name == "l7" && opt.job.protocol == "udp") {
-      opt.job.protocol = "http1";
     }
     if (!opt.vector_explicit && opt.job.attack_vector == "flood") {
       opt.job.attack_vector = "basic";
