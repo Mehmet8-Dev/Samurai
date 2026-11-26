@@ -1,0 +1,11 @@
+# Gitleaks configuration for DDoSamurai.
+# Extends the built-in default ruleset and allowlists known synthetic test fixtures.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic dummy JWT fixture in MCP E2E token-capture test (not a real credential)"
+condition = "AND"
+paths = ['''^samurai/mcp/test_samurai_mcp\.cpp$''']
+regexes = ['''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxIn0\.sig''']
