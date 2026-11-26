@@ -1,6 +1,12 @@
 // Native C++17 verification suite for samurai_mcp (protocol, fail-closed safety,
 // tool registry, and Closed-Loop Autopilot / Mahoraga RL Agent shield stepping).
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +15,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "autopilot_tools.hpp"
 #include "cluster_tools.hpp"
@@ -112,8 +119,8 @@ int main() {
     Check(line.has_value(), "tools/list returns response");
     const auto p = Parse(*line);
     const Value* tools = p.value.find("result")->find("tools");
-    Check(tools && tools->is_array() && tools->elements().size() == 22,
-          "tools/list returns 22 registered tools");
+    Check(tools && tools->is_array() && tools->elements().size() == 25,
+          "tools/list returns 25 registered tools");
 
     const auto rline = server.HandleLine(
         R"({"jsonrpc":"2.0","id":201,"method":"resources/list","params":{}})");
@@ -122,13 +129,29 @@ int main() {
     Check(resources && resources->is_array() && resources->elements().size() == 5,
           "resources/list returns 5 skill resources");
 
-    const auto rread = server.HandleLine(
-        R"({"jsonrpc":"2.0","id":202,"method":"resources/read","params":{"uri":"samurai://skills/samurai-cluster-orchestrator"}})");
-    const auto rrp = Parse(*rread);
-    const Value* contents = rrp.value.find("result")->find("contents");
-    Check(contents && contents->is_array() && !contents->elements().empty() &&
-              !contents->elements()[0].find("text")->as_string().empty(),
-          "resources/read returns samurai-cluster-orchestrator skill text");
+    const struct SkillCheck {
+      const char* slug;
+      const char* marker;
+    } kSkillChecks[] = {
+        {"samurai-netbench", "25 native C++17 tools"},
+        {"samurai-cluster-orchestrator", "samurai_cluster_run_job"},
+        {"samurai-autopilot-rl", "0.2–3600s"},
+        {"samurai-scenario-author", "expected_status"},
+        {"samurai-hardware-dataplane", "custom_tcp_wire"},
+    };
+    for (const auto& sc : kSkillChecks) {
+      const std::string req = std::string(
+          R"({"jsonrpc":"2.0","id":202,"method":"resources/read","params":{"uri":"samurai://skills/)") +
+          sc.slug + R"("}})";
+      const auto rread = server.HandleLine(req);
+      const auto rrp = Parse(*rread);
+      const Value* contents = rrp.value.find("result")->find("contents");
+      const std::string text = (contents && contents->is_array() && !contents->elements().empty())
+                                   ? contents->elements()[0].find("text")->as_string()
+                                   : "";
+      const std::string msg = std::string("resources/read serves full up-to-date markdown for ") + sc.slug;
+      Check(text.size() > 500 && text.find(sc.marker) != std::string::npos, msg.c_str());
+    }
 
     const auto pline = server.HandleLine(
         R"({"jsonrpc":"2.0","id":203,"method":"prompts/list","params":{}})");
@@ -670,6 +693,589 @@ int main() {
           "setup --host-os windows --npx uses npx.cmd");
 
     fs::remove_all(tmp_root, ec);
+  }
+
+  // 9. API discovery: fail-closed public rejection + loopback HTTP/OpenAPI discovery + scenario synthesis
+  {
+    Value bad_disc = Value::Object();
+    bad_disc.set("target", Value::Str("8.8.8.8"));
+    bool bad_err = false;
+    const Value bad_payload = ParseToolPayload(
+        CallTool(server, 90, "samurai_discover_apis", std::move(bad_disc)), &bad_err);
+    Check(bad_err && bad_payload.find("error") != nullptr,
+          "samurai_discover_apis blocks public IPv4 targets fail-closed");
+
+    // Spin up an ephemeral loopback HTTP/1.1 + OpenAPI server on 127.0.0.1:0.
+    const int srv_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    Check(srv_fd >= 0, "ephemeral loopback test socket created");
+    int yes = 1;
+    ::setsockopt(srv_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    sockaddr_in srv_addr{};
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_port = 0;
+    ::inet_pton(AF_INET, "127.0.0.1", &srv_addr.sin_addr);
+    Check(::bind(srv_fd, reinterpret_cast<sockaddr*>(&srv_addr), sizeof(srv_addr)) == 0,
+          "ephemeral loopback test socket bound");
+    socklen_t alen = sizeof(srv_addr);
+    ::getsockname(srv_fd, reinterpret_cast<sockaddr*>(&srv_addr), &alen);
+    const int open_port = ntohs(srv_addr.sin_port);
+    Check(::listen(srv_fd, 16) == 0, "ephemeral loopback test socket listening");
+
+    // Reserve a closed port by binding and closing another ephemeral socket.
+    int closed_port = 1;
+    {
+      const int cfd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      sockaddr_in caddr{};
+      caddr.sin_family = AF_INET;
+      caddr.sin_port = 0;
+      ::inet_pton(AF_INET, "127.0.0.1", &caddr.sin_addr);
+      if (cfd >= 0 && ::bind(cfd, reinterpret_cast<sockaddr*>(&caddr), sizeof(caddr)) == 0) {
+        socklen_t clen = sizeof(caddr);
+        ::getsockname(cfd, reinterpret_cast<sockaddr*>(&caddr), &clen);
+        closed_port = ntohs(caddr.sin_port);
+      }
+      if (cfd >= 0) ::close(cfd);
+    }
+
+    std::atomic<bool> stop_srv{false};
+    std::thread srv_thread([&]() {
+      while (!stop_srv.load()) {
+        const int cli = ::accept(srv_fd, nullptr, nullptr);
+        if (cli < 0) break;
+        char rbuf[2048];
+        const ssize_t n = ::recv(cli, rbuf, sizeof(rbuf) - 1, 0);
+        if (n > 0) {
+          rbuf[n] = '\0';
+          const std::string req(rbuf, static_cast<std::size_t>(n));
+          std::string resp;
+          if (req.find("GET /openapi.json ") != std::string::npos) {
+            const std::string body =
+                R"({"openapi":"3.0.3","info":{"title":"MockLoopAPI","version":"1.0"},"paths":{"/items":{"get":{"summary":"List items"}},"/orders":{"post":{"summary":"Create order"}}}})";
+            resp = "HTTP/1.1 200 OK\r\nServer: SamuraiTest/1.0\r\nContent-Type: application/json\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+          } else if (req.find("GET /health ") != std::string::npos) {
+            const std::string body = R"({"status":"ok","service":"mock"})";
+            resp = "HTTP/1.1 200 OK\r\nServer: SamuraiTest/1.0\r\nContent-Type: application/json\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+          } else {
+            const std::string body = R"({"error":"not found"})";
+            resp = "HTTP/1.1 404 Not Found\r\nServer: SamuraiTest/1.0\r\nContent-Type: application/json\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+          }
+          (void)::send(cli, resp.data(), resp.size(), MSG_NOSIGNAL);
+        }
+        ::close(cli);
+      }
+    });
+
+    Value disc_args = Value::Object();
+    disc_args.set("target", Value::Str("127.0.0.1"));
+    Value ports_arr = Value::Array();
+    ports_arr.push_back(Value::Int(open_port));
+    ports_arr.push_back(Value::Int(closed_port));
+    disc_args.set("ports", std::move(ports_arr));
+    Value paths_arr = Value::Array();
+    paths_arr.push_back(Value::Str("/health"));
+    disc_args.set("probe_paths", std::move(paths_arr));
+    disc_args.set("replace_default_paths", Value::Bool(true));
+
+    bool disc_err = false;
+    const Value disc_res = ParseToolPayload(
+        CallTool(server, 91, "samurai_discover_apis", std::move(disc_args)), &disc_err);
+
+    stop_srv.store(true);
+    ::shutdown(srv_fd, SHUT_RDWR);
+    ::close(srv_fd);
+    if (srv_thread.joinable()) srv_thread.join();
+
+    Check(!disc_err, "samurai_discover_apis succeeds on loopback target");
+    Check(disc_res.find("endpoints_checked")->as_int() == 2 &&
+              disc_res.find("tcp_open_count")->as_int() == 1,
+          "samurai_discover_apis distinguishes open vs closed ports");
+    const Value* svcs = disc_res.find("services");
+    Check(svcs && svcs->is_array() && svcs->elements().size() == 2,
+          "services array has 2 entries");
+    if (svcs && svcs->elements().size() == 2) {
+      const Value& open_svc = svcs->elements()[0];
+      const Value& closed_svc = svcs->elements()[1];
+      Check(open_svc.find("tcp_open")->as_bool() == true &&
+                closed_svc.find("tcp_open")->as_bool() == false,
+            "open and closed TCP status reported accurately");
+      const Value* oa = open_svc.find("openapi");
+      Check(oa && oa->find("title")->as_string() == "MockLoopAPI" &&
+                oa->find("endpoint_count")->as_int() == 2,
+            "OpenAPI spec parsed and 2 endpoints extracted");
+      const Value* rec_sc = open_svc.find("recommended_scenario");
+      Check(rec_sc && rec_sc->is_object(), "recommended_scenario generated");
+      if (rec_sc && rec_sc->is_object()) {
+        Value comp_args = Value::Object();
+        comp_args.set("scenario", *rec_sc);
+        bool comp_err = false;
+        const Value comp_res = ParseToolPayload(
+            CallTool(server, 92, "samurai_scenario_compile", std::move(comp_args)), &comp_err);
+        Check(!comp_err && comp_res.find("valid")->as_bool() == true,
+              "generated recommended_scenario compiles cleanly via samurai_scenario_compile");
+      }
+    }
+
+    // Verify fingerprinting avoids MinIO/OSRM false positives on whoami/echo and HTTPS plain-HTTP rejection.
+    const int fp_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    Check(fp_fd >= 0, "fingerprint test socket created");
+    int fp_yes = 1;
+    ::setsockopt(fp_fd, SOL_SOCKET, SO_REUSEADDR, &fp_yes, sizeof(fp_yes));
+    sockaddr_in fp_addr{};
+    fp_addr.sin_family = AF_INET;
+    fp_addr.sin_port = 0;
+    ::inet_pton(AF_INET, "127.0.0.1", &fp_addr.sin_addr);
+    Check(::bind(fp_fd, reinterpret_cast<sockaddr*>(&fp_addr), sizeof(fp_addr)) == 0 && ::listen(fp_fd, 16) == 0,
+          "fingerprint test socket bound and listening");
+    socklen_t fp_alen = sizeof(fp_addr);
+    ::getsockname(fp_fd, reinterpret_cast<sockaddr*>(&fp_addr), &fp_alen);
+    const int fp_port = ntohs(fp_addr.sin_port);
+
+    std::atomic<bool> stop_fp{false};
+    std::thread fp_thread([&]() {
+      while (!stop_fp.load()) {
+        const int cli = ::accept(fp_fd, nullptr, nullptr);
+        if (cli < 0) break;
+        char rbuf[2048];
+        const ssize_t n = ::recv(cli, rbuf, sizeof(rbuf) - 1, 0);
+        if (n > 0) {
+          rbuf[n] = '\0';
+          const std::string req(rbuf, static_cast<std::size_t>(n));
+          std::string resp;
+          if (req.find("GET /nearest/") != std::string::npos || req.find("GET / ") != std::string::npos) {
+            const std::string body = "Hostname: abc123\nIP: 127.0.0.1\nRemoteAddr: 127.0.0.1:9999\nGET / HTTP/1.1\r\n\r\n";
+            resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+          } else {
+            const std::string body = "Hostname: abc123\nIP: 127.0.0.1\nRemoteAddr: 127.0.0.1:9999\n";
+            resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+          }
+          (void)::send(cli, resp.data(), resp.size(), MSG_NOSIGNAL);
+        }
+        ::close(cli);
+      }
+    });
+
+    Value fp_args = Value::Object();
+    fp_args.set("target", Value::Str("127.0.0.1"));
+    Value fp_ports = Value::Array();
+    fp_ports.push_back(Value::Int(fp_port));
+    fp_args.set("ports", std::move(fp_ports));
+    fp_args.set("probe_openapi", Value::Bool(false));
+    fp_args.set("generate_scenario", Value::Bool(false));
+    fp_args.set("include_body_preview", Value::Bool(false));
+    bool fp_err = false;
+    const Value fp_res = ParseToolPayload(
+        CallTool(server, 93, "samurai_discover_apis", std::move(fp_args)), &fp_err);
+    stop_fp.store(true);
+    ::shutdown(fp_fd, SHUT_RDWR);
+    ::close(fp_fd);
+    if (fp_thread.joinable()) fp_thread.join();
+
+    Check(!fp_err, "fingerprint loopback discovery succeeds");
+    const Value* fp_svcs = fp_res.find("services");
+    if (fp_svcs && fp_svcs->is_array() && !fp_svcs->elements().empty()) {
+      const std::string fp_label = fp_svcs->elements()[0].find("service_fingerprint")->as_string();
+      Check(fp_label == "HTTP Echo / whoami Service",
+            "whoami catch-all 200 on /minio/health/live not mislabeled as MinIO");
+    }
+  }
+
+  // 10. Scenario compile fidelity: kind=end_session, token metadata, expect_status in plans_by_worker
+  {
+    const auto sc_plan = Parse(R"JSON({
+      "scenario": {
+        "schema_version": 1,
+        "protocol": "http1",
+        "personas": {"u": {"device_profile": "web", "weight": 1}},
+        "flows": {
+          "f": {
+            "persona": "u",
+            "steps": [
+              {"kind": "request", "method": "POST", "path": "/login", "extract_token_regex": "(eyJ[A-Za-z0-9._-]+)", "token_variable_name": "jwt", "expected_status": 200},
+              {"kind": "request", "method": "GET", "path": "/me", "expected_status": [200, 299]},
+              {"kind": "end_session"}
+            ]
+          }
+        },
+        "load_model": {"backend": "l7", "concurrent_vus": 1}
+      },
+      "workers": 1,
+      "sessions_per_worker": 1,
+      "include_plans": true
+    })JSON");
+    bool err = false;
+    const Value out = ParseToolPayload(
+        CallTool(server, 94, "samurai_scenario_compile", sc_plan.value), &err);
+    Check(!err && out.find("valid")->as_bool() == true, "compile with kind/expected_status/regex succeeds");
+    const Value* pbw = out.find("plans_by_worker");
+    Check(pbw && pbw->is_array() && !pbw->elements().empty(), "plans_by_worker returned");
+    if (pbw && pbw->is_array() && !pbw->elements().empty() &&
+        pbw->elements()[0].is_array() && !pbw->elements()[0].elements().empty()) {
+      const Value& w0 = pbw->elements()[0].elements()[0];
+      const Value* paths = w0.find("path");
+      Check(paths && paths->is_array() && paths->elements().size() == 2,
+            "kind=end_session terminates flow without emitting spurious GET /");
+      const Value* regs = w0.find("extract_token_regex");
+      const Value* tvars = w0.find("token_variable_name");
+      const Value* emin = w0.find("expect_status_min");
+      const Value* emax = w0.find("expect_status_max");
+      Check(regs && regs->is_array() && regs->elements().size() == 2 &&
+                regs->elements()[0].as_string() == "(eyJ[A-Za-z0-9._-]+)",
+            "extract_token_regex surfaced in compiled plan");
+      Check(tvars && tvars->is_array() && tvars->elements()[0].as_string() == "jwt",
+            "token_variable_name surfaced in compiled plan");
+      Check(emin && emax && emin->elements()[0].as_int() == 200 && emax->elements()[1].as_int() == 299,
+            "expect_status_min/max surfaced in compiled plan");
+    }
+  }
+
+  // 11. Live scenario_run e2e: HTTP status telemetry, expected_status assertion failure,
+  //     extract_token_regex JWT carry, report schema labels, and L4 raw TCP execution.
+  {
+    const int e2e_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    Check(e2e_fd >= 0, "e2e loopback socket created");
+    int e2e_yes = 1;
+    ::setsockopt(e2e_fd, SOL_SOCKET, SO_REUSEADDR, &e2e_yes, sizeof(e2e_yes));
+    sockaddr_in e2e_addr{};
+    e2e_addr.sin_family = AF_INET;
+    e2e_addr.sin_port = 0;
+    ::inet_pton(AF_INET, "127.0.0.1", &e2e_addr.sin_addr);
+    Check(::bind(e2e_fd, reinterpret_cast<sockaddr*>(&e2e_addr), sizeof(e2e_addr)) == 0 && ::listen(e2e_fd, 16) == 0,
+          "e2e loopback socket bound and listening");
+    socklen_t e2e_alen = sizeof(e2e_addr);
+    ::getsockname(e2e_fd, reinterpret_cast<sockaddr*>(&e2e_addr), &e2e_alen);
+    const int e2e_port = ntohs(e2e_addr.sin_port);
+
+    std::atomic<bool> saw_bearer{false};
+    std::atomic<bool> stop_e2e{false};
+    std::thread e2e_thread([&]() {
+      while (!stop_e2e.load()) {
+        const int cli = ::accept(e2e_fd, nullptr, nullptr);
+        if (cli < 0) break;
+        char rbuf[4096];
+        while (true) {
+          const ssize_t n = ::recv(cli, rbuf, sizeof(rbuf) - 1, 0);
+          if (n <= 0) break;
+          rbuf[n] = '\0';
+          const std::string req(rbuf, static_cast<std::size_t>(n));
+          std::string resp;
+          if (req.rfind("PING", 0) == 0) {
+            resp = "+PONG\r\n";
+          } else if (req.find("POST /login ") != std::string::npos) {
+            const std::string body = R"({"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"})";
+            resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+          } else if (req.find("GET /me ") != std::string::npos) {
+            if (req.find("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig") != std::string::npos) {
+              saw_bearer.store(true);
+              const std::string body = R"({"ok":true})";
+              resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                     std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+            } else {
+              const std::string body = R"({"error":"unauthorized"})";
+              resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: " +
+                     std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+            }
+          } else {
+            const std::string body = R"({"error":"denied"})";
+            resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: " +
+                   std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+          }
+          (void)::send(cli, resp.data(), resp.size(), MSG_NOSIGNAL);
+          if (req.rfind("PING", 0) != 0) break;
+        }
+        ::close(cli);
+      }
+    });
+
+    // 11a. Regex token extraction + expected_status=200 passing + report target protocol/vector
+    const auto regex_run = Parse(std::string(R"JSON({
+      "target": "127.0.0.1",
+      "port": )JSON") + std::to_string(e2e_port) + R"JSON(,
+      "count": 4,
+      "timeout_s": 10,
+      "scenario": {
+        "schema_version": 1,
+        "protocol": "http1",
+        "personas": {"u": {"device_profile": "web", "weight": 1}},
+        "flows": {
+          "auth": {
+            "persona": "u",
+            "steps": [
+              {"kind": "request", "method": "POST", "path": "/login", "body_template": "{}", "extract_token_regex": "(eyJ[A-Za-z0-9_.-]+)", "token_variable_name": "jwt", "expected_status": 200},
+              {"kind": "request", "method": "GET", "path": "/me", "headers": {"Authorization": "Bearer {{jwt}}"}, "expected_status": 200},
+              {"kind": "end_session"}
+            ]
+          }
+        },
+        "load_model": {"backend": "l7", "concurrent_vus": 1},
+        "sla": {"min_completion_rate": 0.95, "max_step_fail_ratio": 0.05, "max_latency_p95_ms": 500}
+      }
+    })JSON");
+    bool err_a = false;
+    const Value res_a = ParseToolPayload(
+        CallTool(server, 95, "samurai_scenario_run", regex_run.value), &err_a);
+    Check(!err_a && res_a.find("exit_code")->as_int() == 0, "regex JWT scenario_run exits 0");
+    Check(saw_bearer.load(), "extract_token_regex extracted JWT and carried Bearer header on wire");
+    if (const Value* rep = res_a.find("report"); rep && rep->is_object()) {
+      const Value* tgt = rep->find("target");
+      Check(tgt && tgt->find("protocol")->as_string() == "http1" &&
+                tgt->find("attack_vector")->as_string() == "scenario",
+            "report.target reports protocol=http1 and attack_vector=scenario");
+    }
+    if (const Value* tel = res_a.find("scenario_telemetry"); tel && tel->is_object()) {
+      Check(tel->find("status_2xx")->as_int() == 2 &&
+                tel->find("expectation_failures")->as_int() == 0 &&
+                tel->find("scenario_sla_passed")->as_int() == 1,
+            "scenario_telemetry reports status_2xx=2, expectation_failures=0, sla_passed=1");
+    } else {
+      Check(false, "scenario_telemetry object present on HTTP scenario_run");
+    }
+
+    // 11b. expected_status=200 on 401 endpoint must fail assertion and SLA
+    const auto fail_run = Parse(std::string(R"({
+      "target": "127.0.0.1",
+      "port": )") + std::to_string(e2e_port) + R"(,
+      "count": 2,
+      "timeout_s": 10,
+      "scenario": {
+        "schema_version": 1,
+        "protocol": "http1",
+        "personas": {"u": {"device_profile": "web", "weight": 1}},
+        "flows": {
+          "unauth": {
+            "persona": "u",
+            "steps": [
+              {"kind": "request", "method": "GET", "path": "/me", "expected_status": 200}
+            ]
+          }
+        },
+        "load_model": {"backend": "l7", "concurrent_vus": 1},
+        "sla": {"min_completion_rate": 0.95, "max_step_fail_ratio": 0.05, "max_latency_p95_ms": 500}
+      }
+    })");
+    bool err_b = false;
+    const Value res_b = ParseToolPayload(
+        CallTool(server, 96, "samurai_scenario_run", fail_run.value), &err_b);
+    Check(!err_b, "401 assertion scenario_run completes");
+    if (const Value* tel = res_b.find("scenario_telemetry"); tel && tel->is_object()) {
+      Check(tel->find("status_4xx")->as_int() == 1 &&
+                tel->find("expectation_failures")->as_int() >= 1 &&
+                tel->find("step_failed")->as_int() >= 1 &&
+                tel->find("scenario_sla_passed")->as_int() == 0,
+            "401 with expected_status=200 reports status_4xx=1, expectation_failures>=1, sla_passed=0");
+    } else {
+      Check(false, "scenario_telemetry present on 401 assertion test");
+    }
+
+    // 11c. L4 TCP scenario execution (tcp_connect -> tcp_send -> tcp_expect -> tcp_close)
+    const auto l4_run = Parse(std::string(R"({
+      "target": "127.0.0.1",
+      "port": )") + std::to_string(e2e_port) + R"(,
+      "count": 10,
+      "timeout_s": 10,
+      "scenario": {
+        "schema_version": 1,
+        "protocol": "tcp",
+        "personas": {"tcp_u": {"device_profile": "web", "weight": 1}},
+        "flows": {
+          "ping": {
+            "persona": "tcp_u",
+            "steps": [
+              {"kind": "tcp_connect"},
+              {"kind": "tcp_send", "payload_template": "PING\r\n"},
+              {"kind": "tcp_expect", "condition": "+PONG"},
+              {"kind": "tcp_close"}
+            ]
+          }
+        },
+        "load_model": {"backend": "l7", "concurrent_vus": 2},
+        "sla": {"min_completion_rate": 0.95, "max_step_fail_ratio": 0.05, "max_latency_p95_ms": 500}
+      }
+    })");
+    bool err_c = false;
+    const Value res_c = ParseToolPayload(
+        CallTool(server, 97, "samurai_scenario_run", l4_run.value), &err_c);
+    Check(!err_c && res_c.find("exit_code")->as_int() == 0, "L4 TCP scenario_run exits 0");
+    if (const Value* rep = res_c.find("report"); rep && rep->is_object()) {
+      const Value* tgt = rep->find("target");
+      Check(tgt && tgt->find("protocol")->as_string() == "tcp" &&
+                tgt->find("attack_vector")->as_string() == "scenario",
+            "L4 TCP report.target reports protocol=tcp and attack_vector=scenario");
+    }
+    if (const Value* tel = res_c.find("scenario_telemetry"); tel && tel->is_object()) {
+      Check(tel->find("scenario_dataplane")->as_string() == "l4_tcp_native_real_socket" &&
+                tel->find("tcp_connect_attempts")->as_int() == 2 &&
+                tel->find("tcp_connect_established")->as_int() == 2 &&
+                tel->find("step_failed")->as_int() == 0 &&
+                tel->find("scenario_sla_passed")->as_int() == 1,
+            "L4 TCP scenario_telemetry reports 2/2 connects, 0 failed, sla_passed=1");
+    } else {
+      Check(false, "scenario_telemetry present on L4 TCP scenario_run");
+    }
+
+    // 11d. Time-based enterprise soak execution (duration_s loops rounds cleanly)
+    const auto soak_run = Parse(std::string(R"JSON({
+      "target": "127.0.0.1",
+      "port": )JSON") + std::to_string(e2e_port) + R"JSON(,
+      "count": 1000000,
+      "duration_s": 0.6,
+      "timeout_s": 15,
+      "scenario": {
+        "schema_version": 1,
+        "protocol": "http1",
+        "personas": {"u": {"device_profile": "web", "weight": 1}},
+        "flows": {
+          "soak_ping": {
+            "persona": "u",
+            "steps": [
+              {"kind": "request", "method": "POST", "path": "/login", "body_template": "{}", "extract_token_regex": "(eyJ[A-Za-z0-9_.-]+)", "token_variable_name": "jwt", "expected_status": 200},
+              {"kind": "request", "method": "GET", "path": "/me", "headers": {"Authorization": "Bearer {{jwt}}"}, "expected_status": 200}
+            ]
+          }
+        },
+        "load_model": {"backend": "l7", "concurrent_vus": 1, "duration_s": 0.6},
+        "sla": {"min_completion_rate": 0.95, "max_step_fail_ratio": 0.05, "max_latency_p95_ms": 500}
+      }
+    })JSON");
+    bool err_d = false;
+    const Value res_d = ParseToolPayload(
+        CallTool(server, 98, "samurai_scenario_run", soak_run.value), &err_d);
+    Check(!err_d && res_d.find("exit_code")->as_int() == 0, "duration_s soak scenario_run exits 0");
+    if (const Value* tel = res_d.find("scenario_telemetry"); tel && tel->is_object()) {
+      Check(tel->find("soak_rounds") && tel->find("soak_rounds")->as_int() >= 2 &&
+                tel->find("status_2xx")->as_int() >= 4 &&
+                tel->find("elapsed_s") && tel->find("elapsed_s")->as_double() >= 0.45 &&
+                tel->find("scenario_sla_passed")->as_int() == 1,
+            "duration_s soak executed multiple rounds with aggregated 2xx telemetry and passing SLA");
+    } else {
+      Check(false, "scenario_telemetry present on duration_s soak run");
+    }
+
+    // 11e. Async background soak job launch + status + graceful stop
+    const auto async_run = Parse(std::string(R"JSON({
+      "target": "127.0.0.1",
+      "port": )JSON") + std::to_string(e2e_port) + R"JSON(,
+      "count": 1000000,
+      "duration_s": 8.0,
+      "timeout_s": 30,
+      "async": true,
+      "scenario": {
+        "schema_version": 1,
+        "protocol": "http1",
+        "personas": {"u": {"device_profile": "web", "weight": 1}},
+        "flows": {
+          "long_soak": {
+            "persona": "u",
+            "steps": [
+              {"kind": "request", "method": "POST", "path": "/login", "body_template": "{}", "expected_status": 200},
+              {"kind": "pause", "think_time": {"min_ms": 50, "max_ms": 50}}
+            ]
+          }
+        },
+        "load_model": {"backend": "l7", "concurrent_vus": 1}
+      }
+    })JSON");
+    bool err_async = false;
+    const Value async_start = ParseToolPayload(
+        CallTool(server, 99, "samurai_scenario_run", async_run.value), &err_async);
+    const std::string job_id = async_start.find("job_id") ? async_start.find("job_id")->as_string() : "";
+    Check(!err_async && async_start.find("async")->as_bool(false) &&
+              async_start.find("status")->as_string() == "running" && !job_id.empty(),
+          "async=true scenario_run starts background job immediately");
+    if (!job_id.empty()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      Value st_args = Value::Object();
+      st_args.set("job_id", Value::Str(job_id));
+      bool err_st = false;
+      const Value st_res = ParseToolPayload(
+          CallTool(server, 100, "samurai_job_status", std::move(st_args)), &err_st);
+      Check(!err_st && st_res.find("job_id")->as_string() == job_id,
+            "samurai_job_status reports active async job");
+
+      Value stop_args = Value::Object();
+      stop_args.set("job_id", Value::Str(job_id));
+      bool err_stop = false;
+      const Value stop_res = ParseToolPayload(
+          CallTool(server, 101, "samurai_job_stop", std::move(stop_args)), &err_stop);
+      Check(!err_stop && stop_res.find("status")->as_string() == "stopped",
+            "samurai_job_stop terminates background soak job cleanly");
+    }
+
+    stop_e2e.store(true);
+    ::shutdown(e2e_fd, SHUT_RDWR);
+    ::close(e2e_fd);
+    if (e2e_thread.joinable()) e2e_thread.join();
+  }
+
+  // 12. Per-call allow_target / allow_targets, denylist precedence & enterprise soak limits
+  {
+    samurai::mcp::SafetyConfig base;
+    Check(base.max_timeout_s == 86400 && base.max_packet_count == 100000000ULL,
+          "Default MCP SafetyConfig supports 24h timeout and 100M count");
+
+    // Still fail-closed without allow_target
+    std::string resolved;
+    Check(!samurai::mcp::ResolveMcpTarget("203.0.113.10", base, resolved).ok,
+          "Public IP remains fail-closed without allow_target");
+    Check(!samurai::mcp::ResolveMcpTarget("api.example.com", base, resolved).ok,
+          "Public domain remains fail-closed without allow_target");
+
+    // Per-call allow_target + allow_targets authorize explicit IP/CIDR
+    const auto auth_args = Parse(R"({"allow_target":"203.0.113.10","allow_targets":["198.51.100.0/24","*.corp.example.com"]})");
+    std::string eff_err;
+    const auto eff = samurai::mcp::EffectiveSafetyConfig(auth_args.value, base, &eff_err);
+    Check(eff_err.empty(), "Valid per-call allow_target/allow_targets accepted cleanly");
+    Check(samurai::mcp::ResolveMcpTarget("203.0.113.10", eff, resolved).ok && resolved == "203.0.113.10",
+          "Explicit allow_target IPv4 succeeds");
+    Check(samurai::mcp::ResolveMcpTarget("198.51.100.42", eff, resolved).ok && resolved == "198.51.100.42",
+          "Explicit allow_targets CIDR succeeds");
+    Check(!samurai::mcp::ResolveMcpTarget("8.8.8.8", eff, resolved).ok,
+          "Unlisted public IP still blocked even when other allow_target is given");
+
+    // Wildcard bypasses must be rejected
+    const auto wild_args = Parse(R"({"allow_target":"0.0.0.0/0"})");
+    std::string wild_err;
+    (void)samurai::mcp::EffectiveSafetyConfig(wild_args.value, base, &wild_err);
+    Check(!wild_err.empty(), "Wildcard 0.0.0.0/0 allow_target is rejected");
+
+    // Denylist always wins over per-call allow_target
+    samurai::mcp::SafetyConfig denied_base = base;
+    denied_base.deny_targets.push_back("203.0.113.10");
+    denied_base.deny_targets.push_back("*.blocked.example");
+    const auto deny_test_args = Parse(R"({"allow_target":"203.0.113.10","allow_targets":["app.blocked.example"]})");
+    const auto eff_denied = samurai::mcp::EffectiveSafetyConfig(deny_test_args.value, denied_base);
+    Check(!samurai::mcp::ResolveMcpTarget("203.0.113.10", eff_denied, resolved).ok,
+          "SAMURAI_MCP_DENY_TARGETS overrides per-call allow_target IP");
+    Check(!samurai::mcp::ResolveMcpTarget("app.blocked.example", eff_denied, resolved).ok,
+          "SAMURAI_MCP_DENY_TARGETS overrides per-call allow_target domain");
+
+    // AppendSafetyCliArgs forwards IPv4/CIDR and resolved hostname IPv4 without raw domain strings
+    std::vector<std::string> cli_cmd;
+    samurai::mcp::AppendSafetyCliArgs(eff, cli_cmd, "93.184.216.34");
+    bool has_cidr = false, has_resolved = false, has_wildcard_domain = false;
+    for (std::size_t i = 0; i + 1 < cli_cmd.size(); ++i) {
+      if (cli_cmd[i] == "--allow-target") {
+        if (cli_cmd[i + 1] == "198.51.100.0/24") has_cidr = true;
+        if (cli_cmd[i + 1] == "93.184.216.34") has_resolved = true;
+        if (cli_cmd[i + 1] == "*.corp.example.com") has_wildcard_domain = true;
+      }
+    }
+    Check(has_cidr && has_resolved && !has_wildcard_domain,
+          "AppendSafetyCliArgs emits valid IPv4/CIDR + resolved IPv4 only");
+
+    // High/unlimited packet count validation
+    std::string cerr;
+    Check(samurai::mcp::ValidateMcpPacketCount(5000000, base, &cerr),
+          "ValidateMcpPacketCount permits >500k requests cleanly");
+    samurai::mcp::SafetyConfig unlimited = base;
+    unlimited.max_packet_count = 0;
+    Check(samurai::mcp::ValidateMcpPacketCount(4294967295LL, unlimited, &cerr),
+          "max_packet_count=0 permits full uint32 count");
   }
 
   if (g_failures > 0) {

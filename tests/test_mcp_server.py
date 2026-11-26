@@ -64,6 +64,9 @@ def test_cpp_mcp_initialize_and_tools_list() -> None:
         "samurai_scenario_compile",
         "samurai_scenario_run",
         "samurai_scenario_evaluate_sla",
+        "samurai_discover_apis",
+        "samurai_job_status",
+        "samurai_job_stop",
     }.issubset(tool_names)
 
 
