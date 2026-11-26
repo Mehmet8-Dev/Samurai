@@ -464,6 +464,9 @@ FlowOp parse_op(const json::Value& obj) {
   }
   op.capture_name = GetStr(obj, "capture_name");
   op.capture_source = GetStr(obj, "capture_source");
+  op.scenario_flow = GetStr(obj, "scenario_flow");
+  op.scenario_vu_id = GetStr(obj, "scenario_vu_id");
+  op.scenario_on_failure = GetStr(obj, "scenario_on_failure");
   op.think_time_ms = GetInt(obj, "think_time_ms", op.think_time_ms);
   op.loop_count = GetInt(obj, "loop_count", op.loop_count);
 

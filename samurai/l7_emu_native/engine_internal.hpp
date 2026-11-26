@@ -268,6 +268,10 @@ void capture_body_json(
     const FlowOp& follow,
     const std::string& body,
     std::map<std::string, std::string>& captures);
+void capture_body_regex(
+    const FlowOp& follow,
+    const std::string& body,
+    std::map<std::string, std::string>& captures);
 void evaluate_response_ops(
     const std::vector<FlowOp>& follow_ops,
     int status_code,

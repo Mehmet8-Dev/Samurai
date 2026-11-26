@@ -5,6 +5,8 @@
 #include "l2l3_stack/nd_engine.hpp"
 #include "l2l3_stack/arp_engine.hpp"
 
+#include <regex>
+
 namespace samurai::l7_emu_native {
 
 const std::string* find_scenario_header(
@@ -250,6 +252,9 @@ std::vector<H1RequestSpec> build_h1_requests(const Profile& profile) {
       spec.header_fields.emplace_back(key, value);
       spec.compiled_header_values.emplace_back(key, compile_capture_template(value));
     }
+    spec.scenario_flow = op.scenario_flow;
+    spec.scenario_vu_id = op.scenario_vu_id;
+    spec.scenario_on_failure = op.scenario_on_failure;
     if (const std::string* f = find_scenario_header(op.headers, "x-scenario-flow")) {
       spec.scenario_flow = *f;
     }
@@ -447,6 +452,24 @@ void capture_body_json(
   }
 }
 
+void capture_body_regex(
+    const FlowOp& follow,
+    const std::string& body,
+    std::map<std::string, std::string>& captures) {
+  if (follow.capture_source.empty() || follow.capture_name.empty()) {
+    return;
+  }
+  try {
+    const std::regex re(follow.capture_source);
+    std::smatch m;
+    if (std::regex_search(body, m, re)) {
+      captures[follow.capture_name] = (m.size() > 1 && m[1].matched) ? m[1].str() : m[0].str();
+    }
+  } catch (const std::regex_error&) {
+    // Ignore malformed user regex cleanly without crashing the dataplane worker.
+  }
+}
+
 void evaluate_response_ops(
     const std::vector<FlowOp>& follow_ops,
     int status_code,
@@ -507,6 +530,10 @@ void evaluate_response_ops(
     }
     if (follow.opcode == "CAPTURE_BODY_JSON") {
       capture_body_json(follow, body, captures);
+      continue;
+    }
+    if (follow.opcode == "CAPTURE_BODY_REGEX") {
+      capture_body_regex(follow, body, captures);
       continue;
     }
     if (follow.opcode == "THINK_TIME") {

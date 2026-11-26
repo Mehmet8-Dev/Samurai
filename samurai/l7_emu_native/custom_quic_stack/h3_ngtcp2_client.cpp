@@ -16,6 +16,7 @@
 #include <iterator>
 #include <optional>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1508,7 +1509,7 @@ std::vector<ScenarioStep> derive_scenario_steps(const Profile& profile) {
         apply_expect_op(&current.expectations, op);
       }
     } else if (op.opcode == "CAPTURE_HEADER" || op.opcode == "CAPTURE_COOKIE" ||
-               op.opcode == "CAPTURE_BODY_JSON") {
+               op.opcode == "CAPTURE_BODY_JSON" || op.opcode == "CAPTURE_BODY_REGEX") {
       if (current_open) {
         current.captures.push_back(
             ScenarioCaptureOp{op.opcode, op.capture_name, op.capture_source});
@@ -1759,6 +1760,17 @@ void apply_scenario_captures(
       std::string value;
       if (!path.empty() && extract_json_field(response_body, path, &value) && captures != nullptr) {
         (*captures)[cap.capture_name.empty() ? path : cap.capture_name] = value;
+      }
+    } else if (cap.opcode == "CAPTURE_BODY_REGEX") {
+      if (!cap.capture_source.empty() && !cap.capture_name.empty() && captures != nullptr) {
+        try {
+          const std::regex re(cap.capture_source);
+          std::smatch m;
+          if (std::regex_search(response_body, m, re)) {
+            (*captures)[cap.capture_name] = (m.size() > 1 && m[1].matched) ? m[1].str() : m[0].str();
+          }
+        } catch (const std::regex_error&) {
+        }
       }
     }
   }

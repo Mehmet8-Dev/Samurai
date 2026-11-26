@@ -218,50 +218,15 @@ std::map<std::string, double> run_profile(const Profile& profile, const RuntimeC
       };
     }
 
-    for (const FlowOp& follow : completed.follow_ops) {
-      if (follow.opcode == "EXPECT_STATUS" && follow.has_expect) {
-        if (completed.status_code < follow.expect.status_min || completed.status_code > follow.expect.status_max) {
-          lane.expectation_failures = completed.expectation_failures + 1;
-        }
-      } else if (follow.opcode == "EXPECT_HEADER" && follow.has_expect) {
-        const std::string name = lower_copy(follow.expect.name);
-        const std::string* header_value = find_header_value(completed.response_header_fields, name);
-        if ((header_value == nullptr || header_value->find(follow.expect.value) == std::string::npos) &&
-            (completed.response_headers.empty() || completed.response_headers.find(name) == completed.response_headers.end() ||
-             completed.response_headers.at(name).find(follow.expect.value) == std::string::npos)) {
-          lane.expectation_failures += 1;
-        }
-      } else if (follow.opcode == "EXPECT_BODY_SUBSTRING" && follow.has_expect) {
-        if (completed.response_body.find(follow.expect.value) == std::string::npos) {
-          lane.expectation_failures += 1;
-        }
-      } else if (follow.opcode == "CAPTURE_HEADER") {
-        const std::string key = lower_copy(follow.capture_source.empty() ? follow.capture_name : follow.capture_source);
-        const std::string* header_value = find_header_value(completed.response_header_fields, key);
-        if (header_value != nullptr) {
-          captures[follow.capture_name.empty() ? key : follow.capture_name] = *header_value;
-        } else {
-          const auto it = completed.response_headers.find(key);
-          if (it != completed.response_headers.end()) {
-            captures[follow.capture_name.empty() ? key : follow.capture_name] = it->second;
-          }
-        }
-      } else if (follow.opcode == "CAPTURE_COOKIE") {
-        const std::string* cookie_value = find_header_value(completed.response_header_fields, "set-cookie");
-        if (cookie_value != nullptr) {
-          capture_cookie(*cookie_value, follow.capture_name, captures);
-        } else {
-          const auto it = completed.response_headers.find("set-cookie");
-          if (it != completed.response_headers.end()) {
-            capture_cookie(it->second, follow.capture_name, captures);
-          }
-        }
-      } else if (follow.opcode == "CAPTURE_BODY_JSON") {
-        capture_body_json(follow, completed.response_body, captures);
-      } else if (follow.opcode == "THINK_TIME") {
-        lane.think_time_total_ms += std::max(0, follow.think_time_ms);
-      }
-    }
+    evaluate_response_ops(
+        completed.follow_ops,
+        completed.status_code,
+        completed.response_header_fields,
+        completed.response_headers,
+        completed.response_body,
+        captures,
+        lane.expectation_failures,
+        lane.think_time_total_ms);
 
     acc.expectation_failures += lane.expectation_failures;
     acc.sent += 1;

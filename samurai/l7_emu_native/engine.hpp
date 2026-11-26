@@ -25,6 +25,9 @@ struct FlowOp {
   bool has_expect{false};
   std::string capture_name;
   std::string capture_source;
+  std::string scenario_flow;
+  std::string scenario_vu_id;
+  std::string scenario_on_failure;
   int think_time_ms{0};
   int loop_count{0};
 
