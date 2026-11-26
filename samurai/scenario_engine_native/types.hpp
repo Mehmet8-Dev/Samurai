@@ -93,6 +93,13 @@ struct Step {
   std::unordered_map<std::string, std::string> headers{};
   std::unordered_map<std::string, std::string> cookies{};
 
+  // Per-step response expectations (optional).
+  int expect_status_min{0};
+  int expect_status_max{0};
+  std::string expect_body_contains{};
+  std::string expect_header_name{};
+  std::string expect_header_value{};
+
   // TLS action fields (TlsConnect / TlsDisconnect).
   std::string tls_sni{};
   std::string tls_alpn{};          // e.g. "h2", "http/1.1"
@@ -139,6 +146,7 @@ struct LoadModel {
   std::string backend{"http"};
   int concurrent_vus{0};
   int ramp_seconds{0};
+  double duration_s{0.0};
 };
 
 struct ScenarioSpecNative {

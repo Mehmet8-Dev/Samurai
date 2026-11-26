@@ -68,6 +68,10 @@ ScenarioSpecNative parse_spec(const json::Value& spec) {
     out.load_model.backend = GetStr(*lm, "backend", out.load_model.backend);
     out.load_model.concurrent_vus = GetInt(*lm, "concurrent_vus", out.load_model.concurrent_vus);
     out.load_model.ramp_seconds = GetInt(*lm, "ramp_seconds", out.load_model.ramp_seconds);
+    out.load_model.duration_s = std::max(0.0, GetDouble(*lm, "duration_s", out.load_model.duration_s));
+  }
+  if (out.load_model.duration_s <= 0.0) {
+    out.load_model.duration_s = std::max(0.0, GetDouble(spec, "duration_s", 0.0));
   }
 
   const json::Value* personas = spec.find("personas");
@@ -109,7 +113,9 @@ ScenarioSpecNative parse_spec(const json::Value& spec) {
         for (const auto& st_obj : steps->elements()) {
           if (!st_obj.is_object()) continue;
           Step step{};
-          step.type = parse_step_type(GetStr(st_obj, "type", "request"));
+          std::string raw_type = GetStr(st_obj, "type");
+          if (raw_type.empty()) raw_type = GetStr(st_obj, "kind", "request");
+          step.type = parse_step_type(raw_type);
           step.method = GetStr(st_obj, "method", step.method);
           step.path = GetStr(st_obj, "path", step.path);
           step.body_template = GetStr(st_obj, "body_template");
@@ -136,6 +142,31 @@ ScenarioSpecNative parse_spec(const json::Value& spec) {
           step.token_path = GetStr(st_obj, "token_path");
           step.headers = GetStrMap(st_obj, "headers");
           step.cookies = GetStrMap(st_obj, "cookies");
+
+          if (const json::Value* es = st_obj.find("expected_status")) {
+            if (es->is_number()) {
+              const int code = static_cast<int>(es->as_int(0));
+              step.expect_status_min = code;
+              step.expect_status_max = code;
+            } else if (es->is_object()) {
+              step.expect_status_min = GetInt(*es, "min", GetInt(*es, "status_min", 0));
+              step.expect_status_max = GetInt(*es, "max", GetInt(*es, "status_max", step.expect_status_min));
+            } else if (es->is_array() && !es->elements().empty()) {
+              step.expect_status_min = static_cast<int>(es->elements().front().as_int(0));
+              step.expect_status_max = static_cast<int>(es->elements().back().as_int(step.expect_status_min));
+            }
+          }
+          if (const int mn = GetInt(st_obj, "expect_status_min", 0); mn > 0) step.expect_status_min = mn;
+          if (const int mx = GetInt(st_obj, "expect_status_max", 0); mx > 0) step.expect_status_max = mx;
+          if (step.expect_status_min > 0 && step.expect_status_max <= 0) {
+            step.expect_status_max = step.expect_status_min;
+          }
+          step.expect_body_contains =
+              GetStr(st_obj, "expect_body_contains", GetStr(st_obj, "expect_body_substring"));
+          if (const json::Value* eh = st_obj.find("expect_header"); eh != nullptr && eh->is_object()) {
+            step.expect_header_name = GetStr(*eh, "name");
+            step.expect_header_value = GetStr(*eh, "value");
+          }
 
           // L7 action fields.
           step.tls_sni = GetStr(st_obj, "tls_sni");
@@ -200,6 +231,13 @@ struct PackedEvents {
   std::vector<std::string> tcp_payload{};
   std::vector<std::string> tcp_expect_condition{};
   std::vector<int> tcp_expect_timeout_ms{};
+  // Token binding & response expectation metadata.
+  std::vector<std::string> token_source{};
+  std::vector<std::string> token_path{};
+  std::vector<std::string> token_variable_name{};
+  std::vector<std::string> extract_token_regex{};
+  std::vector<int> expect_status_min{};
+  std::vector<int> expect_status_max{};
   // L7 protocol emulation fields (Faz 5).
   std::vector<std::string> tls_sni{};
   std::vector<std::string> tls_alpn{};
@@ -246,6 +284,12 @@ static void reserve_packed_events(PackedEvents& pe, std::size_t event_cap) {
   pe.tcp_payload.reserve(event_cap);
   pe.tcp_expect_condition.reserve(event_cap);
   pe.tcp_expect_timeout_ms.reserve(event_cap);
+  pe.token_source.reserve(event_cap);
+  pe.token_path.reserve(event_cap);
+  pe.token_variable_name.reserve(event_cap);
+  pe.extract_token_regex.reserve(event_cap);
+  pe.expect_status_min.reserve(event_cap);
+  pe.expect_status_max.reserve(event_cap);
   pe.tls_sni.reserve(event_cap);
   pe.tls_alpn.reserve(event_cap);
   pe.tls_cipher_list.reserve(event_cap);
@@ -336,6 +380,15 @@ static void emit_l7_defaults(PackedEvents& out) {
   out.nd_target_ip.emplace_back("");
 }
 
+static void emit_token_expect_defaults(PackedEvents& out) {
+  out.token_source.emplace_back("");
+  out.token_path.emplace_back("");
+  out.token_variable_name.emplace_back("");
+  out.extract_token_regex.emplace_back("");
+  out.expect_status_min.push_back(0);
+  out.expect_status_max.push_back(0);
+}
+
 // Helper: push default base fields (request_kind through tcp_expect_timeout_ms) for L7 events.
 static void emit_base_defaults(PackedEvents& out) {
   out.request_kind.emplace_back("");
@@ -357,6 +410,7 @@ static void emit_base_defaults(PackedEvents& out) {
   out.tcp_payload.emplace_back("");
   out.tcp_expect_condition.emplace_back("");
   out.tcp_expect_timeout_ms.push_back(0);
+  emit_token_expect_defaults(out);
 }
 
 static void compile_flow_recursive_packed(
@@ -399,6 +453,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        emit_token_expect_defaults(out);
         emit_l7_defaults(out);
         st.emitted += 1;
         break;
@@ -464,6 +519,12 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        out.token_source.push_back(step.token_variable_name.empty() ? std::string("") : step.token_source);
+        out.token_path.push_back(step.token_path);
+        out.token_variable_name.push_back(step.token_variable_name);
+        out.extract_token_regex.push_back(step.extract_token_regex);
+        out.expect_status_min.push_back(step.expect_status_min);
+        out.expect_status_max.push_back(step.expect_status_max);
         emit_l7_defaults(out);
         st.emitted += 1;
         break;
@@ -490,6 +551,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        emit_token_expect_defaults(out);
         emit_l7_defaults(out);
         st.emitted += 1;
         break;
@@ -516,6 +578,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.push_back(step.payload_template);
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        emit_token_expect_defaults(out);
         emit_l7_defaults(out);
         st.emitted += 1;
         break;
@@ -542,6 +605,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.push_back(step.condition);
         out.tcp_expect_timeout_ms.push_back(step.timeout_ms);
+        emit_token_expect_defaults(out);
         emit_l7_defaults(out);
         st.emitted += 1;
         break;
@@ -568,6 +632,7 @@ static void compile_flow_recursive_packed(
         out.tcp_payload.emplace_back("");
         out.tcp_expect_condition.emplace_back("");
         out.tcp_expect_timeout_ms.push_back(0);
+        emit_token_expect_defaults(out);
         emit_l7_defaults(out);
         st.emitted += 1;
         break;
@@ -739,6 +804,12 @@ static json::Value PackedEventsToJson(const PackedEvents& pe) {
   out.set("tcp_payload", arr_strs(pe.tcp_payload));
   out.set("tcp_expect_condition", arr_strs(pe.tcp_expect_condition));
   out.set("tcp_expect_timeout_ms", arr_ints(pe.tcp_expect_timeout_ms));
+  out.set("token_source", arr_strs(pe.token_source));
+  out.set("token_path", arr_strs(pe.token_path));
+  out.set("token_variable_name", arr_strs(pe.token_variable_name));
+  out.set("extract_token_regex", arr_strs(pe.extract_token_regex));
+  out.set("expect_status_min", arr_ints(pe.expect_status_min));
+  out.set("expect_status_max", arr_ints(pe.expect_status_max));
   out.set("tls_sni", arr_strs(pe.tls_sni));
   out.set("tls_alpn", arr_strs(pe.tls_alpn));
   out.set("tls_cipher_list", arr_strs(pe.tls_cipher_list));
