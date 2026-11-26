@@ -340,6 +340,12 @@ ToolResult AutopilotManager::HandleStep(const Value& args) {
 }
 
 ToolResult AutopilotManager::HandleRunWindow(const Value& args, const SafetyConfig& safety) {
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) {
+    return MakeToolError("Invalid target authorization parameter: " + safety_err);
+  }
+
   const std::string sid = OptStr(args, "session_id", "");
   if (sid.empty()) return MakeToolError("session_id is required");
 
@@ -358,11 +364,14 @@ ToolResult AutopilotManager::HandleRunWindow(const Value& args, const SafetyConf
     target_rps = it->second->controller->current_setpoint();
   }
 
-  const double window_s = std::clamp(OptDouble(args, "window_s", 1.0), 0.2, 15.0);
+  const double window_s = std::clamp(OptDouble(args, "window_s", 1.0), 0.2, 3600.0);
+  const std::int64_t max_cap = eff_safety.max_packet_count > 0
+      ? static_cast<std::int64_t>(std::min<std::uint64_t>(eff_safety.max_packet_count, 4294967295ULL))
+      : 4294967295LL;
   const std::int64_t computed_count = std::clamp<std::int64_t>(
       static_cast<std::int64_t>(std::llround(target_rps * window_s)),
       1,
-      static_cast<std::int64_t>(safety.max_packet_count));
+      max_cap);
 
   const bool has_scenario_input =
       args.find("scenario") != nullptr ||
@@ -375,11 +384,16 @@ ToolResult AutopilotManager::HandleRunWindow(const Value& args, const SafetyConf
   Value bench_args = Value::Object();
   bench_args.set("worker", Value::Str(effective_worker));
   bench_args.set("target", Value::Str(OptStr(args, "target", "127.0.0.1")));
+  if (const Value* at = args.find("allow_target")) bench_args.set("allow_target", *at);
+  if (const Value* ats = args.find("allow_targets")) bench_args.set("allow_targets", *ats);
   bench_args.set("port", Value::Int(OptInt(args, "port", 8080)));
   bench_args.set("protocol", Value::Str(OptStr(args, "protocol", "http1")));
   bench_args.set("count", Value::Int(OptInt(args, "count", computed_count)));
   bench_args.set("size", Value::Int(OptInt(args, "size", 64)));
   bench_args.set("rps", Value::Double(target_rps));
+  if (effective_worker == "scenario" && window_s > 15.0) {
+    bench_args.set("duration_s", Value::Double(window_s));
+  }
   if (has_scenario_input) {
     std::string raw_json;
     std::string src_path;
@@ -408,9 +422,10 @@ ToolResult AutopilotManager::HandleRunWindow(const Value& args, const SafetyConf
   if (const Value* ka = args.find("keepalive"); ka && ka->is_bool()) {
     bench_args.set("keepalive", *ka);
   }
-  bench_args.set("timeout_s", Value::Int(OptInt(args, "timeout_s", 30)));
+  const int default_to = std::clamp(static_cast<int>(std::ceil(window_s)) + 30, 30, eff_safety.max_timeout_s);
+  bench_args.set("timeout_s", Value::Int(OptInt(args, "timeout_s", default_to)));
 
-  const ToolResult run_res = HandleRunBenchmark(bench_args, safety);
+  const ToolResult run_res = HandleRunBenchmark(bench_args, eff_safety);
   if (!temp_scenario_path.empty()) {
     ::unlink(temp_scenario_path.c_str());
   }

@@ -229,9 +229,13 @@ ClusterManager::~ClusterManager() {
 }
 
 ToolResult ClusterManager::HandleDiscover(const Value& args, const SafetyConfig& safety) const {
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) return MakeToolError("Invalid target authorization parameter: " + safety_err);
+
   const std::string raw_host = OptStr(args, "host", "127.0.0.1");
   std::string host;
-  const auto chk = ResolveMcpTarget(raw_host, safety, host);
+  const auto chk = ResolveMcpTarget(raw_host, eff_safety, host);
   if (!chk.ok) {
     return MakeToolError("Cluster host blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -260,9 +264,13 @@ ToolResult ClusterManager::HandleDiscover(const Value& args, const SafetyConfig&
 }
 
 ToolResult ClusterManager::HandleProvisionNode(const Value& args, const SafetyConfig& safety) const {
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) return MakeToolError("Invalid target authorization parameter: " + safety_err);
+
   const std::string raw_master = OptStr(args, "host", "127.0.0.1");
   std::string master_host;
-  const auto mchk = ResolveMcpTarget(raw_master, safety, master_host);
+  const auto mchk = ResolveMcpTarget(raw_master, eff_safety, master_host);
   if (!mchk.ok) {
     return MakeToolError("Master host blocked by fail-closed MCP safety gate: " + mchk.reason);
   }
@@ -280,7 +288,7 @@ ToolResult ClusterManager::HandleProvisionNode(const Value& args, const SafetyCo
   const auto nodes = SplitCsv(hosts_csv);
   if (nodes.empty()) return MakeToolError("node_hosts cannot be empty.");
   for (const auto& ip : nodes) {
-    const auto nchk = ValidateMcpTarget(ip, safety);
+    const auto nchk = ValidateMcpTarget(ip, eff_safety);
     if (!nchk.ok) {
       return MakeToolError("Node host '" + ip + "' blocked by fail-closed MCP safety gate: " + nchk.reason);
     }
@@ -311,9 +319,13 @@ ToolResult ClusterManager::HandleProvisionNode(const Value& args, const SafetyCo
 }
 
 ToolResult ClusterManager::HandleReconfigure(const Value& args, const SafetyConfig& safety) const {
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) return MakeToolError("Invalid target authorization parameter: " + safety_err);
+
   const std::string raw_host = OptStr(args, "host", "127.0.0.1");
   std::string host;
-  const auto chk = ResolveMcpTarget(raw_host, safety, host);
+  const auto chk = ResolveMcpTarget(raw_host, eff_safety, host);
   if (!chk.ok) {
     return MakeToolError("Master host blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -347,9 +359,13 @@ ToolResult ClusterManager::HandleReconfigure(const Value& args, const SafetyConf
 }
 
 ToolResult ClusterManager::HandleAbort(const Value& args, const SafetyConfig& safety) const {
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) return MakeToolError("Invalid target authorization parameter: " + safety_err);
+
   const std::string raw_host = OptStr(args, "host", "127.0.0.1");
   std::string host;
-  const auto chk = ResolveMcpTarget(raw_host, safety, host);
+  const auto chk = ResolveMcpTarget(raw_host, eff_safety, host);
   if (!chk.ok) {
     return MakeToolError("Master host blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -685,9 +701,13 @@ ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
     }
   }
 
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) return MakeToolError("Invalid target authorization parameter: " + safety_err);
+
   const std::string raw_target = OptStr(args, "target", "127.0.0.1");
   std::string target;
-  const auto chk = ResolveMcpTarget(raw_target, safety, target);
+  const auto chk = ResolveMcpTarget(raw_target, eff_safety, target);
   if (!chk.ok) {
     return MakeToolError("Target blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -705,8 +725,11 @@ ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
   const std::int64_t count = OptInt(args, "count", 10000);
   const std::int64_t telco_dur_ms = OptInt(args, "telco_duration_ms", 0);
   const bool telco_timed = (worker == "telco" && telco_dur_ms > 0 && count == 0);
-  if (!telco_timed && (count < 1 || static_cast<std::uint64_t>(count) > safety.max_packet_count)) {
-    return MakeToolError("count must be between 1 and " + std::to_string(safety.max_packet_count));
+  if (!telco_timed) {
+    std::string cerr;
+    if (!ValidateMcpPacketCount(count, eff_safety, &cerr)) {
+      return MakeToolError(cerr);
+    }
   }
 
   const std::int64_t size = OptInt(args, "size", 64);
@@ -728,7 +751,7 @@ ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
 
   const int expect_workers = static_cast<int>(std::clamp<std::int64_t>(OptInt(args, "expect_workers", 1), 1, 128));
   const int wait_workers_s = static_cast<int>(std::clamp<std::int64_t>(OptInt(args, "wait_workers_s", 15), 1, 60));
-  const int timeout_s = static_cast<int>(std::clamp<std::int64_t>(OptInt(args, "timeout_s", 45), 5, safety.max_timeout_s));
+  const int timeout_s = static_cast<int>(std::clamp<std::int64_t>(OptInt(args, "timeout_s", 45), 5, eff_safety.max_timeout_s));
   const std::string control_listen = OptStr(args, "control_listen", "tcp://127.0.0.1:5099");
 
   std::vector<std::string> cmd = {
@@ -744,14 +767,7 @@ ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
       "--wait-workers-s", std::to_string(wait_workers_s),
   };
 
-  for (const auto& allow_ip : safety.allow_targets) {
-    cmd.push_back("--allow-target");
-    cmd.push_back(allow_ip);
-  }
-  for (const auto& deny_ip : safety.deny_targets) {
-    cmd.push_back("--deny-target");
-    cmd.push_back(deny_ip);
-  }
+  AppendSafetyCliArgs(eff_safety, cmd, target);
 
   if (OptBool(args, "insecure_control", false)) cmd.push_back("--insecure-control");
   if (!shard_strategy.empty()) {
@@ -828,7 +844,7 @@ ToolResult ClusterManager::HandleRunDistributedJob(const Value& args,
   if (OptBool(args, "ipfix_enabled", false)) {
     const std::string raw_collector = OptStr(args, "ipfix_collector", "127.0.0.1");
     std::string collector;
-    const auto cchk = ResolveMcpTarget(raw_collector, safety, collector);
+    const auto cchk = ResolveMcpTarget(raw_collector, eff_safety, collector);
     if (!cchk.ok) {
       return MakeToolError("ipfix_collector blocked by fail-closed MCP safety gate: " + cchk.reason);
     }
