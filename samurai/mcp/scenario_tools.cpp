@@ -98,6 +98,7 @@ Value SummarizeSpec(const samurai::scenario_native::ScenarioSpecNative& spec) {
   lm.set("backend", Value::Str(spec.load_model.backend));
   lm.set("concurrent_vus", Value::Int(spec.load_model.concurrent_vus));
   lm.set("ramp_seconds", Value::Int(spec.load_model.ramp_seconds));
+  lm.set("duration_s", Value::Double(spec.load_model.duration_s));
 
   Value summary = Value::Object();
   summary.set("persona_count", Value::Int(static_cast<std::int64_t>(spec.personas.size())));
@@ -107,6 +108,23 @@ Value SummarizeSpec(const samurai::scenario_native::ScenarioSpecNative& spec) {
   summary.set("personas", std::move(personas));
   summary.set("flows", std::move(flows));
   return summary;
+}
+
+Value ExtractJobDoneDetail(const std::string& stdout_text) {
+  std::istringstream iss(stdout_text);
+  std::string line;
+  while (std::getline(iss, line)) {
+    if (line.empty()) continue;
+    const auto parsed = Parse(line);
+    if (!parsed.ok || !parsed.value.is_object()) continue;
+    const Value* ev = parsed.value.find("event");
+    if (ev && ev->is_string() && ev->as_string() == "job_done") {
+      if (const Value* detail = parsed.value.find("detail"); detail && detail->is_object()) {
+        return *detail;
+      }
+    }
+  }
+  return Value::Null();
 }
 
 }  // namespace
@@ -200,6 +218,12 @@ std::string WriteTempScenarioFile(const std::string& raw_json) {
 }
 
 ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
+  std::string safety_err;
+  const SafetyConfig eff_safety = EffectiveSafetyConfig(args, safety, &safety_err);
+  if (!safety_err.empty()) {
+    return MakeToolError("Invalid target authorization parameter: " + safety_err);
+  }
+
   const std::string bin = FindNativeBinary({"samurai"});
   if (bin.empty()) {
     return MakeToolError("samurai CLI binary not found. Build via CMake first.");
@@ -207,7 +231,7 @@ ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
 
   const std::string raw_target = args.find("target") ? args.find("target")->as_string("127.0.0.1") : "127.0.0.1";
   std::string target;
-  const auto chk = ResolveMcpTarget(raw_target, safety, target);
+  const auto chk = ResolveMcpTarget(raw_target, eff_safety, target);
   if (!chk.ok) {
     return MakeToolError("Target blocked by fail-closed MCP safety gate: " + chk.reason);
   }
@@ -218,13 +242,10 @@ ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
   }
 
   const std::int64_t count = args.find("count") ? args.find("count")->as_int(100) : 100;
-  if (count < 1 || static_cast<std::uint64_t>(count) > safety.max_packet_count) {
-    return MakeToolError("count must be between 1 and " + std::to_string(safety.max_packet_count));
+  std::string count_err;
+  if (!ValidateMcpPacketCount(count, eff_safety, &count_err)) {
+    return MakeToolError(count_err);
   }
-
-  const int timeout_s = std::clamp(
-      static_cast<int>(args.find("timeout_s") ? args.find("timeout_s")->as_int(30) : 30),
-      5, safety.max_timeout_s);
 
   Value doc;
   std::string raw_json;
@@ -235,15 +256,32 @@ ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
 
   // Validate spec in-process via native compiler before launching dataplane worker.
   Value spec_summary;
+  double spec_duration_s = 0.0;
   try {
     const auto spec = samurai::scenario_native::parse_spec(doc);
     if (spec.flows.empty()) {
       return MakeToolError("Scenario spec has 0 flows.");
     }
+    spec_duration_s = spec.load_model.duration_s;
     spec_summary = SummarizeSpec(spec);
   } catch (const std::exception& ex) {
     return MakeToolError(std::string("Scenario validation failed before run: ") + ex.what());
   }
+
+  const double arg_duration_s =
+      (args.find("duration_s") && args.find("duration_s")->is_number())
+          ? std::max(0.0, args.find("duration_s")->as_double(0.0))
+          : 0.0;
+  const double effective_duration_s = arg_duration_s > 0.0 ? arg_duration_s : spec_duration_s;
+  const int default_timeout_s = effective_duration_s > 0.0
+      ? std::max(30, static_cast<int>(effective_duration_s + 30.5))
+      : 30;
+  const int timeout_s = std::clamp(
+      static_cast<int>((args.find("timeout_s") && args.find("timeout_s")->is_number())
+                           ? args.find("timeout_s")->as_int(default_timeout_s)
+                           : default_timeout_s),
+      5, eff_safety.max_timeout_s);
+  const bool run_async = args.find("async") && args.find("async")->as_bool(false);
 
   auto lower_str = [](std::string s) {
     for (char& c : s) {
@@ -307,6 +345,11 @@ ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
       "--report-json", report_path,
       "--confirm",
   };
+  AppendSafetyCliArgs(eff_safety, cmd, target);
+  if (raw_target != target) {
+    cmd.push_back("--host-header");
+    cmd.push_back(raw_target);
+  }
 
   if (const Value* rps = args.find("rps"); rps && rps->is_number() && rps->as_double(0.0) > 0.0) {
     cmd.push_back("--rps");
@@ -324,28 +367,83 @@ ToolResult HandleScenarioRun(const Value& args, const SafetyConfig& safety) {
     }
   }
 
-  const auto res = RunSubprocess(cmd, timeout_s, tcp_env.env_overrides);
-  const std::string report_raw = ReadFileToString(report_path);
-  ::unlink(report_path.c_str());
-  if (remove_temp_scenario) ::unlink(scenario_path.c_str());
+  EnvVarList env_overrides = tcp_env.env_overrides;
+  if (arg_duration_s > 0.0) {
+    env_overrides.emplace_back("SAMURAI_SCENARIO_DURATION_S", std::to_string(arg_duration_s));
+  }
 
-  Value out = Value::Object();
-  out.set("host", HostMetadataJson());
-  out.set("scenario_summary", std::move(spec_summary));
-  if (tcp_env.active) {
-    out.set("custom_tcp_env", tcp_env.summary_json);
+  auto build_scn_result = [spec_summary = std::move(spec_summary),
+                           tcp_summary = tcp_env.summary_json,
+                           tcp_active = tcp_env.active,
+                           report_path, scenario_path, remove_temp_scenario](
+                              const SubprocessResult& res) -> Value {
+    const std::string report_raw = ReadFileToString(report_path);
+    ::unlink(report_path.c_str());
+    if (remove_temp_scenario) ::unlink(scenario_path.c_str());
+
+    Value out = Value::Object();
+    out.set("host", HostMetadataJson());
+    out.set("scenario_summary", spec_summary);
+    if (tcp_active) {
+      out.set("custom_tcp_env", tcp_summary);
+    }
+    out.set("exit_code", Value::Int(res.exit_code));
+    out.set("timed_out", Value::Bool(res.timed_out));
+    if (!report_raw.empty()) {
+      const auto parsed = Parse(report_raw);
+      out.set("report", parsed.ok ? parsed.value : Value::Str(report_raw));
+    } else {
+      out.set("report", Value::Null());
+    }
+    const Value job_done = ExtractJobDoneDetail(res.stdout_text);
+    if (job_done.is_object()) {
+      Value st = Value::Object();
+      for (const char* k : {
+               "scenario_backend", "scenario_dataplane", "scenario_sessions",
+               "sessions_started", "sessions_completed",
+               "soak_rounds", "elapsed_s",
+               "step_attempted", "step_succeeded", "step_failed",
+               "expectation_failures", "status_2xx", "status_3xx",
+               "status_4xx", "status_5xx", "status_codes",
+               "scenario_latency_p95_ms", "scenario_sla_passed",
+               "tcp_connect_attempts", "tcp_connect_established",
+               "tcp_timeout_close_count", "step_results"}) {
+        if (const Value* v = job_done.find(k)) {
+          st.set(k, *v);
+        }
+      }
+      if (!st.members().empty()) {
+        out.set("scenario_telemetry", std::move(st));
+      }
+    }
+    out.set("stdout", Value::Str(res.stdout_text));
+    out.set("stderr", Value::Str(res.stderr_text));
+    return out;
+  };
+
+  if (run_async) {
+    return StartAsyncMcpJob(
+        "samurai_scenario_run",
+        target,
+        static_cast<int>(port),
+        timeout_s,
+        [cmd = std::move(cmd), env_overrides = std::move(env_overrides),
+         timeout_s, build_scn_result = std::move(build_scn_result)](
+            const std::atomic<bool>& cancel,
+            std::atomic<pid_t>& active_pid,
+            std::string& final_status_out) {
+          const SubprocessResult res =
+              RunSubprocessCancellable(cmd, timeout_s, env_overrides, &cancel, &active_pid);
+          if (cancel.load()) final_status_out = "stopped";
+          else if (res.timed_out) final_status_out = "timed_out";
+          else if (res.exit_code != 0) final_status_out = "failed";
+          else final_status_out = "completed";
+          return build_scn_result(res);
+        });
   }
-  out.set("exit_code", Value::Int(res.exit_code));
-  out.set("timed_out", Value::Bool(res.timed_out));
-  if (!report_raw.empty()) {
-    const auto parsed = Parse(report_raw);
-    out.set("report", parsed.ok ? parsed.value : Value::Str(report_raw));
-  } else {
-    out.set("report", Value::Null());
-  }
-  out.set("stdout", Value::Str(res.stdout_text));
-  out.set("stderr", Value::Str(res.stderr_text));
-  return MakeToolSuccess(std::move(out));
+
+  const auto res = RunSubprocessCancellable(cmd, timeout_s, env_overrides, nullptr, nullptr);
+  return MakeToolSuccess(build_scn_result(res));
 }
 
 ToolResult HandleScenarioEvaluateSla(const Value& args) {
