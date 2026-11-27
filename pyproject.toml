@@ -3,7 +3,7 @@
 # This pyproject.toml is retained strictly for the Python test harness (`tests/`)
 # and offline Mahoraga RL training utilities (`samurai/models/`).
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=84.2.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
