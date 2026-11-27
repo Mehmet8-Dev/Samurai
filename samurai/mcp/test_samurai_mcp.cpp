@@ -672,7 +672,7 @@ int main() {
     win_opts.client = "vscode";
     win_opts.host_os = "windows";
     win_opts.yes = true;
-    win_opts.image = "samurai:local-v3.4.0";
+    win_opts.image = "samurai:local-v3.5.0";
     win_opts.home_override = tmp_root.string();
     win_opts.project_override = tmp_root.string();
     win_opts.appdata_override = (tmp_root / "AppData" / "Roaming").string();
@@ -696,7 +696,7 @@ int main() {
       if (args_val && args_val->is_array()) {
         for (const auto& el : args_val->elements()) {
           if (el.as_string() == "host.docker.internal:host-gateway") has_gateway = true;
-          if (el.as_string() == "samurai:local-v3.4.0") has_local_img = true;
+          if (el.as_string() == "samurai:local-v3.5.0") has_local_img = true;
           if (el.as_string() == "samurai-build-cache:/var/cache/samurai") has_cache_vol = true;
         }
       }

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-11-27
+
+### Changed
+- **README Positioning & Engine Selection Guide (`README.md`)**:
+  - Replaced the top summary banner with the **Why Samurai?** positioning section, removed the `Run Your First Stress Test` section, and expanded the **Choosing the Right Engine** guide (`l7`, `scenario`, `afxdp`, `dpdk`, `gpu`, `telco`).
+- **Version Bump (`3.5.0`)**:
+  - Bumped canonical SemVer across `npm/package.json`, `pyproject.toml`, Helm `appVersion`, `CITATION.cff`, `samurai/__init__.py`, `samurai/mcp/protocol.hpp`, Docker image tag references, tests, and documentation to `3.5.0`.
+
 ## [3.4.0] - 2026-11-25
 
 ### Added

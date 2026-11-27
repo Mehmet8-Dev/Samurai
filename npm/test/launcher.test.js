@@ -52,7 +52,7 @@ test("resolveTargetCommand routes bench, build, and mcp subcommands cleanly", ()
 test("buildDockerArgs uses host network on Linux and host-gateway on macOS/Windows", () => {
   const linuxArgs = buildDockerArgs("samurai", ["--worker", "l7"], {
     platform: "linux",
-    image: "samurai:local-v3.4.0",
+    image: "samurai:local-v3.5.0",
   });
   assert.ok(linuxArgs.includes("--network"));
   assert.ok(linuxArgs.includes("host"));
@@ -82,9 +82,9 @@ test("detectHostHardware, getNativeCacheDir, and getLocalImageTag use source-nat
   assert.equal(typeof hw.cpus, "number");
   assert.equal(typeof hw.cudaGpu, "boolean");
   assert.equal(typeof hw.dpdk, "boolean");
-  const dir = getNativeCacheDir("3.4.0", { SAMURAI_CACHE_DIR: "/tmp/scache" });
-  assert.equal(dir, "/tmp/scache/v3.4.0-native");
-  assert.equal(getLocalImageTag("3.4.0", {}), "samurai:local-v3.4.0");
+  const dir = getNativeCacheDir("3.5.0", { SAMURAI_CACHE_DIR: "/tmp/scache" });
+  assert.equal(dir, "/tmp/scache/v3.5.0-native");
+  assert.equal(getLocalImageTag("3.5.0", {}), "samurai:local-v3.5.0");
 });
 
 test("bin/samurai.js executes local samurai mcp doctor --json when built", (t) => {
@@ -167,7 +167,7 @@ test("mcp_setup configures Windows IDE & CLI paths with local Docker host-gatewa
     const res = executeSetup({
       client: "vscode",
       hostOs: "windows",
-      imageTag: "samurai:local-v3.4.0",
+      imageTag: "samurai:local-v3.5.0",
       yes: true,
       homeOverride: tmpDir,
       projectOverride: tmpDir,
@@ -179,7 +179,7 @@ test("mcp_setup configures Windows IDE & CLI paths with local Docker host-gatewa
     assert.ok(res.report.proposed_entry.args.includes(DEFAULT_BUILD_CACHE_VOLUME));
     assert.ok(res.report.proposed_entry.args.includes("--add-host"));
     assert.ok(res.report.proposed_entry.args.includes("host.docker.internal:host-gateway"));
-    assert.ok(res.report.proposed_entry.args.includes("samurai:local-v3.4.0"));
+    assert.ok(res.report.proposed_entry.args.includes("samurai:local-v3.5.0"));
 
     const written = JSON.parse(fs.readFileSync(res.report.config_path, "utf8"));
     assert.ok(written.servers.existing);

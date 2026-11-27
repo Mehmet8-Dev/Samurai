@@ -1,8 +1,15 @@
 # Samurai — Pure C++17 Line-Rate Load, Kernel-Bypass & AI Resilience Engine
 
-**1,000,000 stateful TCP flows in 577 MiB (`605 B/flow`) · Stateful HTTP/2 & QUIC/H3 (`io_uring`/kTLS) · Consumer GeForce BAR1 P2P CUDA · 5G CUPS Telecom · Native C++17 MCP Server (`samurai_mcp`)**
+## Why Samurai?
 
-Samurai (v3.4.0) bridges the gap between scripting load tools (`k6`, `Locust`) and raw stateless packet generators (`pktgen`, `TRex`) in a single compiled **C++17** runtime with zero Python dataplane overhead — strictly scoped for authorized lab and infrastructure validation.
+Modern infrastructure teams face a gap between low-level stateless packet blasters and high-level application load tools:
+
+- **The Problem:** Traditional Python/scripting load testers hit GIL, memory-allocation, and syscall bottlenecks long before saturating 10G–100G links; conversely, raw packet generators lack stateful TCP loss recovery, HTTP/2–QUIC/H3 state machines, multi-step persona modeling, carrier-telecom signaling (PFCP/GTP-U/SCTP/Diameter/SIP), or adaptive feedback loops. Many GPU/DPU-accelerated dataplanes also lock developers behind expensive datacenter-only licenses.
+- **How Samurai Differs:**
+  - **Zero Python Dataplane Overhead:** Pure C++17 native daemons, MCP server, and worker binaries (`samurai`, `samurai_mcp`, `samurai_master`, `samurai_slave`, `samurai_*_worker`), keeping Python strictly for offline test harnesses and RL training scripts.
+  - **Full-Stack L2–L7 + Carrier Telecom in One Runtime:** Combines RFC 6675 SACK userspace TCP, `io_uring`/kTLS HTTP/2 & QUIC/H3, stateful persona scenarios, and 4G/5G telecom protocols (`GTP-U`, `PFCP`, `SCTP`, `Diameter`, `SIP/RTP/SRTP`) with live IPFIX/NetFlow v9/v10 telemetry.
+  - **Commodity & Enterprise Hardware Acceleration:** Supports consumer GeForce BAR1 P2P DMA + autonomous GPU-initiated doorbells alongside enterprise `AF_XDP`, `DPDK`, and BlueField `DOCA GPUNetIO` + `aarch64` DPU CUPS Seqlock shared memory.
+  - **Closed-Loop Resilience & Safety Gates:** Built-in RL (`Mahoraga`) / AIMD autopilot, VAE anomaly defense verification, and fail-closed `ValidateTargetSafety` gates (private/loopback by default, explicit allowlist/denylist enforcement).
 
 ---
 
@@ -38,7 +45,7 @@ npx -y samurai-net mcp setup --client all --yes
 npx -y samurai-net mcp setup --client claude_code --yes
 
 # Windows PowerShell (Docker Desktop + native %APPDATA% / %USERPROFILE% paths + local host-built image):
-# Automatically builds `samurai:local-v3.4.0` on your machine (`SAMURAI_NATIVE_ARCH=ON`) and injects `--add-host host.docker.internal:host-gateway`.
+# Automatically builds `samurai:local-v3.5.0` on your machine (`SAMURAI_NATIVE_ARCH=ON`) and injects `--add-host host.docker.internal:host-gateway`.
 npx -y samurai-net mcp setup --client antigravity --yes
 npx -y samurai-net mcp setup --client vscode --yes
 npx -y samurai-net mcp setup --client claude_desktop --yes
@@ -49,13 +56,13 @@ npx -y samurai-net mcp setup --client cursor --docker --yes
 npx -y samurai-net mcp setup --client cursor --docker --ghcr --yes
 ```
 
-### 3. Run Your First Stress Test
-```bash
-# Stateful HTTP/2 load test against a local lab target (private/loopback only by default)
-npx -y samurai-net --worker l7 --target 127.0.0.1 --port 8080 --l7-protocol http2 --concurrency 4 --count 10000 --confirm
-```
+### 3. Choosing the Right Engine
 
-> **Which engine should I pick?** Start with `--worker l7` (HTTP/1.1, HTTP/2, QUIC/H3) or `--worker scenario` for web/API SLA testing; move to `--worker afxdp` / `dpdk` / `gpu` for 10G–100G kernel-bypass or GeForce BAR1 P2P labs; use `--worker telco` for 4G/5G core (`GTP-U`, `PFCP`, `SCTP`, `Diameter`, `SIP/SRTP`).
+Samurai separates traffic generation into specialized native workers so you can match the dataplane to your test objective:
+
+- **Web, API & SLA Validation (`--worker l7`, `--worker scenario`):** Best starting point for application-layer testing. Use `--worker l7` for stateful HTTP/1.1, HTTP/2 (`nghttp2` + `io_uring`/kTLS), and QUIC/HTTP/3 (`ngtcp2`/`nghttp3`) benchmarks, or `--worker scenario` when you need multi-step user personas, session state, and microsecond SLA assertions.
+- **High-Throughput L2–L4 & Kernel-Bypass Labs (`--worker afxdp`, `--worker dpdk`, `--worker gpu`):** Designed for 10G–100G line-rate stress tests and hardware-accelerated labs. Choose `afxdp` for Linux zero-copy XSK/UMEM, `dpdk` for PMD hugepage rings, or `gpu` for NVIDIA CUDA warp-parallel synthesis and GeForce BAR1 P2P DMA.
+- **4G/5G Core & Carrier Telecom (`--worker telco`):** Tailored for EPC/5GC, BNG, and IMS infrastructure validation, supporting `GTP-U`, `PFCP`, `SCTP`, `Diameter`, and `SIP/SRTP` signaling and user-plane flows.
 
 ---
 
@@ -90,19 +97,6 @@ Exposes **25 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**,
 - **Closed-Loop Autopilot & Mahoraga RL (`samurai_control`):** `samurai_autopilot_create`, `samurai_autopilot_step`, `samurai_autopilot_run_window`, `samurai_autopilot_status`, `samurai_autopilot_reset` — supporting `AIMD`, `BinSearch`, in-process SRLP MLP & RL² GRU `RlPolicy` inference, `LeverShield` WAF path-block reflex, and `RlExploreConfig`.
 
 All MCP tools enforce fail-closed target validation (`samurai::core::ValidateTargetSafety(..., allow_public=false)`) and never expose `--allow-public-target`. See [`mcp/README.md`](mcp/README.md) for Cursor/Codex configuration and [`skills/`](skills/) for all 5 portable agent skills.
-
----
-
-## Why Samurai?
-
-Modern infrastructure teams face a gap between low-level stateless packet blasters and high-level application load tools:
-
-- **The Problem:** Traditional Python/scripting load testers hit GIL, memory-allocation, and syscall bottlenecks long before saturating 10G–100G links; conversely, raw packet generators lack stateful TCP loss recovery, HTTP/2–QUIC/H3 state machines, multi-step persona modeling, carrier-telecom signaling (PFCP/GTP-U/SCTP/Diameter/SIP), or adaptive feedback loops. Many GPU/DPU-accelerated dataplanes also lock developers behind expensive datacenter-only licenses.
-- **How Samurai Differs:**
-  - **Zero Python Dataplane Overhead:** Pure C++17 native daemons, MCP server, and worker binaries (`samurai`, `samurai_mcp`, `samurai_master`, `samurai_slave`, `samurai_*_worker`), keeping Python strictly for offline test harnesses and RL training scripts.
-  - **Full-Stack L2–L7 + Carrier Telecom in One Runtime:** Combines RFC 6675 SACK userspace TCP, `io_uring`/kTLS HTTP/2 & QUIC/H3, stateful persona scenarios, and 4G/5G telecom protocols (`GTP-U`, `PFCP`, `SCTP`, `Diameter`, `SIP/RTP/SRTP`) with live IPFIX/NetFlow v9/v10 telemetry.
-  - **Commodity & Enterprise Hardware Acceleration:** Supports consumer GeForce BAR1 P2P DMA + autonomous GPU-initiated doorbells alongside enterprise `AF_XDP`, `DPDK`, and BlueField `DOCA GPUNetIO` + `aarch64` DPU CUPS Seqlock shared memory.
-  - **Closed-Loop Resilience & Safety Gates:** Built-in RL (`Mahoraga`) / AIMD autopilot, VAE anomaly defense verification, and fail-closed `ValidateTargetSafety` gates (private/loopback by default, explicit allowlist/denylist enforcement).
 
 ---
 
