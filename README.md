@@ -73,33 +73,6 @@ Samurai separates traffic generation into specialized native workers so you can 
 
 ---
 
-## Native C++17 MCP Server (AI Agents & RL Autopilot)
-
-Samurai includes a modular, zero-Python **Model Context Protocol (MCP)** stdio server ([`samurai/mcp/`](samurai/mcp/), `protocolVersion: 2024-11-05`) built directly against `samurai_core`, `samurai_control`, and `samurai_scenario`. It includes built-in **`doctor`** and **`setup`** subcommands for automatic client diagnostics and registration across **10 AI clients** (`claude_code`, `claude_desktop`, `cursor`, `codex`, `gemini_cli`, `antigravity`, `windsurf`, `vscode`, `opencode`, `copilot_cli`):
-
-```bash
-# Diagnose local binaries, workers, and MCP client registration status
-samurai_mcp doctor --json
-
-# Apply MCP registration (creates a .bak backup automatically; omit --yes to check plan without writing)
-samurai_mcp setup --client cursor --yes          # native binary
-samurai_mcp setup --client claude_code --docker --yes         # local Docker image
-samurai_mcp setup --client claude_code --docker --ghcr --yes  # GHCR source-runtime (compiles natively on first run)
-
-# Or register directly via Claude Code CLI:
-claude mcp add samurai -- /path/to/Samurai/build/mcp/samurai_mcp
-```
-
-Exposes **25 native tools**, **5 MCP Skill Resources (`samurai://skills/...`)**, and **5 Workflow Prompts** covering:
-- **Live Target Testing, API Discovery, Benchmarks & RFC Compliance:** `samurai_list_workers`, `samurai_list_profiles`, `samurai_discover_apis` (fail-closed Docker network/container discovery, OpenAPI/Swagger route extraction, HTTP fingerprinting, and Scenario JSON synthesis), `samurai_run_benchmark` (all 10 workers, L7/TLS/H2/QUIC, 4G/5G Telco CUPS, GPU BAR1 P2P, live IPFIX, KPI gates, `duration_s` soak, `allow_target` authorization), `samurai_run_rfc_suite`, `samurai_bench_tcp_flows`, `samurai_bench_l7_userspace`, `samurai_job_status`, `samurai_job_stop`.
-- **Distributed Cluster & Multi-Worker Orchestration:** `samurai_cluster_discover`, `samurai_cluster_provision_node`, `samurai_cluster_run_job` (distributed `samurai_master` multi-worker & closed-loop RL job execution), `samurai_cluster_plan_shards`, `samurai_cluster_reconfigure`, `samurai_cluster_abort`, and `samurai_cluster_local_mesh`.
-- **Scenario Engine (`samurai_scenario`):** `samurai_scenario_compile`, `samurai_scenario_run`, `samurai_scenario_evaluate_sla`.
-- **Closed-Loop Autopilot & Mahoraga RL (`samurai_control`):** `samurai_autopilot_create`, `samurai_autopilot_step`, `samurai_autopilot_run_window`, `samurai_autopilot_status`, `samurai_autopilot_reset` — supporting `AIMD`, `BinSearch`, in-process SRLP MLP & RL² GRU `RlPolicy` inference, `LeverShield` WAF path-block reflex, and `RlExploreConfig`.
-
-All MCP tools enforce fail-closed target validation (`samurai::core::ValidateTargetSafety(..., allow_public=false)`) and never expose `--allow-public-target`. See [`mcp/README.md`](mcp/README.md) for Cursor/Codex configuration and [`skills/`](skills/) for all 5 portable agent skills.
-
----
-
 ## Key Capabilities
 
 - **Pure Native C++17 Runtime:** Zero Python runtime overhead; compiled microservice architecture with direct OS and hardware integration.
